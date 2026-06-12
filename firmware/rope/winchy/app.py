@@ -6,6 +6,7 @@
 # radio anymore. See docs/rope_segment_architecture.md.
 
 import asyncio
+import math
 import time
 
 from machine import Pin, RTC
@@ -17,6 +18,7 @@ import protocol
 from winchy import board
 from winchy.fusion import altitude
 from winchy.fusion.attitude import rope_angle_above_ground
+from winchy.fusion.kalman import GravityKalman, VerticalKalman
 from winchy.sensors.ads1232 import ADS1232
 from winchy.sensors.barometer import Barometer
 from winchy.sensors.gps import GPS, parse_nmea
@@ -26,8 +28,13 @@ from winchy.state import State
 
 FORCE_TIMEOUT_MS = 1000
 IMU_PERIOD_MS = 20          # 50 Hz sampling
-IMU_WINDOW = 20             # moving-average window (matches old smoothing)
+IMU_WINDOW = 20             # samples for the boot-time accel print
 BARO_PERIOD_MS = 1000
+
+# Gyro bias: learned slowly while IDLE and still, frozen during the tow so
+# it cannot chase real rotation.
+GYRO_BIAS_ALPHA = 0.01
+GYRO_STILL_TOLERANCE_G = 0.05
 TELEMETRY_PERIOD_MS = 500   # 2 Hz, the old loop cadence; the SF12/BW500
                             # airtime (~130 ms/packet) caps what is sane here
 DISPLAY_PERIOD_MS = 500
@@ -54,27 +61,40 @@ async def force_task(adc, state):
             state.force_errors += 1
 
 
-async def imu_task(imu, state):
-    window = []
+async def imu_task(imu, state, filt, gyro_bias):
+    bias = list(gyro_bias)
+    last = time.ticks_ms()
     while True:
-        window.append(imu.read_accel())
-        if len(window) > IMU_WINDOW:
-            window.pop(0)
-        n = len(window)
-        ax = sum(s[0] for s in window) / n
-        ay = sum(s[1] for s in window) / n
-        az = sum(s[2] for s in window) / n
-        state.accel = (ax, ay, az)
-        state.angle_deg = rope_angle_above_ground(ax, ay, az)
-        state.accel_ts = time.ticks_ms()
+        accel = imu.read_accel()
+        gyro = imu.read_gyro()
+        now = time.ticks_ms()
+        dt = time.ticks_diff(now, last) / 1000.0
+        last = now
+
+        norm = math.sqrt(accel[0] ** 2 + accel[1] ** 2 + accel[2] ** 2)
+        if (state.phase == protocol.PHASE_IDLE
+                and abs(norm - 1.0) < GYRO_STILL_TOLERANCE_G):
+            for i in range(3):
+                bias[i] += GYRO_BIAS_ALPHA * (gyro[i] - bias[i])
+        corrected = (gyro[0] - bias[0], gyro[1] - bias[1],
+                     gyro[2] - bias[2])
+
+        filt.predict(corrected, dt)
+        filt.update(accel)
+        state.accel = accel
+        state.gyro_dps = corrected
+        state.angle_deg = rope_angle_above_ground(*filt.gravity)
+        state.accel_ts = now
         await asyncio.sleep_ms(IMU_PERIOD_MS)
 
 
-async def baro_task(baro, state):
+async def baro_task(baro, state, vertical):
+    last = time.ticks_ms()
     while True:
         pressure = await baro.apressure_hpa()
+        now = time.ticks_ms()
         state.pressure_hpa = pressure
-        state.baro_ts = time.ticks_ms()
+        state.baro_ts = now
 
         gps_fresh = (state.gps_fix and time.ticks_diff(
             time.ticks_ms(), state.gps_ts) < BARO_CAL_GPS_MAX_AGE_MS)
@@ -89,6 +109,10 @@ async def baro_task(baro, state):
         if state.qnh_hpa:
             state.baro_alt_m = altitude.pressure_to_altitude_m(
                 pressure, state.qnh_hpa)
+            vertical.predict(time.ticks_diff(now, last) / 1000.0)
+            vertical.update(state.baro_alt_m)
+            state.climb_rate_ms = vertical.vrate
+        last = now
         await asyncio.sleep_ms(BARO_PERIOD_MS)
 
 
@@ -144,8 +168,8 @@ async def telemetry_task(sx, state):
         print("ADC value:", force)
         print("Seilwinkel:", state.angle_deg)
         if state.qnh_hpa:
-            print("Baro alt: %.1f m (GPS %.1f m)" % (state.baro_alt_m,
-                                                     state.alt_m))
+            print("Baro alt: %.1f m (GPS %.1f m, %+.1f m/s)"
+                  % (state.baro_alt_m, state.alt_m, state.climb_rate_ms))
         sx.send(frame)  # non-blocking; TX_DONE arrives via radio callback
         seq = (seq + 1) & 0xFFFF
         state.tx_count += 1
@@ -175,11 +199,13 @@ async def supervisor_task(pmu, state):
         await asyncio.sleep_ms(SUPERVISOR_PERIOD_MS)
 
 
-async def _main(pmu, adc, imu, baro, sx, display, state):
+async def _main(pmu, adc, imu, baro, sx, display, state, gyro_bias):
+    gravity_filter = GravityKalman()
+    vertical_filter = VerticalKalman()
     await asyncio.gather(
         force_task(adc, state),
-        imu_task(imu, state),
-        baro_task(baro, state),
+        imu_task(imu, state, gravity_filter, gyro_bias),
+        baro_task(baro, state, vertical_filter),
         gps_task(state),
         telemetry_task(sx, state),
         display_task(display, state),
@@ -200,6 +226,15 @@ def run():
 
     imu = QMI8658(board.qmi_spi, board.qmi_cs)
     print("Accelerations:", imu.read_accel_avg(IMU_WINDOW))
+    # Initial gyro bias from 50 samples; the unit is at rest at power-on.
+    sums = [0.0, 0.0, 0.0]
+    for _ in range(50):
+        g = imu.read_gyro()
+        for i in range(3):
+            sums[i] += g[i]
+        time.sleep_ms(5)
+    gyro_bias = tuple(v / 50 for v in sums)
+    print("Gyro bias (dps): (%.2f, %.2f, %.2f)" % gyro_bias)
 
     mag = Magnetometer()  # loads calibration.cal; input for the Kalman work
 
@@ -240,4 +275,4 @@ def run():
     sx.setBlockingCallback(False, on_radio)
 
     print("Starting asyncio runtime")
-    asyncio.run(_main(pmu, adc, imu, baro, sx, display, state))
+    asyncio.run(_main(pmu, adc, imu, baro, sx, display, state, gyro_bias))

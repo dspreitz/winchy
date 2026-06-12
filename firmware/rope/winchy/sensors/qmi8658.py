@@ -14,9 +14,13 @@ _REG_TEMP_L = 0x33
 _REG_AX_L = 0x35
 _REG_AY_L = 0x37
 _REG_AZ_L = 0x39
+_REG_GX_L = 0x3B
+_REG_GY_L = 0x3D
+_REG_GZ_L = 0x3F
 
 _WHO_AM_I_VALUE = 0x05
-_ACCEL_LSB_PER_G = 16384
+_ACCEL_LSB_PER_G = 16384   # CTRL2 range bits: +/-2 g
+_GYRO_LSB_PER_DPS = 128    # CTRL3 range bits: +/-256 dps
 
 
 class QMI8658:
@@ -57,6 +61,12 @@ class QMI8658:
         return (self._read_int16(_REG_AX_L) / _ACCEL_LSB_PER_G,
                 self._read_int16(_REG_AY_L) / _ACCEL_LSB_PER_G,
                 self._read_int16(_REG_AZ_L) / _ACCEL_LSB_PER_G)
+
+    def read_gyro(self):
+        """(x, y, z) angular rate in degrees per second."""
+        return (self._read_int16(_REG_GX_L) / _GYRO_LSB_PER_DPS,
+                self._read_int16(_REG_GY_L) / _GYRO_LSB_PER_DPS,
+                self._read_int16(_REG_GZ_L) / _GYRO_LSB_PER_DPS)
 
     def read_accel_avg(self, samples=10, delay_ms=10):
         sum_x = sum_y = sum_z = 0.0

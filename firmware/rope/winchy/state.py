@@ -12,8 +12,9 @@ class State:
         self.force_ts = 0
         self.force_errors = 0    # DRDY timeouts
         # IMU / attitude
-        self.accel = (0.0, 0.0, 0.0)  # windowed mean specific force, g
-        self.angle_deg = 0.0          # rope angle above ground
+        self.accel = (0.0, 0.0, 0.0)     # instantaneous specific force, g
+        self.gyro_dps = (0.0, 0.0, 0.0)  # bias-corrected angular rate
+        self.angle_deg = 0.0             # rope angle above ground (Kalman)
         self.accel_ts = 0
         # Tow phase (protocol.PHASE_*; the state machine will drive this)
         self.phase = 0  # PHASE_IDLE
@@ -22,6 +23,7 @@ class State:
         self.baro_ts = 0
         self.qnh_hpa = 0.0      # sea-level reference, GPS-calibrated; 0 = none
         self.baro_alt_m = 0.0   # altitude from pressure + qnh_hpa
+        self.climb_rate_ms = 0.0  # vertical Kalman estimate
         # GPS
         self.gps_fix = 0         # GGA fix quality (0 = none)
         self.gps_sats = 0
