@@ -15,6 +15,7 @@ from sx1262 import SX1262
 import config
 import protocol
 from winchy import board
+from winchy.fusion import altitude
 from winchy.fusion.attitude import rope_angle_above_ground
 from winchy.sensors.ads1232 import ADS1232
 from winchy.sensors.barometer import Barometer
@@ -35,6 +36,12 @@ SUPERVISOR_PERIOD_MS = 5000
 # MicroPython's time.time() counts from 2000-01-01; the protocol carries
 # unix epoch seconds.
 _UNIX_EPOCH_OFFSET = 946684800
+
+# Barometric altitude calibration against GPS, only while IDLE (during a
+# launch the unit climbs and GPS/baro lag differently, so the reference is
+# frozen). EMA per 1 Hz barometer sample: ~30 s to settle.
+BARO_CAL_ALPHA = 0.1
+BARO_CAL_GPS_MAX_AGE_MS = 5000
 
 
 async def force_task(adc, state):
@@ -65,8 +72,23 @@ async def imu_task(imu, state):
 
 async def baro_task(baro, state):
     while True:
-        state.pressure_hpa = await baro.apressure_hpa()
+        pressure = await baro.apressure_hpa()
+        state.pressure_hpa = pressure
         state.baro_ts = time.ticks_ms()
+
+        gps_fresh = (state.gps_fix and time.ticks_diff(
+            time.ticks_ms(), state.gps_ts) < BARO_CAL_GPS_MAX_AGE_MS)
+        if state.phase == protocol.PHASE_IDLE and gps_fresh:
+            ref = altitude.sea_level_pressure_hpa(pressure, state.alt_m)
+            if state.qnh_hpa == 0:
+                state.qnh_hpa = ref
+                print("Baro reference initialised: QNH %.1f hPa "
+                      "(GPS alt %.1f m)" % (ref, state.alt_m))
+            else:
+                state.qnh_hpa += BARO_CAL_ALPHA * (ref - state.qnh_hpa)
+        if state.qnh_hpa:
+            state.baro_alt_m = altitude.pressure_to_altitude_m(
+                pressure, state.qnh_hpa)
         await asyncio.sleep_ms(BARO_PERIOD_MS)
 
 
@@ -121,6 +143,9 @@ async def telemetry_task(sx, state):
             state.pressure_hpa, state.system_mv, flags)
         print("ADC value:", force)
         print("Seilwinkel:", state.angle_deg)
+        if state.qnh_hpa:
+            print("Baro alt: %.1f m (GPS %.1f m)" % (state.baro_alt_m,
+                                                     state.alt_m))
         sx.send(frame)  # non-blocking; TX_DONE arrives via radio callback
         seq = (seq + 1) & 0xFFFF
         state.tx_count += 1
@@ -134,7 +159,8 @@ async def display_task(display, state):
         display.text("F: {}".format(state.force_raw - state.force_offset), 0, 0)
         display.text("Seilwinkel:", 0, 16)
         display.text("{:.1f} deg".format(state.angle_deg), 0, 26)
-        display.text("{:.1f} hPa".format(state.pressure_hpa), 0, 42)
+        display.text("{:.0f}hPa {:.0f}m".format(state.pressure_hpa,
+                                                state.baro_alt_m), 0, 42)
         display.text("Sat:{} {}mV".format(state.gps_sats, state.system_mv),
                      0, 54)
         display.show()

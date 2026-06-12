@@ -15,9 +15,13 @@ class State:
         self.accel = (0.0, 0.0, 0.0)  # windowed mean specific force, g
         self.angle_deg = 0.0          # rope angle above ground
         self.accel_ts = 0
+        # Tow phase (protocol.PHASE_*; the state machine will drive this)
+        self.phase = 0  # PHASE_IDLE
         # Barometer
         self.pressure_hpa = 0.0
         self.baro_ts = 0
+        self.qnh_hpa = 0.0      # sea-level reference, GPS-calibrated; 0 = none
+        self.baro_alt_m = 0.0   # altitude from pressure + qnh_hpa
         # GPS
         self.gps_fix = 0         # GGA fix quality (0 = none)
         self.gps_sats = 0
