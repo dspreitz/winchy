@@ -26,6 +26,7 @@ class State:
         self.alt_m = 0.0
         self.gps_ts = 0
         self.time_synced = False
+        self.pending_time_sync = False  # telemetry task owes a TIME_SYNC frame
         # Power
         self.system_mv = 0
         self.batt_mv = 0

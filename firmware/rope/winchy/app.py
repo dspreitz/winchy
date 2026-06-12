@@ -6,7 +6,6 @@
 # radio anymore. See docs/rope_segment_architecture.md.
 
 import asyncio
-import struct
 import time
 
 from machine import Pin, RTC
@@ -14,6 +13,7 @@ import sh1106
 from sx1262 import SX1262
 
 import config
+import protocol
 from winchy import board
 from winchy.fusion.attitude import rope_angle_above_ground
 from winchy.sensors.ads1232 import ADS1232
@@ -31,6 +31,10 @@ TELEMETRY_PERIOD_MS = 500   # 2 Hz, the old loop cadence; the SF12/BW500
                             # airtime (~130 ms/packet) caps what is sane here
 DISPLAY_PERIOD_MS = 500
 SUPERVISOR_PERIOD_MS = 5000
+
+# MicroPython's time.time() counts from 2000-01-01; the protocol carries
+# unix epoch seconds.
+_UNIX_EPOCH_OFFSET = 946684800
 
 
 async def force_task(adc, state):
@@ -88,24 +92,39 @@ async def gps_task(state):
                 y, mo, d, h, mi, s = update["datetime"]
                 rtc.datetime((y, mo, d, 0, h, mi, s, 0))
                 state.time_synced = True
+                state.pending_time_sync = True
                 print("RTC synced from GPS: %04d-%02d-%02d %02d:%02d:%02dZ"
                       % (y, mo, d, h, mi, s))
 
 
 async def telemetry_task(sx, state):
+    seq = 0
     while True:
-        adc_val = state.force_raw
-        print("ADC value:", adc_val - state.force_offset)
+        if state.pending_time_sync:
+            state.pending_time_sync = False
+            frame = protocol.encode_time_sync(
+                seq, time.time() + _UNIX_EPOCH_OFFSET)
+            sx.send(frame)
+            seq = (seq + 1) & 0xFFFF
+            state.tx_count += 1
+            print("Sent TIME_SYNC:", frame)
+
+        force = state.force_raw - state.force_offset  # tared counts
+        flags = protocol.FLAG_FORCE_UNCALIBRATED  # until calibration lands
+        if state.gps_fix:
+            flags |= protocol.FLAG_GPS_FIX
+        if state.time_synced:
+            flags |= protocol.FLAG_TIME_SYNCED
+        # Tow phase detection arrives with the state machine (step 6).
+        frame = protocol.encode_telemetry(
+            seq, protocol.PHASE_IDLE, force, state.angle_deg,
+            state.pressure_hpa, state.system_mv, flags)
+        print("ADC value:", force)
         print("Seilwinkel:", state.angle_deg)
-        # Pack: 4-byte signed ADC + 2-byte unsigned pressure (x10) + 1-byte
-        # unsigned angle (1 deg resolution). NOTE: still the untared raw ADC
-        # value, as before. Replaced by versioned frames in step 5.
-        pressure_scaled = int(state.pressure_hpa * 10)
-        angle_uint8 = max(0, min(255, int(round(state.angle_deg))))
-        packet = struct.pack(">iHB", adc_val, pressure_scaled, angle_uint8)
-        sx.send(packet)  # non-blocking; TX_DONE arrives via radio callback
+        sx.send(frame)  # non-blocking; TX_DONE arrives via radio callback
+        seq = (seq + 1) & 0xFFFF
         state.tx_count += 1
-        print("Sent packet (binary):", packet)
+        print("Sent packet (binary):", frame)
         await asyncio.sleep_ms(TELEMETRY_PERIOD_MS)
 
 
