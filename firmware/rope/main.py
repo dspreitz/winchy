@@ -1,9 +1,8 @@
 # Rope segment entry point.
 #
-# Migration step 1 (docs/rope_segment_architecture.md): the original
-# monolithic application lives unchanged in legacy.py and is started from
-# here behind a crash guard, so any failure or Ctrl-C lands at the REPL
-# instead of wedging the unit.
+# The application (winchy/app.py, asyncio runtime) is started behind a
+# crash guard, so any failure or Ctrl-C lands at the REPL instead of
+# wedging the unit. Hold the BOOT button during reset for a bare REPL.
 
 import sys
 
@@ -15,7 +14,8 @@ if Pin(0, Pin.IN, Pin.PULL_UP).value() == 0:
     print("SAFE MODE: BOOT button held, application not started")
 else:
     try:
-        import legacy  # original application; runs forever
+        from winchy import app
+        app.run()  # runs forever
     except KeyboardInterrupt:
         print("Application interrupted, dropping to REPL")
     except Exception as e:

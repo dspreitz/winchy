@@ -1,5 +1,6 @@
 # ADS1232 24-bit bridge ADC (rope force), bit-banged serial interface.
 
+import asyncio
 import time
 
 from machine import Pin
@@ -24,6 +25,7 @@ class ADS1232:
         self._gain1 = Pin(gain1, Pin.OUT)
         self.offset = 0
         self._ready = False
+        self._flag = asyncio.ThreadSafeFlag()
         self._pdwn.value(1)  # wake from power-down
         self._sclk.value(0)
         self.set_gain(gain)
@@ -31,6 +33,7 @@ class ADS1232:
 
     def _on_drdy(self, _pin):
         self._ready = True
+        self._flag.set()
 
     def set_gain(self, gain):
         if gain not in self._GAINS:
@@ -40,14 +43,8 @@ class ADS1232:
         self._gain1.value(g1)
         print("Gain set to %dx" % gain)
 
-    def read_raw(self, timeout_ms=250):
-        """One signed 24-bit conversion, no offset applied."""
-        deadline = time.ticks_add(time.ticks_ms(), timeout_ms)
-        while not self._ready and self._dout.value() == 1:
-            if time.ticks_diff(deadline, time.ticks_ms()) < 0:
-                raise OSError("ADS1232 DRDY timeout")
-            time.sleep_ms(1)
-
+    def _clock_out(self):
+        """Shift out the 24-bit conversion. DRDY (DOUT low) must be true."""
         result = 0
         for _ in range(24):
             self._sclk.value(1)
@@ -62,6 +59,26 @@ class ADS1232:
         # edges on DOUT that re-trigger the IRQ.
         self._ready = False
         return result
+
+    def read_raw(self, timeout_ms=250):
+        """One signed 24-bit conversion, no offset applied. Blocking."""
+        deadline = time.ticks_add(time.ticks_ms(), timeout_ms)
+        while not self._ready and self._dout.value() == 1:
+            if time.ticks_diff(deadline, time.ticks_ms()) < 0:
+                raise OSError("ADS1232 DRDY timeout")
+            time.sleep_ms(1)
+        return self._clock_out()
+
+    async def aread_raw(self, timeout_ms=250):
+        """One signed 24-bit conversion, yielding to other tasks while the
+        conversion completes. Raises asyncio.TimeoutError if DRDY stays
+        away (ADC unpowered/unwired)."""
+        # Loop: a stale flag set by the falling edges of the previous data
+        # shift returns immediately, but DOUT is still high then, so we
+        # wait again on the (now cleared) flag for the genuine DRDY edge.
+        while self._dout.value() == 1:
+            await asyncio.wait_for_ms(self._flag.wait(), timeout_ms)
+        return self._clock_out()
 
     def read(self, timeout_ms=250):
         """Offset-corrected (tared) reading."""
