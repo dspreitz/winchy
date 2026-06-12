@@ -20,353 +20,25 @@
 # I2C Adress: 0x3c
 
 
-# This file is executed on every boot (including wake-boot from deepsleep)
-import esp
-#esp.osdebug(None)
-import webrepl
-#webrepl.start()
+# Board wiring and AXP2101 power-rail setup live in config.py and
+# winchy/board.py (migration step 2, docs/rope_segment_architecture.md).
+# The rest of this file is the original application, pending step 3+.
 
 import math
-
-from AXP2101 import *
-import time
-# import machine
-from machine import I2C, Pin, SPI, UART, SoftI2C
-from bmp280 import *
 import struct
-import sh1106 # Display library
+import time
 
-from sx1262 import SX1262 # LoRa library
+from machine import Pin
+from bmp280 import *
+import sh1106  # Display library
+from sx1262 import SX1262  # LoRa library
 
-i2c = I2C(0, scl=Pin(18), sda=Pin(17), freq=400000)
+import config
+from winchy import board
 
-# ============ Begin of AXP2101 ============
-SDA = None
-SCL = None
-IRQ = None
-I2CBUS = None
+PMU = board.init_power()
+i2c = board.i2c0
 
-if implementation.name == 'micropython':
-    from machine import Pin, SoftI2C
-    SDA = 42
-    SCL = 41
-    IRQ = 40
-    I2CBUS = SoftI2C(scl=Pin(SCL), sda=Pin(SDA))
-pmu_flag = False
-irq = None
-
-
-def __callback(args):
-    global pmu_flag
-    pmu_flag = True
-    # print('callback')
-
-
-PMU = AXP2101(I2CBUS, addr=AXP2101_SLAVE_ADDRESS)
-
-id = PMU.getChipID()
-if id != XPOWERS_AXP2101_CHIP_ID:
-    print("PMU is not online...")
-    while True:
-        pass
-
-print('getID:%s' % hex(PMU.getChipID()))
-
-#  Set the minimum common working voltage of the PMU VBUS input,
-#  below this value will turn off the PMU
-PMU.setVbusVoltageLimit(PMU.XPOWERS_AXP2101_VBUS_VOL_LIM_4V36)
-
-#  Set the maximum current of the PMU VBUS input,
-#  higher than this value will turn off the PMU
-PMU.setVbusCurrentLimit(PMU.XPOWERS_AXP2101_VBUS_CUR_LIM_1500MA)
-
-#  Get the VSYS shutdown voltage
-vol = PMU.getSysPowerDownVoltage()
-print('->  getSysPowerDownVoltage:%u' % vol)
-
-#  Set VSY off voltage as 2600mV, Adjustment range 2600mV ~ 3300mV
-PMU.setSysPowerDownVoltage(2600)
-
-vol = PMU.getSysPowerDownVoltage()
-print('->  getSysPowerDownVoltage:%u' % vol)
-
-#  DC1 IMAX = 2A
-#  1500~3400mV, 100mV/step, 20steps
-PMU.setDC1Voltage(3300)
-# print('DC1  : %s   Voltage:%u mV ' % PMU.isEnableDC1()  ? '+': '-', PMU.getDC1Voltage())
-print('DC1  : {0}   Voltage:{1} mV '.format(
-    ('-', '+')[PMU.isEnableDC1()], PMU.getDC1Voltage()))
-
-
-#  DC2 IMAX = 2A
-#  500~1200mV  10mV/step, 71steps
-#  1220~1540mV 20mV/step, 17steps
-PMU.setDC2Voltage(1000)
-print(PMU.isEnableDC2())
-print('DC2  : {0}   Voltage:{1} mV '.format(
-    ('-', '+')[PMU.isEnableDC2()], PMU.getDC2Voltage()))
-
-#  DC3 IMAX = 2A
-#  500~1200mV, 10mV/step, 71steps
-#  1220~1540mV, 20mV/step, 17steps
-#  1600~3400mV, 100mV/step, 19steps
-PMU.setDC3Voltage(3300)
-print('DC3  : {0}   Voltage:{1} mV '.format(
-    ('-', '+')[PMU.isEnableDC3()], PMU.getDC3Voltage()))
-
-#  DCDC4 IMAX = 1.5A
-#  500~1200mV, 10mV/step, 71steps
-#  1220~1840mV, 20mV/step, 32steps
-PMU.setDC4Voltage(1000)
-print('DC4  : {0}   Voltage:{1} mV '.format(
-    ('-', '+')[PMU.isEnableDC4()], PMU.getDC4Voltage()))
-
-#  DC5 IMAX = 2A
-#  1200mV
-#  1400~3700mV, 100mV/step, 24steps
-PMU.setDC5Voltage(3300)
-print('DC5  : {0}   Voltage:{1} mV '.format(
-    ('-', '+')[PMU.isEnableDC5()], PMU.getDC5Voltage()))
-
-# ALDO1 IMAX = 300mA
-# 500~3500mV, 100mV/step, 31steps
-PMU.setALDO1Voltage(3300)
-
-# ALDO2 IMAX = 300mA
-# 500~3500mV, 100mV/step, 31steps
-PMU.setALDO2Voltage(3300)
-
-# ALDO3 IMAX = 300mA
-# 500~3500mV, 100mV/step, 31steps
-PMU.setALDO3Voltage(3300)
-
-# ALDO4 IMAX = 300mA
-# 500~3500mV, 100mV/step, 31steps
-PMU.setALDO4Voltage(3300)
-
-# BLDO1 IMAX = 300mA
-# 500~3500mV, 100mV/step, 31steps
-PMU.setBLDO1Voltage(3300)
-
-# BLDO2 IMAX = 300mA - This supports the ADS1232 with 5V
-# 500~3500mV, 100mV/step, 31steps
-PMU.setBLDO2Voltage(3300)
-
-# CPUSLDO IMAX = 30mA
-# 500~1400mV, 50mV/step, 19steps
-PMU.setCPUSLDOVoltage(1000)
-
-# DLDO1 IMAX = 300mA
-# 500~3400mV, 100mV/step, 29steps
-PMU.setDLDO1Voltage(3300)
-
-# DLDO2 IMAX = 300mA
-# 500~1400mV, 50mV/step, 2steps
-PMU.setDLDO2Voltage(3300)
-
-#  PMU.enableDC1()
-PMU.enableDC2()
-PMU.enableDC3()
-PMU.enableDC4()
-PMU.enableDC5()
-PMU.enableALDO1()
-PMU.enableALDO2()
-PMU.enableALDO3()
-PMU.enableALDO4()
-PMU.enableBLDO1()
-PMU.enableBLDO2()
-PMU.enableCPUSLDO()
-PMU.enableDLDO1()
-PMU.enableDLDO2()
-
-print('===================================')
-print('DC1    : {0}   Voltage:{1} mV '.format(
-    ('-', '+')[PMU.isEnableDC1()], PMU.getDC1Voltage()))
-print('DC2    : {0}   Voltage:{1} mV '.format(
-    ('-', '+')[PMU.isEnableDC2()], PMU.getDC2Voltage()))
-print('DC3    : {0}   Voltage:{1} mV '.format(
-    ('-', '+')[PMU.isEnableDC3()], PMU.getDC3Voltage()))
-print('DC4    : {0}   Voltage:{1} mV '.format(
-    ('-', '+')[PMU.isEnableDC4()], PMU.getDC4Voltage()))
-print('DC5    : {0}   Voltage:{1} mV '.format(
-    ('-', '+')[PMU.isEnableDC5()], PMU.getDC5Voltage()))
-print('===================================')
-print('ALDO1  : {0}   Voltage:{1} mV '.format(
-    ('-', '+')[PMU.isEnableALDO1()], PMU.getALDO1Voltage()))
-print('ALDO2  : {0}   Voltage:{1} mV '.format(
-    ('-', '+')[PMU.isEnableALDO2()], PMU.getALDO2Voltage()))
-print('ALDO3  : {0}   Voltage:{1} mV '.format(
-    ('-', '+')[PMU.isEnableALDO3()], PMU.getALDO3Voltage()))
-print('ALDO4  : {0}   Voltage:{1} mV '.format(
-    ('-', '+')[PMU.isEnableALDO4()], PMU.getALDO4Voltage()))
-print('===================================')
-print('BLDO1  : {0}   Voltage:{1} mV '.format(
-    ('-', '+')[PMU.isEnableBLDO1()], PMU.getBLDO1Voltage()))
-print('BLDO2  : {0}   Voltage:{1} mV '.format(
-    ('-', '+')[PMU.isEnableBLDO2()], PMU.getBLDO2Voltage()))
-print('===================================')
-print('CPUSLDO: {0}   Voltage:{1} mV '.format(
-    ('-', '+')[PMU.isEnableCPUSLDO()], PMU.getCPUSLDOVoltage()))
-print('===================================')
-print('DLDO1  : {0}   Voltage:{1} mV '.format(
-    ('-', '+')[PMU.isEnableDLDO1()], PMU.getDLDO1Voltage()))
-print('DLDO2  : {0}   Voltage:{1} mV '.format(
-    ('-', '+')[PMU.isEnableDLDO2()], PMU.getDLDO2Voltage()))
-print('===================================')
-
-#  Set the time of pressing the button to turn off
-powerOff = ['4', '6', '8', '10']
-PMU.setPowerKeyPressOffTime(PMU.XPOWERS_POWEROFF_6S)
-opt = PMU.getPowerKeyPressOffTime()
-print('PowerKeyPressOffTime: %s Sceond' % powerOff[opt])
-
-
-#  Set the button power-on press time
-powerOn = ['128ms', '512ms', '1000ms', '2000ms']
-PMU.setPowerKeyPressOnTime(PMU.XPOWERS_POWERON_2S)
-opt = PMU.getPowerKeyPressOnTime()
-print('PowerKeyPressOnTime: %s ' % powerOn[opt])
-
-
-print('===================================')
-
-#  DCDC 120 % (130 %) high voltage turn off PMIC function
-en = PMU.getDCHighVoltagePowerDowmEn()
-print('getDCHighVoltagePowerDowmEn:%s' % ('DISABLE', 'ENABLE')[en])
-
-#  DCDC1 85 % low voltage turn off PMIC function
-en = PMU.getDC1LowVoltagePowerDowmEn()
-print('getDC1LowVoltagePowerDowmEn:%s' % ('DISABLE', 'ENABLE')[en])
-
-#  DCDC2 85 % low voltage turn off PMIC function
-en = PMU.getDC2LowVoltagePowerDowmEn()
-print('getDC2LowVoltagePowerDowmEn:%s' % ('DISABLE', 'ENABLE')[en])
-
-#  DCDC3 85 % low voltage turn off PMIC function
-en = PMU.getDC3LowVoltagePowerDowmEn()
-print('getDC3LowVoltagePowerDowmEn:%s' % ('DISABLE', 'ENABLE')[en])
-
-#  DCDC4 85 % low voltage turn off PMIC function
-en = PMU.getDC4LowVoltagePowerDowmEn()
-print('getDC4LowVoltagePowerDowmEn:%s' % ('DISABLE', 'ENABLE')[en])
-
-#  DCDC5 85 % low voltage turn off PMIC function
-en = PMU.getDC5LowVoltagePowerDowmEn()
-print('getDC5LowVoltagePowerDowmEn:%s' % ('DISABLE', 'ENABLE')[en])
-
-
-#  PMU.setDCHighVoltagePowerDowm(true)
-#  PMU.setDC1LowVoltagePowerDowm(true)
-#  PMU.setDC2LowVoltagePowerDowm(true)
-#  PMU.setDC3LowVoltagePowerDowm(true)
-#  PMU.setDC4LowVoltagePowerDowm(true)
-#  PMU.setDC5LowVoltagePowerDowm(true)
-
-#  It is necessary to disable the detection function of the TS pin on the board
-#  without the battery temperature detection function, otherwise it will cause abnormal charging
-PMU.disableTSPinMeasure()
-
-#  PMU.enableTemperatureMeasure()
-
-#  Enable internal ADC detection
-PMU.enableBattDetection()
-PMU.enableVbusVoltageMeasure()
-PMU.enableBattVoltageMeasure()
-PMU.enableSystemVoltageMeasure()
-
-'''
-The default setting is CHGLED is automatically controlled by the PMU.
-- XPOWERS_CHG_LED_OFF,
-- XPOWERS_CHG_LED_BLINK_1HZ,
-- XPOWERS_CHG_LED_BLINK_4HZ,
-- XPOWERS_CHG_LED_ON,
-- XPOWERS_CHG_LED_CTRL_CHG,
-'''
-PMU.setChargingLedMode(PMU.XPOWERS_CHG_LED_OFF)
-
-
-#  Disable all interrupts
-PMU.disableIRQ(PMU.XPOWERS_AXP2101_ALL_IRQ)
-#  Clear all interrupt flags
-PMU.clearIrqStatus()
-#  Enable the required interrupt function
-PMU.enableIRQ(
-    PMU.XPOWERS_AXP2101_BAT_INSERT_IRQ | PMU.XPOWERS_AXP2101_BAT_REMOVE_IRQ |  # BATTERY
-    PMU.XPOWERS_AXP2101_VBUS_INSERT_IRQ | PMU.XPOWERS_AXP2101_VBUS_REMOVE_IRQ |  # VBUS
-    PMU.XPOWERS_AXP2101_PKEY_SHORT_IRQ | PMU.XPOWERS_AXP2101_PKEY_LONG_IRQ |  # POWER KEY
-    PMU.XPOWERS_AXP2101_BAT_CHG_DONE_IRQ | PMU.XPOWERS_AXP2101_BAT_CHG_START_IRQ  # CHARGE
-    #  PMU.XPOWERS_AXP2101_PKEY_NEGATIVE_IRQ | PMU.XPOWERS_AXP2101_PKEY_POSITIVE_IRQ | # POWER KEY
-)
-
-#  Set the precharge charging current
-PMU.setPrechargeCurr(PMU.XPOWERS_AXP2101_PRECHARGE_50MA)
-#  Set constant current charge current limit
-PMU.setChargerConstantCurr(PMU.XPOWERS_AXP2101_CHG_CUR_200MA)
-#  Set stop charging termination current
-PMU.setChargerTerminationCurr(PMU.XPOWERS_AXP2101_CHG_ITERM_25MA)
-
-#  Set charge cut-off voltage
-PMU.setChargeTargetVoltage(PMU.XPOWERS_AXP2101_CHG_VOL_4V1)
-
-#  Set the watchdog trigger event type
-PMU.setWatchdogConfig(PMU.XPOWERS_AXP2101_WDT_IRQ_TO_PIN)
-#  Set watchdog timeout
-PMU.setWatchdogTimeout(PMU.XPOWERS_AXP2101_WDT_TIMEOUT_4S)
-#  Enable watchdog to trigger interrupt event
-#  PMU.enableWatchdog()
-
-PMU.disableWatchdog()
-
-PMU.clearIrqStatus()
-
-
-data = [1, 2, 3, 4]
-print('Write buffer to pmu')
-PMU.writeDataBuffer(data, 4)
-print('Read buffer from pmu')
-tmp = PMU.readDataBuffer(4)
-print(tmp)
-
-
-if implementation.name == 'micropython':
-    irq = Pin(IRQ, Pin.IN, Pin.PULL_UP)
-    irq.irq(trigger=Pin.IRQ_FALLING, handler=__callback)
-
-
-while True:
-
-    if pmu_flag:
-        pmu_flag = False
-        mask = PMU.getIrqStatus()
-        print('pmu_flag:', end='')
-        print(bin(mask))
-
-        if PMU.isPekeyShortPressIrq():
-            print("IRQ ---> isPekeyShortPress")
-        if PMU.isPekeyLongPressIrq():
-            print("IRQ ---> isPekeyLongPress")
-        if PMU.isPekeyNegativeIrq():
-            print("IRQ ---> isPekeyNegative")
-        if PMU.isPekeyPositiveIrq():
-            print("IRQ ---> isPekeyPositive")
-        if PMU.isWdtExpireIrq():
-            print("IRQ ---> isWdtExpire")
-
-        PMU.clearIrqStatus()
-
-    PMU.setChargingLedMode((PMU.XPOWERS_CHG_LED_OFF, PMU.XPOWERS_CHG_LED_ON)[
-                           PMU.getChargingLedMode() == PMU.XPOWERS_CHG_LED_OFF])
-    print("getBattVoltage:{0}mV".format(PMU.getBattVoltage()))
-    print("getSystemVoltage:{0}mV".format(PMU.getSystemVoltage()))
-    print("getBatteryPercent:{0}%".format(PMU.getBatteryPercent()))
-
-    print("isCharging:{0}".format(PMU.isCharging()))
-    print("isDischarge:{0}".format(PMU.isDischarge()))
-    print("isStandby:{0}".format(PMU.isStandby()))
-    break
-    # time.sleep(0.8)
-
-# ============ End of PMU Initialization ============
 
 # ============ Begin of BMP2800 Initialization ============
 # I2CBMP = SoftI2C(scl=Pin(18), sda=Pin(17), freq=1000000)
@@ -423,7 +95,7 @@ def pressure():
 print(pressure(), "hPa")
 
 # ============ Begin of UBlox M10S-00B Initialization ============
-uart = UART(1,baudrate = 9600, bits=8, parity=None, stop=1, tx = Pin(8),rx = Pin(9), timeout=300)
+uart = board.gps_uart
 n=0
 while True:
     if uart.any():
@@ -441,9 +113,8 @@ while True:
 # CS = IO34
 # INT = IO33
 
-spi = SPI(2, baudrate=1000000, polarity=1, phase=1, sck=Pin(36), mosi=Pin(35), miso=Pin(37))
-cs = Pin(34,Pin.OUT)
-cs.value(1) # Set CS high to start
+spi = board.qmi_spi
+cs = board.qmi_cs  # initialised high
 
 # Register addresses
 REG_WHO_AM_I = 0x00		# Default: 0x05
@@ -628,7 +299,10 @@ while True:
 from PiicoDev_QMC6310 import PiicoDev_QMC6310
 from PiicoDev_Unified import sleep_ms
 
-magSensor = PiicoDev_QMC6310(bus=0, freq=1000000, scl=Pin(18), sda=Pin(17), range=3000) # initialise the magnetometer
+# NOTE: PiicoDev re-creates I2C bus 0 at 1 MHz; to be consolidated into
+# board.i2c0 in migration step 3.
+magSensor = PiicoDev_QMC6310(bus=0, freq=1000000, scl=Pin(config.I2C0_SCL),
+                             sda=Pin(config.I2C0_SDA), range=3000)
 # magSensor.calibrate()
  
 threshold = 120 # microTesla or 'uT'.
@@ -650,7 +324,8 @@ def displaymag():
 
 
 # ============ Begin of Display Initialization ============
-display = sh1106.SH1106_I2C(128, 64, i2c, Pin(16), 0x3c)
+display = sh1106.SH1106_I2C(config.OLED_WIDTH, config.OLED_HEIGHT, board.i2c0,
+                            Pin(config.OLED_RST), config.OLED_ADDR)
 printdisplay("Test")
 sleep_ms(1000)
 
@@ -665,11 +340,14 @@ def cb(events):
     elif events & SX1262.TX_DONE:
         print('TX done.')
         
-sx = SX1262(spi_bus=1, clk=12, mosi=11, miso=13, cs=10, irq=1, rst=5, gpio=4)
+sx = SX1262(spi_bus=config.LORA_SPI_BUS, clk=config.LORA_CLK,
+            mosi=config.LORA_MOSI, miso=config.LORA_MISO, cs=config.LORA_CS,
+            irq=config.LORA_IRQ, rst=config.LORA_RST, gpio=config.LORA_BUSY)
 # print("2")
 # LoRa
-sx.begin(freq=868.0, bw=500.0, sf=12, cr=8, syncWord=0x12,
-         power=-5, currentLimit=60.0, preambleLength=8,
+sx.begin(freq=config.LORA_FREQ_MHZ, bw=config.LORA_BW_KHZ, sf=config.LORA_SF,
+         cr=config.LORA_CR, syncWord=config.LORA_SYNC_WORD,
+         power=config.LORA_TX_POWER_DBM, currentLimit=60.0, preambleLength=8,
          implicit=False, implicitLen=0xFF,
          crcOn=True, txIq=False, rxIq=False,
          tcxoVoltage=1.7, useRegulatorLDO=False, blocking=True)
@@ -688,11 +366,11 @@ sx.setBlockingCallback(False, cb)
 # ============ Initialize ADS1232  ============
 
 # Pin assignments
-PDWN = Pin(39, Pin.OUT)  # Power down / reset 39
-SCLK = Pin(45, Pin.OUT)  # Serial clock 45
-DOUT = Pin(46, Pin.IN)   # Data out / data ready (DRDY) 46
-GAIN0 = Pin(38, Pin.OUT)    # GAIN0 connected to IO38
-GAIN1 = Pin(2, Pin.OUT)     # GAIN1 connected to IO2
+PDWN = Pin(config.ADS_PDWN, Pin.OUT)   # Power down / reset
+SCLK = Pin(config.ADS_SCLK, Pin.OUT)   # Serial clock
+DOUT = Pin(config.ADS_DOUT, Pin.IN)    # Data out / data ready (DRDY)
+GAIN0 = Pin(config.ADS_GAIN0, Pin.OUT)
+GAIN1 = Pin(config.ADS_GAIN1, Pin.OUT)
 
 # Wake up and initialize ADS1232
 PDWN.value(1)
@@ -776,7 +454,7 @@ def compute_rope_inclination(ax, ay, az):
 
 # ============ Begin of Loop for ADS1232 ============
 # Example loop
-gain = 128
+gain = config.ADS_GAIN
 set_gain(gain)
 
 def tare(samples=10):
