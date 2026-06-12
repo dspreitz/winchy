@@ -167,6 +167,11 @@ async def telemetry_task(sx, state):
             state.pressure_hpa, state.system_mv, flags)
         print("ADC value:", force)
         print("Seilwinkel:", state.angle_deg)
+        ax, ay, az = state.accel
+        gx, gy, gz = state.gyro_dps
+        print("Motion: |a|=%.3f g a=(%.2f,%.2f,%.2f) gyro=(%.1f,%.1f,%.1f) dps"
+              % (math.sqrt(ax * ax + ay * ay + az * az), ax, ay, az,
+                 gx, gy, gz))
         if state.qnh_hpa:
             print("Baro alt: %.1f m (GPS %.1f m, %+.1f m/s)"
                   % (state.baro_alt_m, state.alt_m, state.climb_rate_ms))
@@ -202,15 +207,17 @@ async def supervisor_task(pmu, state):
 async def _main(pmu, adc, imu, baro, sx, display, state, gyro_bias):
     gravity_filter = GravityKalman()
     vertical_filter = VerticalKalman()
-    await asyncio.gather(
+    tasks = [
         force_task(adc, state),
         imu_task(imu, state, gravity_filter, gyro_bias),
         baro_task(baro, state, vertical_filter),
         gps_task(state),
         telemetry_task(sx, state),
-        display_task(display, state),
         supervisor_task(pmu, state),
-    )
+    ]
+    if display:
+        tasks.append(display_task(display, state))
+    await asyncio.gather(*tasks)
 
 
 def run():
@@ -248,10 +255,15 @@ def run():
     display = sh1106.SH1106_I2C(config.OLED_WIDTH, config.OLED_HEIGHT,
                                 board.i2c0, Pin(config.OLED_RST),
                                 config.OLED_ADDR)
-    display.sleep(False)
-    display.fill(0)
-    display.text("Winchy rope unit", 0, 0)
-    display.show()
+    if config.DISPLAY_ENABLED:
+        display.sleep(False)
+        display.fill(0)
+        display.text("Winchy rope unit", 0, 0)
+        display.show()
+    else:
+        display.sleep(True)  # panel off
+        display = None
+        print("Display disabled (config.DISPLAY_ENABLED)")
 
     # --- LoRa
     def on_radio(events):

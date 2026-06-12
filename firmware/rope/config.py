@@ -50,7 +50,10 @@ ADS_GAIN0 = 38
 ADS_GAIN1 = 2
 ADS_GAIN = 128
 
-# SH1106 OLED
+# SH1106 OLED. Disabled: the panel is physically blocked by the ADS1232
+# breakout PCB, so it only wastes power. Set True to re-enable the status
+# page and the display task.
+DISPLAY_ENABLED = False
 OLED_RST = 16
 OLED_ADDR = 0x3C
 OLED_WIDTH = 128
