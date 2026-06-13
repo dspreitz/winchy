@@ -79,7 +79,8 @@ except ImportError:
 # Latest decoded telemetry, served as JSON. Rebuilt (not mutated) in the RX
 # callback so the server always reads a complete snapshot.
 latest = {"phase": "--", "force": 0, "uncal": True, "angle": 0.0, "alt": 0,
-          "rssi": 0, "batt": 0.0, "battlow": False, "tsync": False,
+          "rssi": 0, "batt": 0.0, "battlow": False, "battpct": 255,
+          "charging": False, "tsync": False,
           "time": "--:--:--", "tsrc": "--", "rx": 0, "lost": 0}
 
 # Winch RTC sync: NTP (via WiFi) is preferred; the rope's GPS time over the
@@ -180,6 +181,8 @@ def on_receive(events):
                   "angle": msg["angle_deg"], "alt": msg["altitude_m"],
                   "rssi": last_rssi, "batt": msg["batt_v"],
                   "battlow": bool(msg["flags"] & protocol.FLAG_BATTERY_LOW),
+                  "battpct": msg["batt_pct"],
+                  "charging": bool(msg["flags"] & protocol.FLAG_CHARGING),
                   "gps": bool(msg["flags"] & protocol.FLAG_GPS_FIX),
                   "tsync": clock_set,   # winch RTC set (NTP or GPS)?
                   "time": ("%02d:%02d:%02d" % (tm[3], tm[4], tm[5])
@@ -224,7 +227,7 @@ body{font-family:sans-serif;background:#111;color:#eee;margin:0;text-align:cente
 <div class=row><div class=cell><div class=lbl>FORCE</div><div id=force class=big>--</div></div>
 <div class=cell><div class=lbl>ANGLE</div><div id=angle class=big>--</div></div></div>
 <div class=row><div class=cell><div class=lbl>ALT m</div><div id=alt class=big>--</div></div>
-<div class=cell><div class=lbl>BATT V</div><div id=batt class=big>--</div></div></div>
+<div class=cell><div class=lbl>BATT</div><div id=batt class=big>--</div><div id=battsub class=lbl>--</div></div></div>
 <div id=link class=lbl>link --</div>
 <script>
 var last=Date.now();
@@ -234,7 +237,9 @@ function tick(){
   phase.textContent=d.phase;
   force.textContent=d.force+(d.uncal?' c':' N');
   angle.textContent=d.angle.toFixed(1);
-  alt.textContent=d.alt;batt.textContent=d.batt.toFixed(1);
+  alt.textContent=d.alt;
+  batt.textContent=(d.battpct>100?'--':d.battpct+'%')+(d.charging?' CHG':'');
+  battsub.textContent=d.batt.toFixed(1)+' V';
   link.textContent='link '+d.rssi+' dBm   rx'+d.rx+' lost'+d.lost;
   warn.style.display=d.battlow?'block':'none';
   gpsdot.style.background=d.gps?'#1c1':'#c33';

@@ -230,6 +230,8 @@ async def telemetry_task(sx, state):
             flags |= protocol.FLAG_TIME_SYNCED
         if state.batt_low:
             flags |= protocol.FLAG_BATTERY_LOW
+        if state.charging:
+            flags |= protocol.FLAG_CHARGING
         frame_count += 1
         report_requested = bool(
             REPORT_REQUEST_EVERY and frame_count % REPORT_REQUEST_EVERY == 0)
@@ -238,7 +240,8 @@ async def telemetry_task(sx, state):
         # Tow phase detection arrives with the state machine (step 6).
         frame = protocol.encode_telemetry(
             seq, protocol.PHASE_IDLE, force, state.angle_deg,
-            state.baro_alt_m, state.batt_mv, flags)  # real cell, not sys rail
+            state.baro_alt_m, state.batt_mv, flags,  # real cell, not sys rail
+            state.batt_pct)
         print("ADC value:", force)
         print("Seilwinkel:", state.angle_deg)
         ax, ay, az = state.accel
@@ -313,6 +316,7 @@ async def supervisor_task(pmu, state):
         state.system_mv = pmu.getSystemVoltage()
         state.batt_mv = pmu.getBattVoltage()
         state.batt_pct = pmu.getBatteryPercent()
+        state.charging = pmu.isCharging()
         # Recurring low-battery check - only meaningful while IDLE, and only
         # when a cell is actually fitted (0 mV = USB-only, not "empty").
         if state.phase == protocol.PHASE_IDLE and state.batt_mv > BATT_PRESENT_MV:
