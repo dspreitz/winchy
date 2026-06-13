@@ -161,7 +161,8 @@ async def imu_task(imu, state, filt, gyro_bias):
         except OSError:
             raw_bytes = 0
         rawf.write("# boot\n# t_ms,ax,ay,az,gx,gy,gz,mx,my,mz,force,"
-                   "pressure_hpa,baro_alt_m,climb_ms,gps_alt_m,angle_deg\n")
+                   "pressure_hpa,baro_alt_m,climb_ms,gps_alt_m,gps_lat,"
+                   "gps_lon,gps_fix,gps_sats,angle_deg\n")
         rawf.flush()
     while True:
         accel = imu.read_accel()
@@ -192,10 +193,11 @@ async def imu_task(imu, state, filt, gyro_bias):
             mx, my, mz = state.mag   # held; mag_task refreshes it at ~20 Hz
             raw_buf.append(
                 "%d,%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f,%d,"
-                "%.2f,%.1f,%.2f,%.1f,%.1f\n" % (
+                "%.2f,%.1f,%.2f,%.1f,%.7f,%.7f,%d,%d,%.1f\n" % (
                     now, accel[0], accel[1], accel[2], gyro[0], gyro[1],
                     gyro[2], mx, my, mz, state.force_raw, state.pressure_hpa,
                     state.baro_alt_m, state.climb_rate_ms, state.alt_m,
+                    state.lat, state.lon, state.gps_fix, state.gps_sats,
                     state.angle_deg))
             if len(raw_buf) >= RAW_LOG_FLUSH_EVERY:
                 for r in raw_buf:
