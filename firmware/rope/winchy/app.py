@@ -75,6 +75,17 @@ RAW_LOG = True
 RAW_LOG_PATH = "raw.csv"
 RAW_LOG_FLUSH_EVERY = 100   # rows buffered (~2 s at 50 Hz) per flash write
 RAW_LOG_MAX_BYTES = 4000000
+# Motion gating: a winch sits idle most of the time, so logging only around
+# movement keeps the log (and the planned WiFi->GitHub upload) minimal. A
+# time-based ring buffer holds the last RAW_LOG_PREROLL_S so the START of a
+# launch is captured; once the unit has been at rest RAW_LOG_REST_HOLD_S, the
+# segment is closed. Set RAW_LOG_MOTION_GATED False to log everything (e.g. a
+# dedicated full-rate Kalman-validation capture).
+RAW_LOG_MOTION_GATED = True
+RAW_LOG_PREROLL_S = 5       # rolling pre-roll captured before motion starts
+RAW_LOG_REST_HOLD_S = 5     # continuous rest this long closes a segment
+MOTION_ACCEL_DEV_G = 0.10   # |norm-1g| over this = moving (rest <= 0.04)
+MOTION_GYRO_DPS = 10.0      # bias-corrected gyro magnitude over this = moving
 
 # Closed-loop TX-power control (ADR). Drives the rope's output power from the
 # winch's reported downlink quality. Hardened after an earlier version starved
@@ -152,8 +163,11 @@ async def imu_task(imu, state, filt, gyro_bias):
     bias = list(gyro_bias)
     last = time.ticks_ms()
     rawf = None
-    raw_buf = []
+    raw_buf = []            # write batch while recording
     raw_bytes = 0
+    ring = []              # rolling pre-roll: (t_ms, rowstr), idle only
+    recording = False
+    last_motion_ts = 0
     if RAW_LOG:
         rawf = open(RAW_LOG_PATH, "a")
         try:
@@ -191,22 +205,54 @@ async def imu_task(imu, state, filt, gyro_bias):
         # is logged RAW (un-bias-corrected) so the bias estimation replays too.
         if rawf is not None and raw_bytes < RAW_LOG_MAX_BYTES:
             mx, my, mz = state.mag   # held; mag_task refreshes it at ~20 Hz
-            raw_buf.append(
-                "%d,%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f,%d,"
-                "%.2f,%.1f,%.2f,%.1f,%.7f,%.7f,%d,%d,%.1f\n" % (
-                    now, accel[0], accel[1], accel[2], gyro[0], gyro[1],
-                    gyro[2], mx, my, mz, state.force_raw, state.pressure_hpa,
-                    state.baro_alt_m, state.climb_rate_ms, state.alt_m,
-                    state.lat, state.lon, state.gps_fix, state.gps_sats,
-                    state.angle_deg))
-            if len(raw_buf) >= RAW_LOG_FLUSH_EVERY:
-                for r in raw_buf:
-                    rawf.write(r)
-                    raw_bytes += len(r)
-                rawf.flush()
-                raw_buf = []
-                gc.collect()   # reclaim per-row string churn; avoids the
-                #                progressive heap-fragmentation slowdown
+            row = ("%d,%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f,%d,"
+                   "%.2f,%.1f,%.2f,%.1f,%.7f,%.7f,%d,%d,%.1f\n" % (
+                       now, accel[0], accel[1], accel[2], gyro[0], gyro[1],
+                       gyro[2], mx, my, mz, state.force_raw, state.pressure_hpa,
+                       state.baro_alt_m, state.climb_rate_ms, state.alt_m,
+                       state.lat, state.lon, state.gps_fix, state.gps_sats,
+                       state.angle_deg))
+
+            # Motion gate. Rest baselines (motion-test): accel_dev <= 0.04 g,
+            # gyro_mag < 1 dps. A flat spin keeps |a| ~ 1 g, so the gyro term is
+            # what catches it - both terms are needed.
+            moving = (not RAW_LOG_MOTION_GATED) or (
+                abs(norm - 1.0) > MOTION_ACCEL_DEV_G
+                or max(abs(corrected[0]), abs(corrected[1]),
+                       abs(corrected[2])) > MOTION_GYRO_DPS)
+
+            if not recording:
+                ring.append((now, row))
+                # trim the rolling pre-roll to the last RAW_LOG_PREROLL_S
+                while time.ticks_diff(now, ring[0][0]) > RAW_LOG_PREROLL_S * 1000:
+                    ring.pop(0)
+                if moving:
+                    rawf.write("# motion-start t=%d\n" % now)
+                    for _, r in ring:
+                        rawf.write(r)
+                        raw_bytes += len(r)
+                    rawf.flush()
+                    ring = []
+                    recording = True
+                    last_motion_ts = now
+                    gc.collect()
+            else:
+                raw_buf.append(row)
+                if moving:
+                    last_motion_ts = now
+                ended = time.ticks_diff(
+                    now, last_motion_ts) >= RAW_LOG_REST_HOLD_S * 1000
+                if len(raw_buf) >= RAW_LOG_FLUSH_EVERY or ended:
+                    for r in raw_buf:
+                        rawf.write(r)
+                        raw_bytes += len(r)
+                    raw_buf = []
+                    if ended:
+                        rawf.write("# rest t=%d\n" % now)
+                        recording = False
+                    rawf.flush()
+                    gc.collect()   # reclaim per-row string churn; avoids the
+                    #                progressive heap-fragmentation slowdown
         await asyncio.sleep_ms(IMU_PERIOD_MS)
 
 
