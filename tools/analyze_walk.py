@@ -32,15 +32,16 @@ for line in open(rope_path):
     tx = int(f[7]) if len(f) > 7 else None   # tx_dbm (added later)
     gps[int(f[0])] = (lat, lon, float(f[4]), tx)
 
-# winch: seq -> (rssi, snr)
+# winch: seq -> (rssi, snr). Columns:
+# utc,seq,phase,force,angle_deg,alt_m,batt_v,batt_pct,flags,rssi,snr
 rssi = {}
 for line in open(winch_path):
     if line[0] == "#":
         continue
     f = line.strip().split(",")
-    if len(f) < 4:
+    if len(f) < 11:
         continue
-    rssi[int(f[1])] = (int(f[2]), int(f[3]))
+    rssi[int(f[1])] = (int(f[9]), int(f[10]))
 
 joined = sorted(set(gps) & set(rssi))
 if not joined:

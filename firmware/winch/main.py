@@ -59,7 +59,8 @@ WARN_BLINK_FRAMES = 4   # frames per state (~2 s at 2 Hz) when battery is low
 # avoid flash wear; clear winch_rxlog.csv before each run for a fresh log.
 LOG_TO_FLASH = True         # log every RX frame to flash; also served at /log
 LOG_PATH = "winch_rxlog.csv"
-log_buf = []        # pending "utc,seq,rssi,snr,flags" lines (utc = ISO8601 Z)
+log_buf = []        # pending CSV rows: utc,seq,phase,force,angle_deg,alt_m,
+                    # batt_v,batt_pct,flags,rssi,snr  (utc = ISO8601 Z)
 
 # Optional WiFi dashboard: the winch joins an existing WiFi network and serves
 # a live telemetry page (HTTP poll, ~2 Hz) to any phone/laptop on that network
@@ -222,9 +223,12 @@ def on_receive(events):
     if msg["type"] == protocol.TELEMETRY:
         tm = time.localtime()           # RTC is UTC (NTP/GPS-synced)
         if LOG_TO_FLASH:  # buffer only; the main loop does the flash write
-            log_buf.append("%04d-%02d-%02dT%02d:%02d:%02dZ,%d,%d,%d,%d\n" % (
-                tm[0], tm[1], tm[2], tm[3], tm[4], tm[5],
-                seq, last_rssi, last_snr, msg["flags"]))
+            log_buf.append(
+                "%04d-%02d-%02dT%02d:%02d:%02dZ,%d,%d,%d,%.1f,%d,%.1f,%d,%d,%d,%d\n"
+                % (tm[0], tm[1], tm[2], tm[3], tm[4], tm[5], seq, msg["phase"],
+                   msg["force"], msg["angle_deg"], msg["altitude_m"],
+                   msg["batt_v"], msg["batt_pct"], msg["flags"],
+                   last_rssi, last_snr))
         latest = {"phase": protocol.PHASE_NAMES.get(msg["phase"], "?"),
                   "force": msg["force"],
                   "uncal": bool(msg["flags"] & protocol.FLAG_FORCE_UNCALIBRATED),
@@ -391,7 +395,9 @@ print("Winch receiver ready")
 logf = None
 if LOG_TO_FLASH:
     logf = open(LOG_PATH, "a")  # append so a reboot mid-run keeps prior data
-    logf.write("# boot\n")      # delimiter; data rows carry UTC once synced
+    logf.write("# boot\n"       # delimiter; data rows carry UTC once synced
+               "# utc,seq,phase,force,angle_deg,alt_m,batt_v,batt_pct,"
+               "flags,rssi,snr\n")
     logf.flush()
 
 if WIFI_ENABLED:
