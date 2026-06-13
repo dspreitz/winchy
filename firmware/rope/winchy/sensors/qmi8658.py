@@ -27,7 +27,15 @@ class QMI8658:
     def __init__(self, spi, cs):
         self._spi = spi
         self._cs = cs
-        who = self._read(_REG_WHO_AM_I)[0]
+        # The IMU can read back 0x00 for the first few ms after power-up (SPI
+        # not ready yet), which used to crash the boot. Poll WHO_AM_I a few
+        # times with a short settle before giving up.
+        who = 0
+        for _ in range(20):
+            who = self._read(_REG_WHO_AM_I)[0]
+            if who == _WHO_AM_I_VALUE:
+                break
+            time.sleep_ms(10)
         if who != _WHO_AM_I_VALUE:
             raise RuntimeError("QMI8658 not found (WHO_AM_I=0x%02x)" % who)
         # Same register configuration as the original monolith.

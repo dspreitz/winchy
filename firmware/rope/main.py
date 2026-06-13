@@ -11,6 +11,7 @@ import sys
 import time
 
 import machine
+import micropython
 from machine import Pin
 
 CRASH_RESET_DELAY_S = 10   # interruptible window before auto-reset on a crash
@@ -20,12 +21,21 @@ CRASH_RESET_DELAY_S = 10   # interruptible window before auto-reset on a crash
 if Pin(0, Pin.IN, Pin.PULL_UP).value() == 0:
     print("SAFE MODE: BOOT button held, application not started")
 else:
+    # Ignore Ctrl-C during the fragile startup window. A host attaching to the
+    # USB-CDC during boot (mpremote sends Ctrl-C on every connect) otherwise
+    # raised KeyboardInterrupt here and dropped to the REPL ("won't start"
+    # gremlin). _main re-enables it once the app is up, so a deliberate Ctrl-C
+    # still interrupts the running app for deploys. BOOT-button safe mode above
+    # is the escape hatch if startup itself misbehaves.
+    micropython.kbd_intr(-1)
     try:
         from winchy import app
-        app.run()  # runs forever
+        app.run()  # runs forever (re-enables Ctrl-C early in _main)
     except KeyboardInterrupt:
+        micropython.kbd_intr(3)
         print("Application interrupted, dropping to REPL")
     except Exception as e:
+        micropython.kbd_intr(3)   # keep the countdown below interruptible
         sys.print_exception(e)
         try:
             with open("crash.log", "w") as f:

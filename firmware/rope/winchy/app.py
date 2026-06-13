@@ -704,6 +704,10 @@ async def wifi_task(state):
 
 
 async def _main(pmu, adc, imu, baro, sx, display, state, gyro_bias, mag):
+    # The app is up: re-enable Ctrl-C (main.py disabled it for the startup
+    # window so a host attaching/probing during boot can't abort it). Now a
+    # deliberate Ctrl-C interrupts the running app as usual (for deploys).
+    micropython.kbd_intr(3)
     gravity_filter = GravityKalman()
     vertical_filter = VerticalKalman()
     tasks = [
