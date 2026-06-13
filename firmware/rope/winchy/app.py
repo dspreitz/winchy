@@ -69,8 +69,11 @@ GPS_LOG_FLUSH_EVERY = 4     # flush after this many records (~2 s at 2 Hz)
 # adapted here - changing SF/BW would need both ends retuned in lockstep, so
 # that stays a deliberate, handshaked step. Set ADR_ENABLED = False to pin
 # power at config.LORA_TX_POWER_DBM.
-ADR_ENABLED = True          # set False for a range test (fixes TX power so
-                            # RSSI maps directly to path loss)
+ADR_ENABLED = False         # OFF: fixed TX at config.LORA_TX_POWER_DBM (+14).
+                            # ADR drove power down on a strong link and the link
+                            # got stuck/dropped; the SF7 budget has ample margin
+                            # so power-saving isn't worth it. Re-enable only once
+                            # the ramp-up/recovery is hardened.
 ADR_TX_POWER_MIN_DBM = -9   # SX1262 floor (driver clamps below this)
 ADR_TX_POWER_MAX_DBM = 14   # EU 868.0-868.6 MHz ERP cap (25 mW); raise only if
                             # antenna gain / regulatory domain allows
