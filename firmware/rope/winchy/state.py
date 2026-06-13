@@ -35,6 +35,7 @@ class State:
         self.time_synced = False
         self.pending_time_sync = False  # telemetry task owes a TIME_SYNC frame
         self.log_start = None    # "yyyymmdd-hhmm" session start (first GPS time)
+        self.raw_uploaded_bytes = 0  # >0 = raw.csv offloaded; imu_task resets it
         # Power
         self.system_mv = 0
         self.batt_mv = 0

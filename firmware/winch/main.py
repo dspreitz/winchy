@@ -11,6 +11,7 @@
 # pinout below, decodes live TELEMETRY frames from the rope unit, OLED works.
 # Deploy protocol.py (from firmware/shared/) alongside this file.
 
+import os
 import time
 
 from machine import I2C, Pin, RTC
@@ -59,6 +60,10 @@ WARN_BLINK_FRAMES = 4   # frames per state (~2 s at 2 Hz) when battery is low
 # avoid flash wear; clear winch_rxlog.csv before each run for a fresh log.
 LOG_TO_FLASH = True         # log every RX frame to flash; also served at /log
 LOG_PATH = "winch_rxlog.csv"
+# Written at open and after an offload-reset; a file of exactly this size has
+# no data rows, so it isn't uploaded.
+LOG_HEADER = ("# boot\n# utc,seq,phase,force,angle_deg,alt_m,batt_v,batt_pct,"
+              "flags,rssi,snr\n")
 log_buf = []        # pending CSV rows: utc,seq,phase,force,angle_deg,alt_m,
                     # batt_v,batt_pct,flags,rssi,snr  (utc = ISO8601 Z)
 
@@ -173,10 +178,12 @@ def _github_upload():
     # Replace the rolling log asset on the 'logs' release: look up the release,
     # delete any existing asset of the same name, then upload the current log.
     # Blocks the asyncio loop for the round-trips (~secs); RX stays IRQ-driven.
+    # Returns the byte count offloaded (0 on failure) so the caller can reset.
     if not GITHUB_TOKEN:
-        return
+        return 0
     import urequests
     import gc
+    uploaded = 0
     # Prepend the session start (first synced time) so each session is a
     # distinct, dated file on the release.
     stamp = log_start or _stamp()
@@ -202,10 +209,36 @@ def _github_upload():
             "https://uploads.github.com/repos/%s/releases/%d/assets?name=%s"
             % (GITHUB_REPO, rid, asset), data=body, headers=h2)
         print("GitHub upload %s: HTTP %d" % (asset, u.status_code))
+        if 200 <= u.status_code < 300:
+            uploaded = len(body)
         u.close()
     except Exception as e:
         print("GitHub upload failed:", e)
     gc.collect()
+    return uploaded
+
+
+def _reset_log(uploaded):
+    # Reclaim flash after a successful offload, but only if nothing new was
+    # flushed since (else keep the rows for the next upload). IRQ-buffered rows
+    # in log_buf are in RAM and flush into the fresh file afterwards.
+    global logf
+    if logf is None:
+        return
+    try:
+        if os.stat(LOG_PATH)[6] > uploaded:
+            return
+    except OSError:
+        return
+    logf.close()
+    try:
+        os.remove(LOG_PATH)
+    except OSError:
+        pass
+    logf = open(LOG_PATH, "a")
+    logf.write(LOG_HEADER)
+    logf.flush()
+    print("winch_rxlog.csv offloaded; reset")
 
 
 def on_receive(events):
@@ -397,7 +430,14 @@ async def _serve():
         if n % 3600 == 0:                 # re-sync NTP hourly (corrects drift)
             _ntp_sync()
         if GITHUB_TOKEN and n % UPLOAD_PERIOD_S == 0:
-            _github_upload()              # interim periodic; later: per launch
+            try:                          # only if there are rows to offload
+                has_data = os.stat(LOG_PATH)[6] > len(LOG_HEADER)
+            except OSError:
+                has_data = False
+            if has_data:
+                up = _github_upload()     # interim periodic; later: per launch
+                if up:
+                    _reset_log(up)        # reclaim flash after a good upload
         await asyncio.sleep_ms(1000)
 
 
@@ -411,9 +451,7 @@ print("Winch receiver ready")
 logf = None
 if LOG_TO_FLASH:
     logf = open(LOG_PATH, "a")  # append so a reboot mid-run keeps prior data
-    logf.write("# boot\n"       # delimiter; data rows carry UTC once synced
-               "# utc,seq,phase,force,angle_deg,alt_m,batt_v,batt_pct,"
-               "flags,rssi,snr\n")
+    logf.write(LOG_HEADER)      # delimiter; data rows carry UTC once synced
     logf.flush()
 
 if WIFI_ENABLED:

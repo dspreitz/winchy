@@ -75,6 +75,11 @@ RAW_LOG = True
 RAW_LOG_PATH = "raw.csv"
 RAW_LOG_FLUSH_EVERY = 100   # rows buffered (~2 s at 50 Hz) per flash write
 RAW_LOG_MAX_BYTES = 4000000
+# Written at file open and after an offload-reset; a file of exactly this size
+# holds no episodes, so the uploader skips it.
+RAW_LOG_HEADER = ("# boot\n# t_ms,ax,ay,az,gx,gy,gz,mx,my,mz,force,"
+                  "pressure_hpa,baro_alt_m,climb_ms,gps_alt_m,gps_lat,"
+                  "gps_lon,gps_fix,gps_sats,angle_deg\n")
 # Motion gating: a winch sits idle most of the time, so logging only around
 # movement keeps the log (and the planned WiFi->GitHub upload) minimal. A
 # time-based ring buffer holds the last RAW_LOG_PREROLL_S so the START of a
@@ -191,9 +196,7 @@ async def imu_task(imu, state, filt, gyro_bias):
             raw_bytes = os.stat(RAW_LOG_PATH)[6]   # cap across reboots (append)
         except OSError:
             raw_bytes = 0
-        rawf.write("# boot\n# t_ms,ax,ay,az,gx,gy,gz,mx,my,mz,force,"
-                   "pressure_hpa,baro_alt_m,climb_ms,gps_alt_m,gps_lat,"
-                   "gps_lon,gps_fix,gps_sats,angle_deg\n")
+        rawf.write(RAW_LOG_HEADER)
         rawf.flush()
     while True:
         accel = imu.read_accel()
@@ -216,6 +219,28 @@ async def imu_task(imu, state, filt, gyro_bias):
         state.gyro_dps = corrected
         state.angle_deg = rope_angle_above_ground(*filt.gravity)
         state.accel_ts = now
+
+        # Offload-reset: wifi_task sets raw_uploaded_bytes after a successful
+        # GitHub upload. As the file's only writer, reclaim the flash here -
+        # but only between episodes and only if nothing new was written since
+        # the upload (else a fresh episode would be lost; keep it for next time).
+        if rawf is not None and state.raw_uploaded_bytes and not recording:
+            try:
+                cur = os.stat(RAW_LOG_PATH)[6]
+            except OSError:
+                cur = 0
+            if cur <= state.raw_uploaded_bytes:
+                rawf.close()
+                try:
+                    os.remove(RAW_LOG_PATH)
+                except OSError:
+                    pass
+                rawf = open(RAW_LOG_PATH, "a")
+                rawf.write(RAW_LOG_HEADER)
+                rawf.flush()
+                raw_bytes = 0
+                print("raw.csv offloaded; reset")
+            state.raw_uploaded_bytes = 0
 
         # Raw log: filter inputs (raw accel/gyro/mag, pressure, force, GPS alt)
         # + on-device outputs (baro alt/climb, angle) for offline replay. gyro
@@ -550,7 +575,6 @@ async def wifi_task(state):
     # up, try to join the known network, push raw.csv if it has new data, then
     # power WiFi back down. WiFi is separate from the SX1262 LoRa link.
     import network
-    last_uploaded = 0
     wlan = network.WLAN(network.STA_IF)
     while True:
         await asyncio.sleep_ms(WIFI_PERIOD_S * 1000)
@@ -563,7 +587,7 @@ async def wifi_task(state):
             size = os.stat(RAW_LOG_PATH)[6]
         except OSError:
             continue
-        if size <= last_uploaded:        # nothing new since the last upload
+        if size <= len(RAW_LOG_HEADER):  # header only, no episodes to offload
             continue
         try:
             wlan.active(True)
@@ -581,7 +605,8 @@ async def wifi_task(state):
                 print("WiFi '%s' joined (%s); uploading %s"
                       % (WIFI_SSID, wlan.ifconfig()[0], asset))
                 if _github_upload_raw(asset):
-                    last_uploaded = size
+                    # Tell imu_task (the file owner) it may reclaim the flash.
+                    state.raw_uploaded_bytes = size
             else:
                 print("WiFi: could not join '%s'" % WIFI_SSID)
         except Exception as e:
