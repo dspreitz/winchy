@@ -73,8 +73,17 @@ GPS_LOG_FLUSH_EVERY = 4     # flush after this many records (~2 s at 2 Hz)
 # stops at RAW_LOG_MAX_BYTES to protect it - clear/offload raw.csv per session.
 RAW_LOG = True
 RAW_LOG_PATH = "raw.csv"
-RAW_LOG_FLUSH_EVERY = 100   # rows buffered (~2 s at 50 Hz) per flash write
+RAW_LOG_FLUSH_EVERY = 100   # rows between flash flushes (flush itself is ~1 ms)
 RAW_LOG_MAX_BYTES = 4000000
+# Each f.write() to littlefs costs ~3 ms, so writing is done in raw_writer_task,
+# not the 50 Hz imu_task: imu_task only appends formatted lines to state.raw_q,
+# and the writer drains them a few at a time, yielding between chunks so a burst
+# (e.g. the pre-roll dump) never stalls sampling. (Single-core cooperative, so
+# each small chunk still blocks briefly - just ~10 ms, not one ~330 ms batch.)
+RAW_WRITE_CHUNK = 8         # rows written per writer pass before it yields
+RAW_WRITE_IDLE_MS = 50      # writer poll interval while idle / deferring
+RAW_GC_EVERY = 20           # gc.collect() every N flushes in the writer
+RAW_Q_MAX = 4000            # safety cap on the pending-write queue (~80 s @50 Hz)
 # Written at file open and after an offload-reset; a file of exactly this size
 # holds no episodes, so the uploader skips it.
 RAW_LOG_HEADER = ("# boot\n# t_ms,ax,ay,az,gx,gy,gz,mx,my,mz,force,"
@@ -184,20 +193,9 @@ async def mag_task(mag, state):
 async def imu_task(imu, state, filt, gyro_bias):
     bias = list(gyro_bias)
     last = time.ticks_ms()
-    rawf = None
-    raw_buf = []            # write batch while recording
-    raw_bytes = 0
     ring = []              # rolling pre-roll: (t_ms, rowstr), idle only
     recording = False
     last_motion_ts = 0
-    if RAW_LOG:
-        rawf = open(RAW_LOG_PATH, "a")
-        try:
-            raw_bytes = os.stat(RAW_LOG_PATH)[6]   # cap across reboots (append)
-        except OSError:
-            raw_bytes = 0
-        rawf.write(RAW_LOG_HEADER)
-        rawf.flush()
     while True:
         accel = imu.read_accel()
         gyro = imu.read_gyro()
@@ -220,32 +218,12 @@ async def imu_task(imu, state, filt, gyro_bias):
         state.angle_deg = rope_angle_above_ground(*filt.gravity)
         state.accel_ts = now
 
-        # Offload-reset: wifi_task sets raw_uploaded_bytes after a successful
-        # GitHub upload. As the file's only writer, reclaim the flash here -
-        # but only between episodes and only if nothing new was written since
-        # the upload (else a fresh episode would be lost; keep it for next time).
-        if rawf is not None and state.raw_uploaded_bytes and not recording:
-            try:
-                cur = os.stat(RAW_LOG_PATH)[6]
-            except OSError:
-                cur = 0
-            if cur <= state.raw_uploaded_bytes:
-                rawf.close()
-                try:
-                    os.remove(RAW_LOG_PATH)
-                except OSError:
-                    pass
-                rawf = open(RAW_LOG_PATH, "a")
-                rawf.write(RAW_LOG_HEADER)
-                rawf.flush()
-                raw_bytes = 0
-                print("raw.csv offloaded; reset")
-            state.raw_uploaded_bytes = 0
-
         # Raw log: filter inputs (raw accel/gyro/mag, pressure, force, GPS alt)
         # + on-device outputs (baro alt/climb, angle) for offline replay. gyro
         # is logged RAW (un-bias-corrected) so the bias estimation replays too.
-        if rawf is not None and raw_bytes < RAW_LOG_MAX_BYTES:
+        # No file I/O here - lines are queued for raw_writer_task so the slow
+        # flash writes never stall this 50 Hz loop.
+        if RAW_LOG and len(state.raw_q) < RAW_Q_MAX:
             mx, my, mz = state.mag   # held; mag_task refreshes it at ~20 Hz
             row = ("%d,%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f,%d,"
                    "%.2f,%.1f,%.2f,%.1f,%.7f,%.7f,%d,%d,%.1f\n" % (
@@ -269,33 +247,91 @@ async def imu_task(imu, state, filt, gyro_bias):
                 while time.ticks_diff(now, ring[0][0]) > RAW_LOG_PREROLL_S * 1000:
                     ring.pop(0)
                 if moving:
-                    rawf.write("# motion-start t=%d\n" % now)
+                    state.raw_q.append("# motion-start t=%d\n" % now)
                     for _, r in ring:
-                        rawf.write(r)
-                        raw_bytes += len(r)
-                    rawf.flush()
+                        state.raw_q.append(r)
                     ring = []
                     recording = True
+                    state.raw_recording = True
                     last_motion_ts = now
-                    gc.collect()
             else:
-                raw_buf.append(row)
+                state.raw_q.append(row)
                 if moving:
                     last_motion_ts = now
-                ended = time.ticks_diff(
-                    now, last_motion_ts) >= RAW_LOG_REST_HOLD_S * 1000
-                if len(raw_buf) >= RAW_LOG_FLUSH_EVERY or ended:
-                    for r in raw_buf:
-                        rawf.write(r)
-                        raw_bytes += len(r)
-                    raw_buf = []
-                    if ended:
-                        rawf.write("# rest t=%d\n" % now)
-                        recording = False
-                    rawf.flush()
-                    gc.collect()   # reclaim per-row string churn; avoids the
-                    #                progressive heap-fragmentation slowdown
+                if time.ticks_diff(now, last_motion_ts) >= RAW_LOG_REST_HOLD_S * 1000:
+                    state.raw_q.append("# rest t=%d\n" % now)
+                    recording = False
+                    state.raw_recording = False
         await asyncio.sleep_ms(IMU_PERIOD_MS)
+
+
+async def raw_writer_task(state):
+    # Owns raw.csv. Drains state.raw_q a few lines at a time, yielding between
+    # chunks so the slow per-line flash writes never block the 50 Hz imu_task.
+    # Also performs the offload-reset (it is now the file's only writer).
+    if not RAW_LOG:
+        return
+    rawf = open(RAW_LOG_PATH, "a")
+    try:
+        raw_bytes = os.stat(RAW_LOG_PATH)[6]   # cap across reboots (append)
+    except OSError:
+        raw_bytes = 0
+    rawf.write(RAW_LOG_HEADER)
+    rawf.flush()
+    unflushed = 0
+    flushes = 0
+    while True:
+        # Offload-reset: wifi_task sets raw_uploaded_bytes after a good upload.
+        # Reclaim the flash, but only between episodes, with the queue drained,
+        # and only if nothing new is on disk since the upload.
+        if (state.raw_uploaded_bytes and not state.raw_recording
+                and not state.raw_q):
+            try:
+                cur = os.stat(RAW_LOG_PATH)[6]
+            except OSError:
+                cur = 0
+            if cur <= state.raw_uploaded_bytes:
+                rawf.close()
+                try:
+                    os.remove(RAW_LOG_PATH)
+                except OSError:
+                    pass
+                rawf = open(RAW_LOG_PATH, "a")
+                rawf.write(RAW_LOG_HEADER)
+                rawf.flush()
+                raw_bytes = 0
+                print("raw.csv offloaded; reset")
+            state.raw_uploaded_bytes = 0
+
+        # In motion-gated mode, defer all flash writes while an episode is
+        # recording so the launch is sampled at full rate with no write stalls.
+        # The buffered lines (RAM is plentiful - PSRAM) drain below once idle.
+        # In continuous mode there is no idle, so drain as we go instead.
+        if RAW_LOG_MOTION_GATED and state.raw_recording:
+            await asyncio.sleep_ms(RAW_WRITE_IDLE_MS)
+            continue
+
+        q = state.raw_q
+        if not q:
+            if unflushed:
+                rawf.flush()
+                unflushed = 0
+            await asyncio.sleep_ms(RAW_WRITE_IDLE_MS)
+            continue
+        chunk = q[:RAW_WRITE_CHUNK]    # atomic slice+del (no await between)
+        del q[:RAW_WRITE_CHUNK]
+        for r in chunk:
+            if raw_bytes < RAW_LOG_MAX_BYTES:
+                rawf.write(r)
+                raw_bytes += len(r)
+                unflushed += 1
+        if unflushed >= RAW_LOG_FLUSH_EVERY:
+            rawf.flush()
+            unflushed = 0
+            flushes += 1
+            if flushes % RAW_GC_EVERY == 0:
+                gc.collect()
+        await asyncio.sleep_ms(0)      # yield so imu_task samples between chunks
 
 
 async def baro_task(baro, state, vertical):
@@ -622,6 +658,7 @@ async def _main(pmu, adc, imu, baro, sx, display, state, gyro_bias, mag):
     tasks = [
         force_task(adc, state),
         imu_task(imu, state, gravity_filter, gyro_bias),
+        raw_writer_task(state),
         mag_task(mag, state),
         baro_task(baro, state, vertical_filter),
         gps_task(state),
