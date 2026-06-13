@@ -37,6 +37,12 @@ GYRO_BIAS_ALPHA = 0.01
 GYRO_STILL_TOLERANCE_G = 0.05
 TELEMETRY_PERIOD_MS = 500   # 2 Hz, the old loop cadence; the SF12/BW500
                             # airtime (~130 ms/packet) caps what is sane here
+REPORT_REQUEST_EVERY = 2    # ask the winch for a LINK_REPORT every Nth frame
+                            # (~1 Hz at 2 Hz telemetry); 0 disables feedback
+REPORT_WINDOW_MS = 600      # extra RX dwell after a request so the winch's
+                            # half-duplex reply lands before the next TX; must
+                            # exceed reply airtime + winch processing (~500 ms
+                            # at SF12, far less once SF drops)
 DISPLAY_PERIOD_MS = 500
 SUPERVISOR_PERIOD_MS = 5000
 
@@ -145,6 +151,7 @@ async def gps_task(state):
 
 async def telemetry_task(sx, state):
     seq = 0
+    frame_count = 0
     while True:
         if state.pending_time_sync:
             state.pending_time_sync = False
@@ -161,10 +168,15 @@ async def telemetry_task(sx, state):
             flags |= protocol.FLAG_GPS_FIX
         if state.time_synced:
             flags |= protocol.FLAG_TIME_SYNCED
+        frame_count += 1
+        report_requested = bool(
+            REPORT_REQUEST_EVERY and frame_count % REPORT_REQUEST_EVERY == 0)
+        if report_requested:
+            flags |= protocol.FLAG_REQUEST_REPORT
         # Tow phase detection arrives with the state machine (step 6).
         frame = protocol.encode_telemetry(
             seq, protocol.PHASE_IDLE, force, state.angle_deg,
-            state.pressure_hpa, state.system_mv, flags)
+            state.baro_alt_m, state.system_mv, flags)
         print("ADC value:", force)
         print("Seilwinkel:", state.angle_deg)
         ax, ay, az = state.accel
@@ -175,11 +187,15 @@ async def telemetry_task(sx, state):
         if state.qnh_hpa:
             print("Baro alt: %.1f m (GPS %.1f m, %+.1f m/s)"
                   % (state.baro_alt_m, state.alt_m, state.climb_rate_ms))
+        # Driver auto-returns to RX after this TX (non-blocking mode), so the
+        # winch's reply is caught by on_radio with no explicit listen window;
+        # we just dwell longer on report cycles so it isn't clobbered.
         sx.send(frame)  # non-blocking; TX_DONE arrives via radio callback
         seq = (seq + 1) & 0xFFFF
         state.tx_count += 1
         print("Sent packet (binary):", frame)
-        await asyncio.sleep_ms(TELEMETRY_PERIOD_MS)
+        await asyncio.sleep_ms(TELEMETRY_PERIOD_MS
+                               + (REPORT_WINDOW_MS if report_requested else 0))
 
 
 async def display_task(display, state):
@@ -268,8 +284,17 @@ def run():
     # --- LoRa
     def on_radio(events):
         if events & SX1262.RX_DONE:
-            msg, err = sx.recv()
-            print("Receive: {}, {}".format(msg, SX1262.STATUS[err]))
+            frame, err = sx.recv()
+            msg = protocol.decode(frame)
+            if msg and msg["type"] == protocol.LINK_REPORT:
+                state.link_rssi_dbm = msg["rssi_dbm"]
+                state.link_snr_db = msg["snr_db"]
+                state.link_loss_pct = msg["loss_pct"]
+                state.link_report_ts = time.ticks_ms()
+                print("Link report: rssi={} dBm snr={} dB loss={}%".format(
+                    msg["rssi_dbm"], msg["snr_db"], msg["loss_pct"]))
+            else:
+                print("Receive: {}, {}".format(frame, SX1262.STATUS[err]))
         elif events & SX1262.TX_DONE:
             print("TX done.")
 

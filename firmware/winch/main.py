@@ -1,7 +1,11 @@
 # Winch segment (ground station) - LilyGo T3S3 V1.2.
 #
 # Receives Winchy protocol frames from the rope unit and shows them to the
-# winch operator. Tracks sequence gaps as a link quality measure.
+# winch operator. Tracks sequence gaps as a link quality measure, and when a
+# TELEMETRY frame requests it, transmits a LINK_REPORT back (measured RSSI,
+# SNR and recent loss) so the rope can adapt its radio settings. The radio
+# stays in non-blocking mode, which auto-returns to RX after each TX, so the
+# reply needs no explicit mode juggling here.
 #
 # Hardware-verified on a T3S3 V1.2 (2026-06-13): boots, SX1262 inits at the
 # pinout below, decodes live TELEMETRY frames from the rope unit, OLED works.
@@ -35,6 +39,11 @@ display = ssd1306.SSD1306_I2C(128, 64, i2c)
 last_seq = None
 received = 0
 lost = 0
+tx_seq = 0          # our own (winch) transmit sequence, for LINK_REPORTs
+last_rssi = 0       # dBm of the most recent frame
+last_snr = 0        # dB of the most recent frame
+recv_window = 0     # frames received since the last report
+lost_window = 0     # frames lost since the last report
 
 
 def show_telemetry(msg):
@@ -44,34 +53,56 @@ def show_telemetry(msg):
     unit = "cnt" if msg["flags"] & protocol.FLAG_FORCE_UNCALIBRATED else "N"
     display.text("F: {} {}".format(msg["force"], unit), 0, 14)
     display.text("Angle: {:.1f}".format(msg["angle_deg"]), 0, 26)
-    display.text("P: {:.1f} hPa".format(msg["pressure_hpa"]), 0, 38)
-    display.text("rx{} lost{}".format(received, lost), 0, 54)
+    display.text("Alt: {} m".format(msg["altitude_m"]), 0, 38)
+    display.text("rx{} l{} {}dBm".format(received, lost, last_rssi), 0, 54)
     display.show()
 
 
+def send_link_report():
+    # Report loss over the window since the previous report, not lifetime, so
+    # the rope sees recent conditions. Sending auto-returns the radio to RX.
+    global tx_seq, recv_window, lost_window
+    total = recv_window + lost_window
+    loss_pct = int(round(100 * lost_window / total)) if total else 0
+    lora.send(protocol.encode_link_report(tx_seq, last_rssi, last_snr,
+                                          loss_pct))
+    tx_seq = (tx_seq + 1) & 0xFFFF
+    recv_window = 0
+    lost_window = 0
+    print("[TX] link report rssi={} snr={} loss={}%".format(
+        last_rssi, last_snr, loss_pct))
+
+
 def on_receive(events):
-    global last_seq, received, lost
+    global last_seq, received, lost, last_rssi, last_snr
+    global recv_window, lost_window
     if not (events & SX1262.RX_DONE):
         return
     frame, err = lora.recv()
     if err != ERR_NONE:
         print("Receive error:", lora.STATUS[err])
         return
+    last_rssi = int(lora.getRSSI())
+    last_snr = int(lora.getSNR())
     msg = protocol.decode(frame)
     if msg is None:
         print("Ignoring unknown frame:", frame)
         return
     received += 1
+    recv_window += 1
     seq = msg["seq"]
     if last_seq is not None:
         gap = (seq - last_seq) & 0xFFFF
         if 1 < gap < 0x8000:  # forward gap = lost frames; backward = restart
             lost += gap - 1
+            lost_window += gap - 1
     last_seq = seq
 
     if msg["type"] == protocol.TELEMETRY:
         print("[RX]", msg)
         show_telemetry(msg)
+        if msg["flags"] & protocol.FLAG_REQUEST_REPORT:
+            send_link_report()
     elif msg["type"] == protocol.TIME_SYNC:
         # Rope unit announces GPS time at startup; RTC sync goes here.
         print("[RX] time sync, unix epoch", msg["epoch_s"])

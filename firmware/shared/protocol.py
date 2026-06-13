@@ -5,16 +5,23 @@
 # sequence number is global per transmitter so the receiver can measure
 # link loss across frame types. Receivers must silently ignore frames
 # with an unknown version, type or length (decode() returns None).
+#
+# The link is bidirectional but asymmetric: the rope unit transmits
+# TELEMETRY/TIME_SYNC/MASS/SUMMARY, and the winch unit transmits the
+# low-rate LINK_REPORT back (its measured RSSI/SNR/loss of the downlink)
+# whenever a TELEMETRY frame carries FLAG_REQUEST_REPORT. The feedback is
+# advisory: losing it must never stall the rope->winch telemetry.
 
 import struct
 
-VERSION = 1
+VERSION = 3
 
 # Frame types
 TELEMETRY = 1
 TIME_SYNC = 2
 MASS = 3
 SUMMARY = 4
+LINK_REPORT = 5  # winch -> rope: downlink quality as seen by the receiver
 
 # Tow phases (TELEMETRY.phase) - see docs/winch_launch_physics.md
 PHASE_IDLE = 0
@@ -41,9 +48,10 @@ PHASE_NAMES = {
 FLAG_FORCE_UNCALIBRATED = 0x01  # force field is raw ADC counts, not newtons
 FLAG_GPS_FIX = 0x02
 FLAG_TIME_SYNCED = 0x04
+FLAG_REQUEST_REPORT = 0x08  # winch should reply with a LINK_REPORT
 
-# version:B type:B seq:H | phase:B force:i angle:B(0.5 deg) pressure:H(0.1
-# hPa) battery:B(0.1 V) flags:B
+# version:B type:B seq:H | phase:B force:i angle:B(0.5 deg)
+# altitude:H(1 m, AMSL) battery:B(0.1 V) flags:B
 _TELEMETRY_FMT = "<BBHBiBHBB"
 # version:B type:B seq:H | unix epoch seconds UTC:I
 _TIME_SYNC_FMT = "<BBHI"
@@ -52,15 +60,17 @@ _MASS_FMT = "<BBHHB"
 # version:B type:B seq:H | duration:H(0.1 s) max force:i release alt:H(m)
 # mass:H(0.1 kg)
 _SUMMARY_FMT = "<BBHHiHH"
+# version:B type:B seq:H | rssi:h(dBm) snr:b(dB) loss:B(%) - winch uplink
+_LINK_REPORT_FMT = "<BBHhbB"
 
 
-def encode_telemetry(seq, phase, force, angle_deg, pressure_hpa, batt_mv,
+def encode_telemetry(seq, phase, force, angle_deg, altitude_m, batt_mv,
                      flags):
     angle = max(0, min(255, int(round(angle_deg * 2))))
-    pressure = max(0, min(65535, int(round(pressure_hpa * 10))))
+    altitude = max(0, min(65535, int(round(altitude_m))))
     batt = max(0, min(255, batt_mv // 100))
     return struct.pack(_TELEMETRY_FMT, VERSION, TELEMETRY, seq & 0xFFFF,
-                       phase, force, angle, pressure, batt, flags)
+                       phase, force, angle, altitude, batt, flags)
 
 
 def encode_time_sync(seq, epoch_s):
@@ -82,6 +92,14 @@ def encode_summary(seq, duration_s, max_force, release_alt_m, mass_kg):
                        duration, max_force, alt, mass)
 
 
+def encode_link_report(seq, rssi_dbm, snr_db, loss_pct):
+    rssi = max(-32768, min(32767, int(round(rssi_dbm))))
+    snr = max(-128, min(127, int(round(snr_db))))
+    loss = max(0, min(100, int(round(loss_pct))))
+    return struct.pack(_LINK_REPORT_FMT, VERSION, LINK_REPORT, seq & 0xFFFF,
+                       rssi, snr, loss)
+
+
 def decode(frame):
     """Decode any frame into a dict with a 'type' key (one of the frame
     type constants). Returns None for unknown version/type/length."""
@@ -90,11 +108,11 @@ def decode(frame):
     ftype = frame[1]
 
     if ftype == TELEMETRY and len(frame) == struct.calcsize(_TELEMETRY_FMT):
-        (_, _, seq, phase, force, angle, pressure, batt,
+        (_, _, seq, phase, force, angle, altitude, batt,
          flags) = struct.unpack(_TELEMETRY_FMT, frame)
         return {"type": TELEMETRY, "seq": seq, "phase": phase,
                 "force": force, "angle_deg": angle / 2,
-                "pressure_hpa": pressure / 10, "batt_v": batt / 10,
+                "altitude_m": altitude, "batt_v": batt / 10,
                 "flags": flags}
 
     if ftype == TIME_SYNC and len(frame) == struct.calcsize(_TIME_SYNC_FMT):
@@ -112,5 +130,10 @@ def decode(frame):
         return {"type": SUMMARY, "seq": seq, "duration_s": duration / 10,
                 "max_force": max_force, "release_alt_m": alt,
                 "mass_kg": mass / 10}
+
+    if ftype == LINK_REPORT and len(frame) == struct.calcsize(_LINK_REPORT_FMT):
+        _, _, seq, rssi, snr, loss = struct.unpack(_LINK_REPORT_FMT, frame)
+        return {"type": LINK_REPORT, "seq": seq, "rssi_dbm": rssi,
+                "snr_db": snr, "loss_pct": loss}
 
     return None

@@ -39,3 +39,8 @@ class State:
         self.batt_pct = 0
         # Radio link
         self.tx_count = 0
+        # Downlink quality as reported by the winch (LINK_REPORT); for ADR.
+        self.link_rssi_dbm = 0
+        self.link_snr_db = 0
+        self.link_loss_pct = 0
+        self.link_report_ts = 0  # time.ticks_ms of last report; 0 = never
