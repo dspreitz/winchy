@@ -57,7 +57,7 @@ WARN_BLINK_FRAMES = 4   # frames per state (~2 s at 2 Hz) when battery is low
 # written in the main loop - never do flash I/O in the IRQ or we'd stall the
 # radio and drop the frames we're trying to count. Disable for routine use to
 # avoid flash wear; clear winch_rxlog.csv before each run for a fresh log.
-LOG_TO_FLASH = True
+LOG_TO_FLASH = False        # set True for a range test (logs every RX frame)
 LOG_PATH = "winch_rxlog.csv"
 log_buf = []        # pending "t_ms,seq,rssi,snr,flags" lines
 

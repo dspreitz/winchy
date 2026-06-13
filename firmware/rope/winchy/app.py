@@ -57,7 +57,7 @@ BATT_LOW_CLEAR_MV = 3650    # clear above this
 # keyed by the telemetry seq so it joins against the winch's per-frame RSSI
 # log (rope walks with GPS; winch stays tethered and logs the downlink).
 # Clear rope_gpslog.csv before a run; disable for routine use (flash wear).
-GPS_LOG = True
+GPS_LOG = False             # set True for a range test (logs position per frame)
 GPS_LOG_PATH = "rope_gpslog.csv"
 GPS_LOG_FLUSH_EVERY = 4     # flush after this many records (~2 s at 2 Hz)
 
@@ -67,8 +67,8 @@ GPS_LOG_FLUSH_EVERY = 4     # flush after this many records (~2 s at 2 Hz)
 # adapted here - changing SF/BW would need both ends retuned in lockstep, so
 # that stays a deliberate, handshaked step. Set ADR_ENABLED = False to pin
 # power at config.LORA_TX_POWER_DBM.
-ADR_ENABLED = False         # range test: fix TX at config.LORA_TX_POWER_DBM
-                            # (+14 dBm) so RSSI maps directly to path loss
+ADR_ENABLED = True          # set False for a range test (fixes TX power so
+                            # RSSI maps directly to path loss)
 ADR_TX_POWER_MIN_DBM = -9   # SX1262 floor (driver clamps below this)
 ADR_TX_POWER_MAX_DBM = 14   # EU 868.0-868.6 MHz ERP cap (25 mW); raise only if
                             # antenna gain / regulatory domain allows
