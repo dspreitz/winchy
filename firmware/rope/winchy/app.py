@@ -22,6 +22,7 @@ from winchy import board
 from winchy.fusion import altitude
 from winchy.fusion.attitude import rope_angle_above_ground
 from winchy.fusion.kalman import GravityKalman, VerticalKalman
+from winchy.fusion.speed import glider_speed
 from winchy.sensors.ads1232 import ADS1232
 from winchy.sensors.barometer import Barometer
 from winchy.sensors.gps import (GPS, parse_nmea, configure as gps_configure,
@@ -40,6 +41,12 @@ BARO_PERIOD_MS = 1000
 # it cannot chase real rotation.
 GYRO_BIAS_ALPHA = 0.01
 GYRO_STILL_TOLERANCE_G = 0.05
+# Glider (CG-hook) speed: the rope-segment velocity carried up the taut rope
+# to the hook. The angle rate is an EMA-smoothed finite difference of the
+# Kalman rope angle (x5 m lever amplifies noise, so smooth + clamp it).
+GLIDER_HOOK_DIST_M = 5.0    # rope segment -> CG-hook ring, along the rope
+ANGLE_RATE_ALPHA = 0.3      # EMA on the rope-angle rate
+ANGLE_RATE_MAX_DPS = 200.0  # clamp to reject finite-difference spikes
 TELEMETRY_PERIOD_MS = 500   # 2 Hz. At SF7/BW500 airtime is ~15 ms so there is
                             # rate headroom, but ~2% duty already nears the
                             # 868.0-868.6 MHz 1% limit - raise rate with care.
@@ -89,7 +96,8 @@ RAW_Q_MAX = 4000            # safety cap on the pending-write queue (~80 s @50 H
 # holds no episodes, so the uploader skips it.
 RAW_LOG_HEADER = ("# boot\n# t_ms,ax,ay,az,gx,gy,gz,mx,my,mz,force,"
                   "pressure_hpa,baro_alt_m,climb_ms,gps_alt_m,gps_lat,"
-                  "gps_lon,gps_fix,gps_sats,gps_speed_ms,angle_deg\n")
+                  "gps_lon,gps_fix,gps_sats,gps_speed_ms,angle_deg,"
+                  "glider_speed_ms\n")
 # Motion gating: a winch sits idle most of the time, so logging only around
 # movement keeps the log (and the planned WiFi->GitHub upload) minimal. A
 # time-based ring buffer holds the last RAW_LOG_PREROLL_S so the START of a
@@ -197,6 +205,7 @@ async def imu_task(imu, state, filt, gyro_bias):
     ring = []              # rolling pre-roll: (t_ms, rowstr), idle only
     recording = False
     last_motion_ts = 0
+    prev_angle = None      # for the rope-angle rate (glider speed)
     while True:
         accel = imu.read_accel()
         gyro = imu.read_gyro()
@@ -219,6 +228,21 @@ async def imu_task(imu, state, filt, gyro_bias):
         state.angle_deg = rope_angle_above_ground(*filt.gravity)
         state.accel_ts = now
 
+        # Rope-angle rate (EMA + clamp) and glider (CG-hook) speed estimate.
+        if prev_angle is not None and dt > 0:
+            rate = (state.angle_deg - prev_angle) / dt
+            if rate > ANGLE_RATE_MAX_DPS:
+                rate = ANGLE_RATE_MAX_DPS
+            elif rate < -ANGLE_RATE_MAX_DPS:
+                rate = -ANGLE_RATE_MAX_DPS
+            state.angle_rate_dps += ANGLE_RATE_ALPHA * (rate - state.angle_rate_dps)
+        prev_angle = state.angle_deg
+        vh = state.ground_speed_ms
+        vv = state.climb_rate_ms
+        state.rope_speed_ms = math.sqrt(vh * vh + vv * vv)
+        state.glider_speed_ms = glider_speed(
+            vh, vv, state.angle_deg, state.angle_rate_dps, GLIDER_HOOK_DIST_M)
+
         # Raw log: filter inputs (raw accel/gyro/mag, pressure, force, GPS alt)
         # + on-device outputs (baro alt/climb, angle) for offline replay. gyro
         # is logged RAW (un-bias-corrected) so the bias estimation replays too.
@@ -227,12 +251,13 @@ async def imu_task(imu, state, filt, gyro_bias):
         if RAW_LOG and len(state.raw_q) < RAW_Q_MAX:
             mx, my, mz = state.mag   # held; mag_task refreshes it at ~20 Hz
             row = ("%d,%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f,%d,"
-                   "%.2f,%.1f,%.2f,%.1f,%.7f,%.7f,%d,%d,%.2f,%.1f\n" % (
+                   "%.2f,%.1f,%.2f,%.1f,%.7f,%.7f,%d,%d,%.2f,%.1f,%.2f\n" % (
                        now, accel[0], accel[1], accel[2], gyro[0], gyro[1],
                        gyro[2], mx, my, mz, state.force_raw, state.pressure_hpa,
                        state.baro_alt_m, state.climb_rate_ms, state.alt_m,
                        state.lat, state.lon, state.gps_fix, state.gps_sats,
-                       state.ground_speed_ms, state.angle_deg))
+                       state.ground_speed_ms, state.angle_deg,
+                       state.glider_speed_ms))
 
             # Motion gate. Rest baselines (motion-test): accel_dev <= 0.04 g,
             # gyro_mag < 1 dps. A flat spin keeps |a| ~ 1 g, so the gyro term is

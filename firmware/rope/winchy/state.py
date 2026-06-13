@@ -16,6 +16,9 @@ class State:
         self.gyro_dps = (0.0, 0.0, 0.0)  # bias-corrected angular rate
         self.mag = (0.0, 0.0, 0.0)       # magnetometer field, uT (x, y, z)
         self.angle_deg = 0.0             # rope angle above ground (Kalman)
+        self.angle_rate_dps = 0.0        # rope-angle rate (EMA), for glider speed
+        self.glider_speed_ms = 0.0       # CG-hook speed (rope speed + 5 m lever)
+        self.rope_speed_ms = 0.0         # rope-segment 3-D speed (GPS+climb)
         self.accel_ts = 0
         # Tow phase (protocol.PHASE_*; the state machine will drive this)
         self.phase = 0  # PHASE_IDLE
