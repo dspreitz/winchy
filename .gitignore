@@ -6,6 +6,7 @@ __pycache__/
 range_log_*.txt
 *_walk*.csv
 winch_rxlog*.csv
+raw*.csv
 
 # WiFi credentials live only on the device, never in the repo
 secrets.py

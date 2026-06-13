@@ -14,6 +14,7 @@ class State:
         # IMU / attitude
         self.accel = (0.0, 0.0, 0.0)     # instantaneous specific force, g
         self.gyro_dps = (0.0, 0.0, 0.0)  # bias-corrected angular rate
+        self.mag = (0.0, 0.0, 0.0)       # magnetometer field, uT (x, y, z)
         self.angle_deg = 0.0             # rope angle above ground (Kalman)
         self.accel_ts = 0
         # Tow phase (protocol.PHASE_*; the state machine will drive this)

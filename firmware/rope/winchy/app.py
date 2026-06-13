@@ -6,8 +6,10 @@
 # radio anymore. See docs/rope_segment_architecture.md.
 
 import asyncio
+import gc
 import math
 import micropython
+import os
 import time
 
 from machine import Pin, RTC
@@ -29,6 +31,7 @@ from winchy.state import State
 
 FORCE_TIMEOUT_MS = 1000
 IMU_PERIOD_MS = 20          # 50 Hz sampling
+MAG_PERIOD_MS = 50          # 20 Hz magnetometer (slow I2C; kept off the IMU loop)
 IMU_WINDOW = 20             # samples for the boot-time accel print
 BARO_PERIOD_MS = 1000
 
@@ -62,6 +65,16 @@ BATT_LOW_CLEAR_MV = 3650    # clear above this
 GPS_LOG = False             # set True for a range test (logs position per frame)
 GPS_LOG_PATH = "rope_gpslog.csv"
 GPS_LOG_FLUSH_EVERY = 4     # flush after this many records (~2 s at 2 Hz)
+
+# Raw sensor log (rope-side, for offline Kalman validation): every filter input
+# (raw accel/gyro/mag, pressure, force, GPS alt) plus the on-device outputs
+# (baro alt/climb, angle) at the IMU cadence, to flash. Offloaded later (USB
+# now; WiFi->GitHub planned). ~16 min at 50 Hz fills the ~5.8 MB FS, so logging
+# stops at RAW_LOG_MAX_BYTES to protect it - clear/offload raw.csv per session.
+RAW_LOG = True
+RAW_LOG_PATH = "raw.csv"
+RAW_LOG_FLUSH_EVERY = 100   # rows buffered (~2 s at 50 Hz) per flash write
+RAW_LOG_MAX_BYTES = 4000000
 
 # Closed-loop TX-power control (ADR). Drives the rope's output power from the
 # winch's reported downlink quality. Hardened after an earlier version starved
@@ -122,9 +135,34 @@ async def force_task(adc, state):
             state.force_errors += 1
 
 
+async def mag_task(mag, state):
+    # Magnetometer read is a slow I2C transaction (~10 ms); run it in its own
+    # task at 20 Hz so it never drags down the 50 Hz IMU/Kalman loop. The IMU
+    # loop logs the held state.mag value into each raw row.
+    while True:
+        try:
+            m = mag.read()
+            state.mag = (m["x"], m["y"], m["z"])
+        except Exception:
+            pass
+        await asyncio.sleep_ms(MAG_PERIOD_MS)
+
+
 async def imu_task(imu, state, filt, gyro_bias):
     bias = list(gyro_bias)
     last = time.ticks_ms()
+    rawf = None
+    raw_buf = []
+    raw_bytes = 0
+    if RAW_LOG:
+        rawf = open(RAW_LOG_PATH, "a")
+        try:
+            raw_bytes = os.stat(RAW_LOG_PATH)[6]   # cap across reboots (append)
+        except OSError:
+            raw_bytes = 0
+        rawf.write("# boot\n# t_ms,ax,ay,az,gx,gy,gz,mx,my,mz,force,"
+                   "pressure_hpa,baro_alt_m,climb_ms,gps_alt_m,angle_deg\n")
+        rawf.flush()
     while True:
         accel = imu.read_accel()
         gyro = imu.read_gyro()
@@ -146,6 +184,27 @@ async def imu_task(imu, state, filt, gyro_bias):
         state.gyro_dps = corrected
         state.angle_deg = rope_angle_above_ground(*filt.gravity)
         state.accel_ts = now
+
+        # Raw log: filter inputs (raw accel/gyro/mag, pressure, force, GPS alt)
+        # + on-device outputs (baro alt/climb, angle) for offline replay. gyro
+        # is logged RAW (un-bias-corrected) so the bias estimation replays too.
+        if rawf is not None and raw_bytes < RAW_LOG_MAX_BYTES:
+            mx, my, mz = state.mag   # held; mag_task refreshes it at ~20 Hz
+            raw_buf.append(
+                "%d,%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f,%d,"
+                "%.2f,%.1f,%.2f,%.1f,%.1f\n" % (
+                    now, accel[0], accel[1], accel[2], gyro[0], gyro[1],
+                    gyro[2], mx, my, mz, state.force_raw, state.pressure_hpa,
+                    state.baro_alt_m, state.climb_rate_ms, state.alt_m,
+                    state.angle_deg))
+            if len(raw_buf) >= RAW_LOG_FLUSH_EVERY:
+                for r in raw_buf:
+                    rawf.write(r)
+                    raw_bytes += len(r)
+                rawf.flush()
+                raw_buf = []
+                gc.collect()   # reclaim per-row string churn; avoids the
+                #                progressive heap-fragmentation slowdown
         await asyncio.sleep_ms(IMU_PERIOD_MS)
 
 
@@ -374,12 +433,13 @@ async def supervisor_task(pmu, state):
         await asyncio.sleep_ms(SUPERVISOR_PERIOD_MS)
 
 
-async def _main(pmu, adc, imu, baro, sx, display, state, gyro_bias):
+async def _main(pmu, adc, imu, baro, sx, display, state, gyro_bias, mag):
     gravity_filter = GravityKalman()
     vertical_filter = VerticalKalman()
     tasks = [
         force_task(adc, state),
         imu_task(imu, state, gravity_filter, gyro_bias),
+        mag_task(mag, state),
         baro_task(baro, state, vertical_filter),
         gps_task(state),
         telemetry_task(sx, state),
@@ -477,4 +537,4 @@ def run():
     state.tx_power_dbm = config.LORA_TX_POWER_DBM  # ADR adjusts from here
 
     print("Starting asyncio runtime")
-    asyncio.run(_main(pmu, adc, imu, baro, sx, display, state, gyro_bias))
+    asyncio.run(_main(pmu, adc, imu, baro, sx, display, state, gyro_bias, mag))
