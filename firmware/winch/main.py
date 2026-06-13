@@ -48,9 +48,13 @@ lost_window = 0     # frames lost since the last report
 loss_ema = 0.0      # smoothed loss %, so a single gap in the tiny per-report
                     # window doesn't swing the figure to 50/100%
 LOSS_EMA_ALPHA = 0.3
+blink = 0           # render counter; alternates the bottom line when warning
+WARN_BLINK_FRAMES = 4   # frames per state (~2 s at 2 Hz) when battery is low
 
 
 def show_telemetry(msg):
+    global blink
+    blink += 1
     display.fill(0)
     display.text("Winchy " + protocol.PHASE_NAMES.get(msg["phase"], "?"),
                  0, 0)
@@ -58,7 +62,14 @@ def show_telemetry(msg):
     display.text("F: {} {}".format(msg["force"], unit), 0, 14)
     display.text("Angle: {:.1f}".format(msg["angle_deg"]), 0, 26)
     display.text("Alt: {} m".format(msg["altitude_m"]), 0, 38)
-    display.text("rx{} l{} {}dBm".format(received, lost, last_rssi), 0, 54)
+    # Bottom line shows link info, but while the rope reports a low battery it
+    # alternates with a warning so the operator can't miss it.
+    if (msg["flags"] & protocol.FLAG_BATTERY_LOW
+            and (blink // WARN_BLINK_FRAMES) % 2 == 0):
+        bottom = "!BATT LOW {:.1f}V".format(msg["batt_v"])
+    else:
+        bottom = "rx{} l{} {}dBm".format(received, lost, last_rssi)
+    display.text(bottom, 0, 54)
     display.show()
 
 

@@ -37,6 +37,7 @@ class State:
         self.system_mv = 0
         self.batt_mv = 0
         self.batt_pct = 0
+        self.batt_low = False    # rope battery low (checked while IDLE)
         # Radio link
         self.tx_count = 0
         # Downlink quality as reported by the winch (LINK_REPORT); for ADR.

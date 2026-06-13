@@ -49,6 +49,7 @@ FLAG_FORCE_UNCALIBRATED = 0x01  # force field is raw ADC counts, not newtons
 FLAG_GPS_FIX = 0x02
 FLAG_TIME_SYNCED = 0x04
 FLAG_REQUEST_REPORT = 0x08  # winch should reply with a LINK_REPORT
+FLAG_BATTERY_LOW = 0x10     # rope battery low (set only while IDLE)
 
 # version:B type:B seq:H | phase:B force:i angle:B(0.5 deg)
 # altitude:H(1 m, AMSL) battery:B(0.1 V) flags:B

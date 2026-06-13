@@ -47,6 +47,12 @@ REPORT_WINDOW_MS = 150      # extra RX dwell after a request so the winch's
 DISPLAY_PERIOD_MS = 500
 SUPERVISOR_PERIOD_MS = 5000
 
+# Low-battery warning (rope cell terminal voltage from the AXP2101, mV).
+# Checked only while IDLE; hysteresis avoids flicker near the threshold.
+BATT_PRESENT_MV = 2500      # at/below this, treat as no cell fitted (USB only)
+BATT_LOW_MV = 3500          # warn below this (~20% on a Li-ion)
+BATT_LOW_CLEAR_MV = 3650    # clear above this
+
 # Closed-loop TX-power control (ADR). Drives output power from the winch's
 # reported downlink SNR margin: back off when the link is strong (save the
 # battery / reduce interference), push up when it thins. Only power is
@@ -205,6 +211,8 @@ async def telemetry_task(sx, state):
             flags |= protocol.FLAG_GPS_FIX
         if state.time_synced:
             flags |= protocol.FLAG_TIME_SYNCED
+        if state.batt_low:
+            flags |= protocol.FLAG_BATTERY_LOW
         frame_count += 1
         report_requested = bool(
             REPORT_REQUEST_EVERY and frame_count % REPORT_REQUEST_EVERY == 0)
@@ -213,7 +221,7 @@ async def telemetry_task(sx, state):
         # Tow phase detection arrives with the state machine (step 6).
         frame = protocol.encode_telemetry(
             seq, protocol.PHASE_IDLE, force, state.angle_deg,
-            state.baro_alt_m, state.system_mv, flags)
+            state.baro_alt_m, state.batt_mv, flags)  # real cell, not sys rail
         print("ADC value:", force)
         print("Seilwinkel:", state.angle_deg)
         ax, ay, az = state.accel
@@ -243,7 +251,15 @@ async def telemetry_task(sx, state):
         # Driver auto-returns to RX after this TX (non-blocking mode), so the
         # winch's reply is caught by on_radio with no explicit listen window;
         # we just dwell longer on report cycles so it isn't clobbered.
-        sx.send(frame)  # non-blocking; TX_DONE arrives via radio callback
+        try:
+            sx.send(frame)  # non-blocking; TX_DONE arrives via radio callback
+        except Exception as e:
+            # SPI collided with the RX IRQ; drop this frame, recover to RX.
+            print("TX deferred:", e)
+            try:
+                sx.startReceive()
+            except Exception:
+                pass
         seq = (seq + 1) & 0xFFFF
         state.tx_count += 1
         print("Sent packet (binary):", frame)
@@ -270,6 +286,15 @@ async def supervisor_task(pmu, state):
         state.system_mv = pmu.getSystemVoltage()
         state.batt_mv = pmu.getBattVoltage()
         state.batt_pct = pmu.getBatteryPercent()
+        # Recurring low-battery check - only meaningful while IDLE, and only
+        # when a cell is actually fitted (0 mV = USB-only, not "empty").
+        if state.phase == protocol.PHASE_IDLE and state.batt_mv > BATT_PRESENT_MV:
+            if state.batt_mv < BATT_LOW_MV:
+                state.batt_low = True
+            elif state.batt_mv > BATT_LOW_CLEAR_MV:
+                state.batt_low = False
+        else:
+            state.batt_low = False
         await asyncio.sleep_ms(SUPERVISOR_PERIOD_MS)
 
 
@@ -336,20 +361,30 @@ def run():
 
     # --- LoRa
     def on_radio(events):
-        if events & SX1262.RX_DONE:
-            frame, err = sx.recv()
-            msg = protocol.decode(frame)
-            if msg and msg["type"] == protocol.LINK_REPORT:
-                state.link_rssi_dbm = msg["rssi_dbm"]
-                state.link_snr_db = msg["snr_db"]
-                state.link_loss_pct = msg["loss_pct"]
-                state.link_report_ts = time.ticks_ms()
-                print("Link report: rssi={} dBm snr={} dB loss={}%".format(
-                    msg["rssi_dbm"], msg["snr_db"], msg["loss_pct"]))
-            else:
-                print("Receive: {}, {}".format(frame, SX1262.STATUS[err]))
-        elif events & SX1262.TX_DONE:
-            print("TX done.")
+        # Runs from the DIO1 IRQ and can land mid-SPI relative to a task's
+        # send(); a corrupted command raises ERR_CHIP_NOT_FOUND. Catch it and
+        # re-arm RX so a collision drops one frame instead of crashing.
+        try:
+            if events & SX1262.RX_DONE:
+                frame, err = sx.recv()
+                msg = protocol.decode(frame)
+                if msg and msg["type"] == protocol.LINK_REPORT:
+                    state.link_rssi_dbm = msg["rssi_dbm"]
+                    state.link_snr_db = msg["snr_db"]
+                    state.link_loss_pct = msg["loss_pct"]
+                    state.link_report_ts = time.ticks_ms()
+                    print("Link report: rssi={} dBm snr={} dB loss={}%".format(
+                        msg["rssi_dbm"], msg["snr_db"], msg["loss_pct"]))
+                else:
+                    print("Receive: {}, {}".format(frame, SX1262.STATUS[err]))
+            elif events & SX1262.TX_DONE:
+                print("TX done.")
+        except Exception as e:
+            print("radio cb error:", e)
+            try:
+                sx.startReceive()
+            except Exception:
+                pass
 
     sx = SX1262(spi_bus=config.LORA_SPI_BUS, clk=config.LORA_CLK,
                 mosi=config.LORA_MOSI, miso=config.LORA_MISO,

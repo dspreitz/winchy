@@ -83,7 +83,9 @@ def init_power():
     )
 
     pmu.setPrechargeCurr(pmu.XPOWERS_AXP2101_PRECHARGE_50MA)
-    pmu.setChargerConstantCurr(pmu.XPOWERS_AXP2101_CHG_CUR_200MA)
+    # 1 A ~= 0.29C for the Samsung INR18650-35E (3500 mAh); needs a >=1.3 A
+    # USB source to actually reach it (a weak laptop port will throttle).
+    pmu.setChargerConstantCurr(pmu.XPOWERS_AXP2101_CHG_CUR_1000MA)
     pmu.setChargerTerminationCurr(pmu.XPOWERS_AXP2101_CHG_ITERM_25MA)
     pmu.setChargeTargetVoltage(pmu.XPOWERS_AXP2101_CHG_VOL_4V1)
 
