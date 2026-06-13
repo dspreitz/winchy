@@ -3,9 +3,9 @@
 # Receives Winchy protocol frames from the rope unit and shows them to the
 # winch operator. Tracks sequence gaps as a link quality measure.
 #
-# NOTE: rewritten against shared/protocol.py but NOT yet hardware-verified
-# (no T3S3 available). Pinout carried over from the original receiver
-# draft. Deploy protocol.py (from firmware/shared/) alongside this file.
+# Hardware-verified on a T3S3 V1.2 (2026-06-13): boots, SX1262 inits at the
+# pinout below, decodes live TELEMETRY frames from the rope unit, OLED works.
+# Deploy protocol.py (from firmware/shared/) alongside this file.
 
 import time
 
