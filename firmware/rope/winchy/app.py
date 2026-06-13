@@ -489,6 +489,9 @@ async def supervisor_task(pmu, state):
                 state.batt_low = False
         else:
             state.batt_low = False
+        # Latch the session start (first valid wall clock) for the log filename.
+        if state.time_synced and state.log_start is None:
+            state.log_start = _log_stamp()
         # Re-announce GPS time periodically so a winch that powered up after
         # the rope (and has no NTP) still gets synced.
         ticks += 1
@@ -498,7 +501,15 @@ async def supervisor_task(pmu, state):
         await asyncio.sleep_ms(SUPERVISOR_PERIOD_MS)
 
 
-def _github_upload_raw():
+def _log_stamp():
+    # "yyyymmdd-hhmm" from the UTC RTC, or None if the clock isn't set yet.
+    t = time.localtime()
+    if t[0] < 2024:
+        return None
+    return "%04d%02d%02d-%02d%02d" % (t[0], t[1], t[2], t[3], t[4])
+
+
+def _github_upload_raw(asset):
     # Replace the rolling rope-log asset on the 'logs' release: look up the
     # release, delete any existing asset of the same name, then upload raw.csv.
     # Blocks the asyncio loop for the round-trips (~secs) - only called while
@@ -514,7 +525,7 @@ def _github_upload_raw():
         r.close()
         rid = rel["id"]
         for a in rel.get("assets", ()):
-            if a.get("name") == GITHUB_ASSET:
+            if a.get("name") == asset:
                 urequests.delete(
                     "https://api.github.com/repos/%s/releases/assets/%d"
                     % (GITHUB_REPO, a["id"]), headers=hdr).close()
@@ -524,9 +535,9 @@ def _github_upload_raw():
         h2["Content-Type"] = "text/csv"
         u = urequests.post(
             "https://uploads.github.com/repos/%s/releases/%d/assets?name=%s"
-            % (GITHUB_REPO, rid, GITHUB_ASSET), data=body, headers=h2)
+            % (GITHUB_REPO, rid, asset), data=body, headers=h2)
         ok = 200 <= u.status_code < 300
-        print("GitHub upload %s: HTTP %d" % (GITHUB_ASSET, u.status_code))
+        print("GitHub upload %s: HTTP %d" % (asset, u.status_code))
         u.close()
     except Exception as e:
         print("GitHub upload failed:", e)
@@ -563,9 +574,13 @@ async def wifi_task(state):
                         break
                     await asyncio.sleep_ms(500)
             if wlan.isconnected():
-                print("WiFi '%s' joined (%s); uploading raw log"
-                      % (WIFI_SSID, wlan.ifconfig()[0]))
-                if _github_upload_raw():
+                # Prepend the session start (first GPS time) to the asset so
+                # each session is a distinct, dated file on the release.
+                stamp = state.log_start or _log_stamp()
+                asset = (stamp + "_" if stamp else "") + GITHUB_ASSET
+                print("WiFi '%s' joined (%s); uploading %s"
+                      % (WIFI_SSID, wlan.ifconfig()[0], asset))
+                if _github_upload_raw(asset):
                     last_uploaded = size
             else:
                 print("WiFi: could not join '%s'" % WIFI_SSID)

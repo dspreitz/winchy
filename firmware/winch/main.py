@@ -102,6 +102,7 @@ latest = {"phase": "--", "force": 0, "uncal": True, "angle": 0.0, "alt": 0,
 # radio (TIME_SYNC frame) is the fallback when there's no internet/WiFi.
 clock_set = False           # is the winch RTC set?
 clock_src = "--"            # "NTP" / "GPS" / "--"
+log_start = None            # "yyyymmdd-hhmm" session start, latched once synced
 
 
 def show_telemetry(msg):
@@ -148,6 +149,14 @@ def _set_rtc_unix(epoch_s):
     RTC().datetime((tm[0], tm[1], tm[2], tm[6], tm[3], tm[4], tm[5], 0))
 
 
+def _stamp():
+    # "yyyymmdd-hhmm" from the UTC RTC, or None if it isn't set yet.
+    if not clock_set:
+        return None
+    t = time.localtime()
+    return "%04d%02d%02d-%02d%02d" % (t[0], t[1], t[2], t[3], t[4])
+
+
 def _ntp_sync():
     global clock_set, clock_src
     try:
@@ -168,6 +177,10 @@ def _github_upload():
         return
     import urequests
     import gc
+    # Prepend the session start (first synced time) so each session is a
+    # distinct, dated file on the release.
+    stamp = log_start or _stamp()
+    asset = (stamp + "_" if stamp else "") + GITHUB_ASSET
     hdr = {"Authorization": "Bearer " + GITHUB_TOKEN, "User-Agent": "winchy",
            "Accept": "application/vnd.github+json"}
     try:
@@ -177,7 +190,7 @@ def _github_upload():
         r.close()
         rid = rel["id"]
         for a in rel.get("assets", ()):
-            if a.get("name") == GITHUB_ASSET:
+            if a.get("name") == asset:
                 urequests.delete(
                     "https://api.github.com/repos/%s/releases/assets/%d"
                     % (GITHUB_REPO, a["id"]), headers=hdr).close()
@@ -187,8 +200,8 @@ def _github_upload():
         h2["Content-Type"] = "text/csv"
         u = urequests.post(
             "https://uploads.github.com/repos/%s/releases/%d/assets?name=%s"
-            % (GITHUB_REPO, rid, GITHUB_ASSET), data=body, headers=h2)
-        print("GitHub upload %s: HTTP %d" % (GITHUB_ASSET, u.status_code))
+            % (GITHUB_REPO, rid, asset), data=body, headers=h2)
+        print("GitHub upload %s: HTTP %d" % (asset, u.status_code))
         u.close()
     except Exception as e:
         print("GitHub upload failed:", e)
@@ -374,9 +387,12 @@ async def _serve():
             print("WiFi: could not join '%s'; dashboard off" % WIFI_SSID)
     else:
         print("WiFi: no secrets.py; dashboard off")
+    global log_start
     n = 0
     while True:                           # keep-alive + periodic flash flush
         _flush_log()
+        if clock_set and log_start is None:   # latch session start once synced
+            log_start = _stamp()
         n += 1
         if n % 3600 == 0:                 # re-sync NTP hourly (corrects drift)
             _ntp_sync()

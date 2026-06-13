@@ -34,6 +34,7 @@ class State:
         self.gps_ts = 0
         self.time_synced = False
         self.pending_time_sync = False  # telemetry task owes a TIME_SYNC frame
+        self.log_start = None    # "yyyymmdd-hhmm" session start (first GPS time)
         # Power
         self.system_mv = 0
         self.batt_mv = 0
