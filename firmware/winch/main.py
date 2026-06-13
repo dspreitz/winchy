@@ -13,7 +13,7 @@
 
 import time
 
-from machine import I2C, Pin
+from machine import I2C, Pin, RTC
 import ssd1306
 from sx1262 import SX1262
 from _sx126x import ERR_NONE
@@ -79,7 +79,13 @@ except ImportError:
 # Latest decoded telemetry, served as JSON. Rebuilt (not mutated) in the RX
 # callback so the server always reads a complete snapshot.
 latest = {"phase": "--", "force": 0, "uncal": True, "angle": 0.0, "alt": 0,
-          "rssi": 0, "batt": 0.0, "battlow": False, "rx": 0, "lost": 0}
+          "rssi": 0, "batt": 0.0, "battlow": False, "tsync": False,
+          "time": "--:--:--", "tsrc": "--", "rx": 0, "lost": 0}
+
+# Winch RTC sync: NTP (via WiFi) is preferred; the rope's GPS time over the
+# radio (TIME_SYNC frame) is the fallback when there's no internet/WiFi.
+clock_set = False           # is the winch RTC set?
+clock_src = "--"            # "NTP" / "GPS" / "--"
 
 
 def show_telemetry(msg):
@@ -120,9 +126,27 @@ def send_link_report():
         last_rssi, last_snr, loss_pct))
 
 
+def _set_rtc_unix(epoch_s):
+    # epoch_s is Unix UTC seconds; gmtime wants seconds since 2000-01-01.
+    tm = time.gmtime(epoch_s - 946684800)
+    RTC().datetime((tm[0], tm[1], tm[2], tm[6], tm[3], tm[4], tm[5], 0))
+
+
+def _ntp_sync():
+    global clock_set, clock_src
+    try:
+        import ntptime
+        ntptime.settime()       # sets the RTC to UTC from pool.ntp.org
+        clock_set = True
+        clock_src = "NTP"
+        print("RTC set from NTP")
+    except Exception as e:
+        print("NTP sync failed:", e)
+
+
 def on_receive(events):
     global last_seq, received, lost, last_rssi, last_snr
-    global recv_window, lost_window, latest
+    global recv_window, lost_window, latest, clock_set, clock_src
     if not (events & SX1262.RX_DONE):
         return
     frame, err = lora.recv()
@@ -149,6 +173,7 @@ def on_receive(events):
         if LOG_TO_FLASH:  # buffer only; the main loop does the flash write
             log_buf.append("%d,%d,%d,%d,%d\n" % (
                 time.ticks_ms(), seq, last_rssi, last_snr, msg["flags"]))
+        tm = time.localtime()
         latest = {"phase": protocol.PHASE_NAMES.get(msg["phase"], "?"),
                   "force": msg["force"],
                   "uncal": bool(msg["flags"] & protocol.FLAG_FORCE_UNCALIBRATED),
@@ -156,14 +181,25 @@ def on_receive(events):
                   "rssi": last_rssi, "batt": msg["batt_v"],
                   "battlow": bool(msg["flags"] & protocol.FLAG_BATTERY_LOW),
                   "gps": bool(msg["flags"] & protocol.FLAG_GPS_FIX),
-                  "tsync": bool(msg["flags"] & protocol.FLAG_TIME_SYNCED),
+                  "tsync": clock_set,   # winch RTC set (NTP or GPS)?
+                  "time": ("%02d:%02d:%02d" % (tm[3], tm[4], tm[5])
+                           if clock_set else "--:--:--"),
+                  "tsrc": clock_src,
                   "rx": received, "lost": lost}
         print("[RX]", msg)
         show_telemetry(msg)
         if msg["flags"] & protocol.FLAG_REQUEST_REPORT:
             send_link_report()
     elif msg["type"] == protocol.TIME_SYNC:
-        # Rope unit announces GPS time at startup; RTC sync goes here.
+        # Rope's GPS time. NTP (over WiFi) has priority, so only use this as a
+        # fallback when the clock isn't already NTP-synced.
+        if clock_src != "NTP":
+            try:
+                _set_rtc_unix(msg["epoch_s"])
+                clock_set = True
+                clock_src = "GPS"
+            except Exception as e:
+                print("RTC from GPS failed:", e)
         print("[RX] time sync, unix epoch", msg["epoch_s"])
     else:
         print("[RX]", msg)
@@ -184,6 +220,7 @@ body{font-family:sans-serif;background:#111;color:#eee;margin:0;text-align:cente
 <div id=phase>--</div>
 <div class=row><div class=cell><span id=gpsdot class=dot></span><span class=lbl>GPS</span></div>
 <div class=cell><span id=tdot class=dot></span><span class=lbl>TIME</span></div></div>
+<div id=clock class=lbl>--:--:--</div>
 <div class=row><div class=cell><div class=lbl>FORCE</div><div id=force class=big>--</div></div>
 <div class=cell><div class=lbl>ANGLE</div><div id=angle class=big>--</div></div></div>
 <div class=row><div class=cell><div class=lbl>ALT m</div><div id=alt class=big>--</div></div>
@@ -202,6 +239,7 @@ function tick(){
   warn.style.display=d.battlow?'block':'none';
   gpsdot.style.background=d.gps?'#1c1':'#c33';
   tdot.style.background=d.tsync?'#1c1':'#c33';
+  clock.textContent=d.time+' UTC'+(d.tsrc!='--'?' ('+d.tsrc+')':'');
  }).catch(function(e){});
  if(Date.now()-last>3000){document.body.className='stale';
   gpsdot.style.background='#555';tdot.style.background='#555';}
@@ -263,13 +301,18 @@ async def _serve():
         if wlan.isconnected():
             print("WiFi '%s' joined - http://%s/  or  http://%s.local/"
                   % (WIFI_SSID, wlan.ifconfig()[0], WIFI_HOSTNAME))
+            _ntp_sync()                   # NTP has priority over rope GPS time
             await asyncio.start_server(handle, "0.0.0.0", 80)
         else:
             print("WiFi: could not join '%s'; dashboard off" % WIFI_SSID)
     else:
         print("WiFi: no secrets.py; dashboard off")
+    n = 0
     while True:                           # keep-alive + periodic flash flush
         _flush_log()
+        n += 1
+        if n % 3600 == 0:                 # re-sync NTP hourly (corrects drift)
+            _ntp_sync()
         await asyncio.sleep_ms(1000)
 
 

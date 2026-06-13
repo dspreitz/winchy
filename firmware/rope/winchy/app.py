@@ -46,6 +46,7 @@ REPORT_WINDOW_MS = 150      # extra RX dwell after a request so the winch's
                             # at SF7, incl. the winch OLED update)
 DISPLAY_PERIOD_MS = 500
 SUPERVISOR_PERIOD_MS = 5000
+TIME_SYNC_RESEND_MS = 30000  # re-announce GPS time so a late/NTP-less winch syncs
 
 # Low-battery warning (rope cell terminal voltage from the AXP2101, mV).
 # Checked only while IDLE; hysteresis avoids flicker near the threshold.
@@ -307,6 +308,7 @@ async def display_task(display, state):
 
 
 async def supervisor_task(pmu, state):
+    ticks = 0
     while True:
         state.system_mv = pmu.getSystemVoltage()
         state.batt_mv = pmu.getBattVoltage()
@@ -320,6 +322,12 @@ async def supervisor_task(pmu, state):
                 state.batt_low = False
         else:
             state.batt_low = False
+        # Re-announce GPS time periodically so a winch that powered up after
+        # the rope (and has no NTP) still gets synced.
+        ticks += 1
+        if (state.time_synced
+                and ticks % (TIME_SYNC_RESEND_MS // SUPERVISOR_PERIOD_MS) == 0):
+            state.pending_time_sync = True
         await asyncio.sleep_ms(SUPERVISOR_PERIOD_MS)
 
 
