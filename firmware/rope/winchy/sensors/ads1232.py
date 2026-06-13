@@ -85,5 +85,21 @@ class ADS1232:
         return self.read_raw(timeout_ms) - self.offset
 
     def tare(self, samples=10):
-        self.offset = sum(self.read_raw() for _ in range(samples)) // samples
+        # The ADC needs a moment to start converting after wake/gain-set, so
+        # the first conversions can time out at boot. Average `samples` good
+        # reads, tolerating timeouts (extra time on the first), instead of
+        # letting one DRDY timeout abort startup. Raises only if it gets none.
+        total = 0
+        got = 0
+        attempts = 0
+        while got < samples and attempts < samples * 3 + 5:
+            attempts += 1
+            try:
+                total += self.read_raw(500 if got == 0 else 250)
+                got += 1
+            except OSError:
+                time.sleep_ms(20)
+        if got == 0:
+            raise OSError("ADS1232 DRDY timeout (tare)")
+        self.offset = total // got
         return self.offset
