@@ -41,9 +41,14 @@ BARO_PERIOD_MS = 1000
 # it cannot chase real rotation.
 GYRO_BIAS_ALPHA = 0.01
 GYRO_STILL_TOLERANCE_G = 0.05
-# Glider (CG-hook) speed: the rope-segment velocity carried up the taut rope
-# to the hook. The angle rate is an EMA-smoothed finite difference of the
-# Kalman rope angle (x5 m lever amplifies noise, so smooth + clamp it).
+# Glider (CG-hook) speed = the rope-segment's own 3-D speed (sqrt(ground^2 +
+# climb^2)), which is the glider speed to within a small correction. The 5 m
+# rigid-link rotation term (L*thetadot) is DISABLED by default: it amplifies
+# ANY rotation of the segment - hand-spinning it on the bench, or the segment
+# swinging/spinning on the cable in flight - into large fake airspeed, which
+# is not the glider's motion. Re-enable only after validating against a real
+# launch (see [[winchy-next-features]]).
+GLIDER_SPEED_5M_CORRECTION = False
 GLIDER_HOOK_DIST_M = 5.0    # rope segment -> CG-hook ring, along the rope
 ANGLE_RATE_ALPHA = 0.3      # EMA on the rope-angle rate
 ANGLE_RATE_MAX_DPS = 200.0  # clamp to reject finite-difference spikes
@@ -240,8 +245,12 @@ async def imu_task(imu, state, filt, gyro_bias):
         vh = state.ground_speed_ms
         vv = state.climb_rate_ms
         state.rope_speed_ms = math.sqrt(vh * vh + vv * vv)
-        state.glider_speed_ms = glider_speed(
-            vh, vv, state.angle_deg, state.angle_rate_dps, GLIDER_HOOK_DIST_M)
+        if GLIDER_SPEED_5M_CORRECTION:
+            state.glider_speed_ms = glider_speed(
+                vh, vv, state.angle_deg, state.angle_rate_dps,
+                GLIDER_HOOK_DIST_M)
+        else:                              # segment 3-D speed; rotation-immune
+            state.glider_speed_ms = state.rope_speed_ms
 
         # Raw log: filter inputs (raw accel/gyro/mag, pressure, force, GPS alt)
         # + on-device outputs (baro alt/climb, angle) for offline replay. gyro
