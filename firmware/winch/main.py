@@ -61,6 +61,26 @@ LOG_TO_FLASH = False        # set True for a range test (logs every RX frame)
 LOG_PATH = "winch_rxlog.csv"
 log_buf = []        # pending "t_ms,seq,rssi,snr,flags" lines
 
+# Optional WiFi dashboard: the winch joins an existing WiFi network and serves
+# a live telemetry page (HTTP poll, ~2 Hz) to any phone/laptop on that network
+# - a real operator display alongside the small OLED. WiFi is winch-only and
+# never touches the LoRa link. Credentials live in secrets.py (gitignored, on
+# the device only) so they stay out of the repo:
+#     WIFI_SSID = "spreitz intern"
+#     WIFI_PASSWORD = "..."
+# Browse to the IP printed at boot. Set WIFI_ENABLED = False for OLED-only.
+WIFI_ENABLED = True
+WIFI_HOSTNAME = "winchy"    # reachable as winchy.local (mDNS) + via router DNS
+try:
+    from secrets import WIFI_SSID, WIFI_PASSWORD
+except ImportError:
+    WIFI_SSID = WIFI_PASSWORD = None   # no secrets.py -> dashboard stays off
+
+# Latest decoded telemetry, served as JSON. Rebuilt (not mutated) in the RX
+# callback so the server always reads a complete snapshot.
+latest = {"phase": "--", "force": 0, "uncal": True, "angle": 0.0, "alt": 0,
+          "rssi": 0, "batt": 0.0, "battlow": False, "rx": 0, "lost": 0}
+
 
 def show_telemetry(msg):
     global blink
@@ -102,7 +122,7 @@ def send_link_report():
 
 def on_receive(events):
     global last_seq, received, lost, last_rssi, last_snr
-    global recv_window, lost_window
+    global recv_window, lost_window, latest
     if not (events & SX1262.RX_DONE):
         return
     frame, err = lora.recv()
@@ -129,6 +149,13 @@ def on_receive(events):
         if LOG_TO_FLASH:  # buffer only; the main loop does the flash write
             log_buf.append("%d,%d,%d,%d,%d\n" % (
                 time.ticks_ms(), seq, last_rssi, last_snr, msg["flags"]))
+        latest = {"phase": protocol.PHASE_NAMES.get(msg["phase"], "?"),
+                  "force": msg["force"],
+                  "uncal": bool(msg["flags"] & protocol.FLAG_FORCE_UNCALIBRATED),
+                  "angle": msg["angle_deg"], "alt": msg["altitude_m"],
+                  "rssi": last_rssi, "batt": msg["batt_v"],
+                  "battlow": bool(msg["flags"] & protocol.FLAG_BATTERY_LOW),
+                  "rx": received, "lost": lost}
         print("[RX]", msg)
         show_telemetry(msg)
         if msg["flags"] & protocol.FLAG_REQUEST_REPORT:
@@ -140,6 +167,104 @@ def on_receive(events):
         print("[RX]", msg)
 
 
+PAGE = """<!DOCTYPE html><html><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Winchy</title><style>
+body{font-family:sans-serif;background:#111;color:#eee;margin:0;text-align:center}
+#phase{font-size:13vw;font-weight:bold;padding:8px;background:#223}
+.big{font-size:10vw;font-weight:bold}.lbl{font-size:4vw;color:#8ac}
+.row{display:flex}.cell{flex:1;padding:8px}
+#warn{background:#c00;color:#fff;font-size:6vw;padding:10px;display:none}
+.stale{opacity:.35}
+</style></head><body>
+<div id=warn>! ROPE BATTERY LOW</div>
+<div id=phase>--</div>
+<div class=row><div class=cell><div class=lbl>FORCE</div><div id=force class=big>--</div></div>
+<div class=cell><div class=lbl>ANGLE</div><div id=angle class=big>--</div></div></div>
+<div class=row><div class=cell><div class=lbl>ALT m</div><div id=alt class=big>--</div></div>
+<div class=cell><div class=lbl>BATT V</div><div id=batt class=big>--</div></div></div>
+<div id=link class=lbl>link --</div>
+<script>
+var last=Date.now();
+function tick(){
+ fetch('/data').then(function(r){return r.json()}).then(function(d){
+  last=Date.now();document.body.className='';
+  phase.textContent=d.phase;
+  force.textContent=d.force+(d.uncal?' c':' N');
+  angle.textContent=d.angle.toFixed(1);
+  alt.textContent=d.alt;batt.textContent=d.batt.toFixed(1);
+  link.textContent='link '+d.rssi+' dBm   rx'+d.rx+' lost'+d.lost;
+  warn.style.display=d.battlow?'block':'none';
+ }).catch(function(e){});
+ if(Date.now()-last>3000)document.body.className='stale';
+}
+setInterval(tick,500);tick();
+</script></body></html>"""
+
+
+async def handle(reader, writer):
+    try:
+        req = await reader.readline()
+        while True:                       # drain request headers
+            h = await reader.readline()
+            if not h or h == b"\r\n":
+                break
+        path = req.split(b" ")[1] if b" " in req else b"/"
+        if path.startswith(b"/data"):
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                         b"Connection: close\r\n\r\n")
+            writer.write(json.dumps(latest).encode())
+        else:
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n"
+                         b"Connection: close\r\n\r\n")
+            writer.write(PAGE.encode())
+        await writer.drain()
+    except Exception as e:
+        print("http err:", e)
+    try:
+        writer.close()
+        await writer.wait_closed()
+    except Exception:
+        pass
+
+
+def _flush_log():
+    if logf is None or not log_buf:
+        return
+    n = len(log_buf)                      # write snapshot, drop exactly those;
+    for i in range(n):                    # anything the IRQ adds meanwhile waits
+        logf.write(log_buf[i])
+    del log_buf[0:n]
+    logf.flush()
+
+
+async def _serve():
+    if WIFI_SSID:
+        try:                              # MUST precede active(True) so mDNS
+            network.hostname(WIFI_HOSTNAME)   # advertises <name>.local
+        except Exception:
+            pass
+        wlan = network.WLAN(network.STA_IF)
+        wlan.active(True)
+        if not wlan.isconnected():
+            wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+            for _ in range(40):           # wait up to ~20 s for join + DHCP
+                if wlan.isconnected():
+                    break
+                await asyncio.sleep_ms(500)
+        if wlan.isconnected():
+            print("WiFi '%s' joined - http://%s/  or  http://%s.local/"
+                  % (WIFI_SSID, wlan.ifconfig()[0], WIFI_HOSTNAME))
+            await asyncio.start_server(handle, "0.0.0.0", 80)
+        else:
+            print("WiFi: could not join '%s'; dashboard off" % WIFI_SSID)
+    else:
+        print("WiFi: no secrets.py; dashboard off")
+    while True:                           # keep-alive + periodic flash flush
+        _flush_log()
+        await asyncio.sleep_ms(1000)
+
+
 lora.setBlockingCallback(False, on_receive)
 
 display.fill(0)
@@ -147,18 +272,19 @@ display.text("Waiting for data", 0, 0)
 display.show()
 print("Winch receiver ready")
 
+logf = None
 if LOG_TO_FLASH:
-    logf = open(LOG_PATH, "a")  # append so a reboot mid-walk keeps prior data
+    logf = open(LOG_PATH, "a")  # append so a reboot mid-run keeps prior data
     logf.write("# boot ticks_ms=%d\n" % time.ticks_ms())
     logf.flush()
 
-while True:
-    time.sleep(1)
-    if LOG_TO_FLASH and log_buf:
-        # Write the snapshot length, then drop exactly those; anything the IRQ
-        # appends meanwhile stays for the next pass.
-        n = len(log_buf)
-        for i in range(n):
-            logf.write(log_buf[i])
-        del log_buf[0:n]
-        logf.flush()
+if WIFI_ENABLED:
+    import asyncio
+    import network
+    import json
+    # RX stays IRQ-driven; this runs WiFi + dashboard + periodic flush.
+    asyncio.run(_serve())
+else:
+    while True:
+        time.sleep(1)
+        _flush_log()
