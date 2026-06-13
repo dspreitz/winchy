@@ -15,11 +15,13 @@ PMU_IRQ = 40
 # u-blox M10S GPS
 GPS_TX = 8
 GPS_RX = 9
-GPS_BAUD = 9600
+GPS_BAUD = 9600        # u-blox cold-boot default; the UART opens here, then
+                       # gps.set_baud() raises the module to GPS_BAUD_HIGH
+GPS_BAUD_HIGH = 115200 # ~11.5 kB/s budget; 10 Hz GGA+RMC is only ~1.5 kB/s
 GPS_PPS = 6   # u-blox 1PPS (TIMEPULSE) -> ESP32 GPIO6, disciplines the RTC
-# Nav/output rate. At 9600 baud only GGA+RMC fit at 5 Hz (~770 B/s); higher
-# needs a faster baud. gps.configure() trims to GGA+RMC and applies this.
-GPS_NAV_RATE_HZ = 5
+# Nav/output rate. gps.configure() trims NMEA to GGA+RMC and applies this.
+# 10 Hz needs the raised baud (at 9600 only ~5 Hz fits).
+GPS_NAV_RATE_HZ = 10
 
 # QMI8658 IMU on SPI2
 QMI_SCK = 36

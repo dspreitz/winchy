@@ -41,13 +41,24 @@ def _ubx(cls, msg_id, payload=b""):
     return b"\xb5\x62" + body + bytes([a, b])
 
 
+def set_baud(uart, baud):
+    """Set the module's UART1 baud (UBX-CFG-VALSET, RAM layer). Sent at the
+    port's current baud; the caller must then reopen the host UART at `baud`.
+    A power cycle resets the module to 9600, so this is part of the boot
+    config and is re-sent every boot.
+    """
+    key = 0x40520001  # CFG-UART1-BAUDRATE (U4)
+    payload = (b"\x00\x01\x00\x00"            # version 0, layers=RAM, reserved
+               + key.to_bytes(4, "little") + baud.to_bytes(4, "little"))
+    uart.write(_ubx(0x06, 0x8A, payload))
+    time.sleep_ms(150)
+
+
 def configure(uart, rate_hz=5):
     """Configure a u-blox M10 over UART: emit only the sentences we parse
     (GGA + RMC) and raise the nav rate. RAM-only (resets on power cycle), so
-    call this at every boot.
-
-    At 9600 baud only GGA+RMC fit at 5 Hz (~770 B/s of the ~960 B/s budget) -
-    do NOT re-enable the other sentences here without a faster baud.
+    call this at every boot. Volume is ~150 B per epoch, so the baud must
+    support rate_hz * 150 B/s (10 Hz needs the raised baud, not 9600).
     """
     # NMEA message rates (class 0xF0): drop GLL/GSA/GSV/VTG, keep GGA/RMC.
     for msg_class, msg_id, on in ((0xF0, 0x01, 0), (0xF0, 0x02, 0),

@@ -15,6 +15,12 @@ i2c0 = I2C(0, scl=Pin(config.I2C0_SCL), sda=Pin(config.I2C0_SDA),
            freq=config.I2C0_FREQ)
 gps_uart = UART(1, baudrate=config.GPS_BAUD, bits=8, parity=None, stop=1,
                 tx=Pin(config.GPS_TX), rx=Pin(config.GPS_RX), timeout=300)
+
+
+def gps_reopen(baud):
+    """Reconfigure the GPS UART to a new baud (after the module switched)."""
+    gps_uart.init(baudrate=baud, bits=8, parity=None, stop=1,
+                  tx=Pin(config.GPS_TX), rx=Pin(config.GPS_RX), timeout=300)
 qmi_spi = SPI(2, baudrate=1000000, polarity=1, phase=1,
               sck=Pin(config.QMI_SCK), mosi=Pin(config.QMI_MOSI),
               miso=Pin(config.QMI_MISO))

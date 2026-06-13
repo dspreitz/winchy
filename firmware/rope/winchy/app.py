@@ -24,7 +24,8 @@ from winchy.fusion.attitude import rope_angle_above_ground
 from winchy.fusion.kalman import GravityKalman, VerticalKalman
 from winchy.sensors.ads1232 import ADS1232
 from winchy.sensors.barometer import Barometer
-from winchy.sensors.gps import GPS, parse_nmea, configure as gps_configure
+from winchy.sensors.gps import (GPS, parse_nmea, configure as gps_configure,
+                                 set_baud as gps_set_baud)
 from winchy.sensors.magnetometer import Magnetometer
 from winchy.sensors.qmi8658 import QMI8658
 from winchy.state import State
@@ -392,9 +393,31 @@ def _pps_arm_next(y, mo, d, h, mi, s):
     _pps_armed = (nxt[0], nxt[1], nxt[2], nxt[6], nxt[3], nxt[4], nxt[5], 0)
 
 
+def _gps_alive(uart, timeout_ms=1500):
+    """True if NMEA is arriving - used to confirm the high-baud switch took."""
+    t0 = time.ticks_ms()
+    buf = b""
+    while time.ticks_diff(time.ticks_ms(), t0) < timeout_ms:
+        n = uart.any()
+        if n:
+            buf += uart.read(n)
+            if b"$G" in buf:
+                return True
+        time.sleep_ms(10)
+    return False
+
+
 async def gps_task(state):
     global _pps_rtc
-    gps_configure(board.gps_uart, config.GPS_NAV_RATE_HZ)  # GGA+RMC, raise rate
+    # Raise the module baud (sent at the boot baud; ignored if already raised),
+    # reopen the host UART to match, then trim to GGA+RMC and set the nav rate.
+    gps_set_baud(board.gps_uart, config.GPS_BAUD_HIGH)
+    board.gps_reopen(config.GPS_BAUD_HIGH)
+    gps_configure(board.gps_uart, config.GPS_NAV_RATE_HZ)
+    if not _gps_alive(board.gps_uart):       # baud switch didn't take - revert
+        board.gps_reopen(config.GPS_BAUD)
+        gps_configure(board.gps_uart, 5)
+        print("GPS: high baud failed, fell back to %d/5 Hz" % config.GPS_BAUD)
     reader = asyncio.StreamReader(board.gps_uart)
     rtc = RTC()
     _pps_rtc = rtc
