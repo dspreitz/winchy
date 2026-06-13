@@ -31,6 +31,7 @@ class State:
         self.lat = 0.0
         self.lon = 0.0
         self.alt_m = 0.0
+        self.ground_speed_ms = 0.0  # GPS speed over ground (RMC)
         self.gps_ts = 0
         self.time_synced = False
         self.pending_time_sync = False  # telemetry task owes a TIME_SYNC frame

@@ -48,7 +48,8 @@ def parse_nmea(line):
       {'type': 'GGA', 'fix': int, 'sats': int, 'lat': f|None,
        'lon': f|None, 'alt_m': f|None}
       {'type': 'RMC', 'valid': bool,
-       'datetime': (y, mo, d, h, mi, s) | None}   # UTC
+       'datetime': (y, mo, d, h, mi, s) | None,    # UTC
+       'speed_ms': f | None}                       # ground speed
     """
     try:
         if isinstance(line, bytes):
@@ -76,7 +77,11 @@ def parse_nmea(line):
                 t, d = fields[1], fields[9]
                 dt = (2000 + int(d[4:6]), int(d[2:4]), int(d[0:2]),
                       int(t[0:2]), int(t[2:4]), int(float(t[4:])))
-            return {"type": "RMC", "valid": valid, "datetime": dt}
+            # field 7 = speed over ground in knots -> m/s (1 kn = 0.514444 m/s)
+            speed_ms = (float(fields[7]) * 0.514444
+                        if len(fields) > 7 and fields[7] else None)
+            return {"type": "RMC", "valid": valid, "datetime": dt,
+                    "speed_ms": speed_ms}
     except (ValueError, IndexError, UnicodeError):
         pass
     return None

@@ -88,7 +88,7 @@ RAW_Q_MAX = 4000            # safety cap on the pending-write queue (~80 s @50 H
 # holds no episodes, so the uploader skips it.
 RAW_LOG_HEADER = ("# boot\n# t_ms,ax,ay,az,gx,gy,gz,mx,my,mz,force,"
                   "pressure_hpa,baro_alt_m,climb_ms,gps_alt_m,gps_lat,"
-                  "gps_lon,gps_fix,gps_sats,angle_deg\n")
+                  "gps_lon,gps_fix,gps_sats,gps_speed_ms,angle_deg\n")
 # Motion gating: a winch sits idle most of the time, so logging only around
 # movement keeps the log (and the planned WiFi->GitHub upload) minimal. A
 # time-based ring buffer holds the last RAW_LOG_PREROLL_S so the START of a
@@ -226,12 +226,12 @@ async def imu_task(imu, state, filt, gyro_bias):
         if RAW_LOG and len(state.raw_q) < RAW_Q_MAX:
             mx, my, mz = state.mag   # held; mag_task refreshes it at ~20 Hz
             row = ("%d,%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f,%d,"
-                   "%.2f,%.1f,%.2f,%.1f,%.7f,%.7f,%d,%d,%.1f\n" % (
+                   "%.2f,%.1f,%.2f,%.1f,%.7f,%.7f,%d,%d,%.2f,%.1f\n" % (
                        now, accel[0], accel[1], accel[2], gyro[0], gyro[1],
                        gyro[2], mx, my, mz, state.force_raw, state.pressure_hpa,
                        state.baro_alt_m, state.climb_rate_ms, state.alt_m,
                        state.lat, state.lon, state.gps_fix, state.gps_sats,
-                       state.angle_deg))
+                       state.ground_speed_ms, state.angle_deg))
 
             # Motion gate. Rest baselines (motion-test): accel_dev <= 0.04 g,
             # gyro_mag < 1 dps. A flat spin keeps |a| ~ 1 g, so the gyro term is
@@ -413,6 +413,8 @@ async def gps_task(state):
                 state.alt_m = update["alt_m"]
             state.gps_ts = time.ticks_ms()
         elif update["type"] == "RMC":
+            if update["speed_ms"] is not None:
+                state.ground_speed_ms = update["speed_ms"]
             if update["datetime"]:
                 y, mo, d, h, mi, s = update["datetime"]
                 if not state.time_synced:
