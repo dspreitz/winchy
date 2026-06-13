@@ -63,45 +63,43 @@ GPS_LOG = False             # set True for a range test (logs position per frame
 GPS_LOG_PATH = "rope_gpslog.csv"
 GPS_LOG_FLUSH_EVERY = 4     # flush after this many records (~2 s at 2 Hz)
 
-# Closed-loop TX-power control (ADR). Drives output power from the winch's
-# reported downlink SNR margin: back off when the link is strong (save the
-# battery / reduce interference), push up when it thins. Only power is
-# adapted here - changing SF/BW would need both ends retuned in lockstep, so
-# that stays a deliberate, handshaked step. Set ADR_ENABLED = False to pin
-# power at config.LORA_TX_POWER_DBM.
-ADR_ENABLED = False         # OFF: fixed TX at config.LORA_TX_POWER_DBM (+14).
-                            # ADR drove power down on a strong link and the link
-                            # got stuck/dropped; the SF7 budget has ample margin
-                            # so power-saving isn't worth it. Re-enable only once
-                            # the ramp-up/recovery is hardened.
-ADR_TX_POWER_MIN_DBM = -9   # SX1262 floor (driver clamps below this)
-ADR_TX_POWER_MAX_DBM = 14   # EU 868.0-868.6 MHz ERP cap (25 mW); raise only if
-                            # antenna gain / regulatory domain allows
-ADR_STEP_DB = 2             # per-adjustment increment, keeps changes gentle
-ADR_MARGIN_DB = 12          # desired SNR headroom above the SF's demod floor
-ADR_HYSTERESIS_DB = 4       # deadband around the target to avoid oscillation
-ADR_LOSS_HIGH_PCT = 50      # sustained loss above this forces power up
-ADR_REPORT_TIMEOUT_MS = 4000  # no fresh report this long -> ramp up (fail safe)
-
-# Approx LoRa demodulator SNR floor (dB) per spreading factor.
-_LORA_SNR_FLOOR_DB = {7: -7, 8: -10, 9: -12, 10: -15, 11: -17, 12: -20}
+# Closed-loop TX-power control (ADR). Drives the rope's output power from the
+# winch's reported downlink quality. Hardened after an earlier version starved
+# the link:
+#   * control on RSSI (linear with power), NOT SNR - SNR saturates (~12 dB) and
+#     let it keep cutting power until RSSI was at the noise floor;
+#   * recover FAST: jump straight to max on a stale/lossy link, so it out-runs
+#     survivorship-biased feedback (only frames that got through report "good");
+#   * optimise SLOW: trim 1 dB at a time, and only when RSSI is well clear of
+#     the floor, so it never walks the link down to the edge.
+# Only power is adapted; SF/BW stay fixed (would need both ends retuned).
+ADR_ENABLED = True
+ADR_TX_POWER_MIN_DBM = -9     # SX1262 floor (driver clamps below this)
+ADR_TX_POWER_MAX_DBM = 14     # EU 868.0-868.6 MHz ERP cap (25 mW)
+ADR_RSSI_LOW_DBM = -90        # winch RSSI below this -> raise (keeps ~20 dB above
+                              # the ~-110 dBm SF7/BW500 sensitivity floor)
+ADR_RSSI_HIGH_DBM = -70       # winch RSSI above this -> trim (margin to spare)
+ADR_STEP_UP_DB = 4            # raise quickly to restore margin
+ADR_STEP_DOWN_DB = 1          # trim gently
+ADR_LOSS_HIGH_PCT = 20        # loss above this -> jump to max
+ADR_REPORT_TIMEOUT_MS = 4000  # no fresh report this long -> jump to max
 
 
 def _adr_next_power(state):
-    """Return the next TX power (dBm) one step toward the SNR-margin target,
-    clamped. Ramps up when feedback is stale or loss is high (fail safe)."""
+    """Next TX power (dBm), clamped. Fail loud (jump to max) on stale/lossy
+    feedback so the link recovers at once; otherwise keep the winch-reported
+    RSSI in a comfortable window - raise fast, trim slow."""
     power = state.tx_power_dbm
     fresh = (state.link_report_ts != 0 and time.ticks_diff(
         time.ticks_ms(), state.link_report_ts) <= ADR_REPORT_TIMEOUT_MS)
-    if not fresh or state.link_loss_pct >= ADR_LOSS_HIGH_PCT:
-        return min(ADR_TX_POWER_MAX_DBM, power + ADR_STEP_DB)
-    floor = _LORA_SNR_FLOOR_DB.get(config.LORA_SF, -20)
-    margin = state.link_snr_db - (floor + ADR_MARGIN_DB)
-    if margin < -ADR_HYSTERESIS_DB:
-        return min(ADR_TX_POWER_MAX_DBM, power + ADR_STEP_DB)
-    if margin > ADR_HYSTERESIS_DB:
-        return max(ADR_TX_POWER_MIN_DBM, power - ADR_STEP_DB)
-    return power  # inside the deadband: hold
+    if (not fresh) or state.link_loss_pct >= ADR_LOSS_HIGH_PCT:
+        return ADR_TX_POWER_MAX_DBM
+    rssi = state.link_rssi_dbm
+    if rssi < ADR_RSSI_LOW_DBM:
+        return min(ADR_TX_POWER_MAX_DBM, power + ADR_STEP_UP_DB)
+    if rssi > ADR_RSSI_HIGH_DBM:
+        return max(ADR_TX_POWER_MIN_DBM, power - ADR_STEP_DOWN_DB)
+    return power  # within the window: hold
 
 # MicroPython's time.time() counts from 2000-01-01; the protocol carries
 # unix epoch seconds.
