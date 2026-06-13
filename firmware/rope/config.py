@@ -16,6 +16,7 @@ PMU_IRQ = 40
 GPS_TX = 8
 GPS_RX = 9
 GPS_BAUD = 9600
+GPS_PPS = 6   # u-blox 1PPS (TIMEPULSE) -> ESP32 GPIO6, disciplines the RTC
 
 # QMI8658 IMU on SPI2
 QMI_SCK = 36

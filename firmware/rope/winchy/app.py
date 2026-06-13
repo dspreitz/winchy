@@ -7,6 +7,7 @@
 
 import asyncio
 import math
+import micropython
 import time
 
 from machine import Pin, RTC
@@ -175,9 +176,42 @@ async def baro_task(baro, state, vertical):
         await asyncio.sleep_ms(BARO_PERIOD_MS)
 
 
+# GPS 1PPS discipline: the rising edge on config.GPS_PPS is the exact UTC
+# second boundary, so we set the whole-second RTC value on the edge instead of
+# when the (latency-jittered) NMEA sentence arrives. The IRQ only schedules the
+# apply; the pre-built tuple is written in a safe context.
+_pps_rtc = None         # RTC() handle
+_pps_armed = None       # datetime tuple to write on the next edge, or None
+_pps_count = 0          # rising edges seen (liveness / debug)
+
+
+def _pps_apply(_):
+    global _pps_armed
+    a = _pps_armed
+    if a is not None and _pps_rtc is not None:
+        _pps_rtc.datetime(a)
+        _pps_armed = None
+
+
+def _on_pps(pin):
+    global _pps_count
+    _pps_count += 1
+    micropython.schedule(_pps_apply, 0)
+
+
+def _pps_arm_next(y, mo, d, h, mi, s):
+    # Arm the RTC for the NEXT whole second (the upcoming PPS edge), UTC.
+    global _pps_armed
+    nxt = time.gmtime(time.mktime((y, mo, d, h, mi, s, 0, 0)) + 1)
+    _pps_armed = (nxt[0], nxt[1], nxt[2], nxt[6], nxt[3], nxt[4], nxt[5], 0)
+
+
 async def gps_task(state):
+    global _pps_rtc
     reader = asyncio.StreamReader(board.gps_uart)
     rtc = RTC()
+    _pps_rtc = rtc
+    Pin(config.GPS_PPS, Pin.IN).irq(trigger=Pin.IRQ_RISING, handler=_on_pps)
     while True:
         line = await reader.readline()
         update = parse_nmea(line)
@@ -193,13 +227,17 @@ async def gps_task(state):
                 state.alt_m = update["alt_m"]
             state.gps_ts = time.ticks_ms()
         elif update["type"] == "RMC":
-            if update["datetime"] and not state.time_synced:
+            if update["datetime"]:
                 y, mo, d, h, mi, s = update["datetime"]
-                rtc.datetime((y, mo, d, 0, h, mi, s, 0))
-                state.time_synced = True
-                state.pending_time_sync = True
-                print("RTC synced from GPS: %04d-%02d-%02d %02d:%02d:%02dZ"
-                      % (y, mo, d, h, mi, s))
+                if not state.time_synced:
+                    # Rough initial set (NMEA-latency) so we have time at once;
+                    # PPS then refines the second boundary on each edge.
+                    rtc.datetime((y, mo, d, 0, h, mi, s, 0))
+                    state.time_synced = True
+                    state.pending_time_sync = True
+                    print("RTC synced from GPS: %04d-%02d-%02d %02d:%02d:%02dZ"
+                          % (y, mo, d, h, mi, s))
+                _pps_arm_next(y, mo, d, h, mi, s)
 
 
 async def telemetry_task(sx, state):
