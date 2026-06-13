@@ -57,7 +57,7 @@ WARN_BLINK_FRAMES = 4   # frames per state (~2 s at 2 Hz) when battery is low
 # written in the main loop - never do flash I/O in the IRQ or we'd stall the
 # radio and drop the frames we're trying to count. Disable for routine use to
 # avoid flash wear; clear winch_rxlog.csv before each run for a fresh log.
-LOG_TO_FLASH = False        # set True for a range test (logs every RX frame)
+LOG_TO_FLASH = True         # log every RX frame to flash; also served at /log
 LOG_PATH = "winch_rxlog.csv"
 log_buf = []        # pending "t_ms,seq,rssi,snr,flags" lines
 
@@ -75,6 +75,20 @@ try:
     from secrets import WIFI_SSID, WIFI_PASSWORD
 except ImportError:
     WIFI_SSID = WIFI_PASSWORD = None   # no secrets.py -> dashboard stays off
+
+# Winch-direct GitHub upload of the received log (no PC in the loop). Needs a
+# fine-grained PAT scoped to GITHUB_REPO ("Contents: read and write") stored in
+# secrets.py as GITHUB_TOKEN. No token -> uploads disabled (log still kept and
+# served at /log). The asset is replaced each upload (one rolling file).
+GITHUB_REPO = "dspreitz/winchy-logs"
+GITHUB_RELEASE_TAG = "logs"
+GITHUB_ASSET = "winch_rxlog.csv"
+UPLOAD_PERIOD_S = 600       # interim: re-upload every 10 min while on WiFi
+                            # (later: trigger once per launch via phase detection)
+try:
+    from secrets import GITHUB_TOKEN
+except ImportError:
+    GITHUB_TOKEN = None
 
 # Latest decoded telemetry, served as JSON. Rebuilt (not mutated) in the RX
 # callback so the server always reads a complete snapshot.
@@ -143,6 +157,41 @@ def _ntp_sync():
         print("RTC set from NTP")
     except Exception as e:
         print("NTP sync failed:", e)
+
+
+def _github_upload():
+    # Replace the rolling log asset on the 'logs' release: look up the release,
+    # delete any existing asset of the same name, then upload the current log.
+    # Blocks the asyncio loop for the round-trips (~secs); RX stays IRQ-driven.
+    if not GITHUB_TOKEN:
+        return
+    import urequests
+    import gc
+    hdr = {"Authorization": "Bearer " + GITHUB_TOKEN, "User-Agent": "winchy",
+           "Accept": "application/vnd.github+json"}
+    try:
+        r = urequests.get("https://api.github.com/repos/%s/releases/tags/%s"
+                          % (GITHUB_REPO, GITHUB_RELEASE_TAG), headers=hdr)
+        rel = r.json()
+        r.close()
+        rid = rel["id"]
+        for a in rel.get("assets", ()):
+            if a.get("name") == GITHUB_ASSET:
+                urequests.delete(
+                    "https://api.github.com/repos/%s/releases/assets/%d"
+                    % (GITHUB_REPO, a["id"]), headers=hdr).close()
+        gc.collect()
+        body = open(LOG_PATH, "rb").read()
+        h2 = dict(hdr)
+        h2["Content-Type"] = "text/csv"
+        u = urequests.post(
+            "https://uploads.github.com/repos/%s/releases/%d/assets?name=%s"
+            % (GITHUB_REPO, rid, GITHUB_ASSET), data=body, headers=h2)
+        print("GitHub upload %s: HTTP %d" % (GITHUB_ASSET, u.status_code))
+        u.close()
+    except Exception as e:
+        print("GitHub upload failed:", e)
+    gc.collect()
 
 
 def on_receive(events):
@@ -265,6 +314,14 @@ async def handle(reader, writer):
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
                          b"Connection: close\r\n\r\n")
             writer.write(json.dumps(latest).encode())
+        elif path.startswith(b"/log"):   # serve the flash log for offload
+            try:
+                body = open(LOG_PATH, "rb").read()
+            except OSError:
+                body = b""
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/csv\r\n"
+                         b"Connection: close\r\n\r\n")
+            writer.write(body)
         else:
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n"
                          b"Connection: close\r\n\r\n")
@@ -318,6 +375,8 @@ async def _serve():
         n += 1
         if n % 3600 == 0:                 # re-sync NTP hourly (corrects drift)
             _ntp_sync()
+        if GITHUB_TOKEN and n % UPLOAD_PERIOD_S == 0:
+            _github_upload()              # interim periodic; later: per launch
         await asyncio.sleep_ms(1000)
 
 
