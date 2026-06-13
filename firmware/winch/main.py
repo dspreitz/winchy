@@ -51,6 +51,16 @@ LOSS_EMA_ALPHA = 0.3
 blink = 0           # render counter; alternates the bottom line when warning
 WARN_BLINK_FRAMES = 4   # frames per state (~2 s at 2 Hz) when battery is low
 
+# Flash logging of received frames, for range tests when the winch is
+# untethered (so we see the downlink directly instead of inferring it from
+# the back-channel). Records are buffered in RAM by the RX callback and
+# written in the main loop - never do flash I/O in the IRQ or we'd stall the
+# radio and drop the frames we're trying to count. Disable for routine use to
+# avoid flash wear; clear winch_rxlog.csv before each run for a fresh log.
+LOG_TO_FLASH = True
+LOG_PATH = "winch_rxlog.csv"
+log_buf = []        # pending "t_ms,seq,rssi,snr,flags" lines
+
 
 def show_telemetry(msg):
     global blink
@@ -116,6 +126,9 @@ def on_receive(events):
     last_seq = seq
 
     if msg["type"] == protocol.TELEMETRY:
+        if LOG_TO_FLASH:  # buffer only; the main loop does the flash write
+            log_buf.append("%d,%d,%d,%d,%d\n" % (
+                time.ticks_ms(), seq, last_rssi, last_snr, msg["flags"]))
         print("[RX]", msg)
         show_telemetry(msg)
         if msg["flags"] & protocol.FLAG_REQUEST_REPORT:
@@ -134,5 +147,18 @@ display.text("Waiting for data", 0, 0)
 display.show()
 print("Winch receiver ready")
 
+if LOG_TO_FLASH:
+    logf = open(LOG_PATH, "a")  # append so a reboot mid-walk keeps prior data
+    logf.write("# boot ticks_ms=%d\n" % time.ticks_ms())
+    logf.flush()
+
 while True:
     time.sleep(1)
+    if LOG_TO_FLASH and log_buf:
+        # Write the snapshot length, then drop exactly those; anything the IRQ
+        # appends meanwhile stays for the next pass.
+        n = len(log_buf)
+        for i in range(n):
+            logf.write(log_buf[i])
+        del log_buf[0:n]
+        logf.flush()

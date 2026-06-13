@@ -53,13 +53,22 @@ BATT_PRESENT_MV = 2500      # at/below this, treat as no cell fitted (USB only)
 BATT_LOW_MV = 3500          # warn below this (~20% on a Li-ion)
 BATT_LOW_CLEAR_MV = 3650    # clear above this
 
+# Range-test GPS logging: record this unit's position per transmitted frame,
+# keyed by the telemetry seq so it joins against the winch's per-frame RSSI
+# log (rope walks with GPS; winch stays tethered and logs the downlink).
+# Clear rope_gpslog.csv before a run; disable for routine use (flash wear).
+GPS_LOG = True
+GPS_LOG_PATH = "rope_gpslog.csv"
+GPS_LOG_FLUSH_EVERY = 4     # flush after this many records (~2 s at 2 Hz)
+
 # Closed-loop TX-power control (ADR). Drives output power from the winch's
 # reported downlink SNR margin: back off when the link is strong (save the
 # battery / reduce interference), push up when it thins. Only power is
 # adapted here - changing SF/BW would need both ends retuned in lockstep, so
 # that stays a deliberate, handshaked step. Set ADR_ENABLED = False to pin
 # power at config.LORA_TX_POWER_DBM.
-ADR_ENABLED = True
+ADR_ENABLED = False         # range test: fix TX at config.LORA_TX_POWER_DBM
+                            # (+14 dBm) so RSSI maps directly to path loss
 ADR_TX_POWER_MIN_DBM = -9   # SX1262 floor (driver clamps below this)
 ADR_TX_POWER_MAX_DBM = 14   # EU 868.0-868.6 MHz ERP cap (25 mW); raise only if
                             # antenna gain / regulatory domain allows
@@ -195,6 +204,13 @@ async def gps_task(state):
 async def telemetry_task(sx, state):
     seq = 0
     frame_count = 0
+    gpslog = open(GPS_LOG_PATH, "a") if GPS_LOG else None
+    if gpslog:
+        gpslog.write("# boot ticks_ms=%d\n"
+                     "seq,ticks_ms,lat,lon,alt_m,sats,fix,tx_dbm\n"
+                     % time.ticks_ms())
+        gpslog.flush()
+    gps_buf = []
     while True:
         if state.pending_time_sync:
             state.pending_time_sync = False
@@ -260,6 +276,15 @@ async def telemetry_task(sx, state):
                 sx.startReceive()
             except Exception:
                 pass
+        if gpslog:  # this frame's position, keyed by seq for the post-walk join
+            gps_buf.append("%d,%d,%.6f,%.6f,%.1f,%d,%d,%d\n" % (
+                seq, time.ticks_ms(), state.lat, state.lon, state.alt_m,
+                state.gps_sats, state.gps_fix, state.tx_power_dbm))
+            if len(gps_buf) >= GPS_LOG_FLUSH_EVERY:
+                for r in gps_buf:
+                    gpslog.write(r)
+                gpslog.flush()
+                gps_buf = []
         seq = (seq + 1) & 0xFFFF
         state.tx_count += 1
         print("Sent packet (binary):", frame)
