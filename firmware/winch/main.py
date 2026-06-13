@@ -63,7 +63,7 @@ LOG_PATH = "winch_rxlog.csv"
 # Written at open and after an offload-reset; a file of exactly this size has
 # no data rows, so it isn't uploaded.
 LOG_HEADER = ("# boot\n# utc,seq,phase,force,angle_deg,alt_m,batt_v,batt_pct,"
-              "flags,rssi,snr\n")
+              "flags,rssi,snr,speed_ms\n")
 log_buf = []        # pending CSV rows: utc,seq,phase,force,angle_deg,alt_m,
                     # batt_v,batt_pct,flags,rssi,snr  (utc = ISO8601 Z)
 
@@ -99,8 +99,8 @@ except ImportError:
 # Latest decoded telemetry, served as JSON. Rebuilt (not mutated) in the RX
 # callback so the server always reads a complete snapshot.
 latest = {"phase": "--", "force": 0, "uncal": True, "angle": 0.0, "alt": 0,
-          "rssi": 0, "batt": 0.0, "battlow": False, "battpct": 255,
-          "charging": False, "tsync": False,
+          "speed": 0.0, "rssi": 0, "batt": 0.0, "battlow": False,
+          "battpct": 255, "charging": False, "tsync": False,
           "time": "--:--:--", "tsrc": "--", "rx": 0, "lost": 0}
 
 # Winch RTC sync: NTP (via WiFi) is preferred; the rope's GPS time over the
@@ -114,8 +114,10 @@ def show_telemetry(msg):
     global blink
     blink += 1
     display.fill(0)
-    display.text("Winchy " + protocol.PHASE_NAMES.get(msg["phase"], "?"),
-                 0, 0)
+    # Top line: phase left, glider speed (km/h) right-aligned.
+    display.text(protocol.PHASE_NAMES.get(msg["phase"], "?"), 0, 0)
+    spd = "%.0f" % (msg["glider_speed_ms"] * 3.6)
+    display.text(spd, 128 - len(spd) * 8, 0)   # 8 px per char, 128 px wide
     unit = "cnt" if msg["flags"] & protocol.FLAG_FORCE_UNCALIBRATED else "N"
     display.text("F: {} {}".format(msg["force"], unit), 0, 14)
     display.text("Angle: {:.1f}".format(msg["angle_deg"]), 0, 26)
@@ -270,15 +272,16 @@ def on_receive(events):
         tm = time.localtime()           # RTC is UTC (NTP/GPS-synced)
         if LOG_TO_FLASH:  # buffer only; the main loop does the flash write
             log_buf.append(
-                "%04d-%02d-%02dT%02d:%02d:%02dZ,%d,%d,%d,%.1f,%d,%.1f,%d,%d,%d,%d\n"
+                "%04d-%02d-%02dT%02d:%02d:%02dZ,%d,%d,%d,%.1f,%d,%.1f,%d,%d,%d,%d,%.1f\n"
                 % (tm[0], tm[1], tm[2], tm[3], tm[4], tm[5], seq, msg["phase"],
                    msg["force"], msg["angle_deg"], msg["altitude_m"],
                    msg["batt_v"], msg["batt_pct"], msg["flags"],
-                   last_rssi, last_snr))
+                   last_rssi, last_snr, msg["glider_speed_ms"]))
         latest = {"phase": protocol.PHASE_NAMES.get(msg["phase"], "?"),
                   "force": msg["force"],
                   "uncal": bool(msg["flags"] & protocol.FLAG_FORCE_UNCALIBRATED),
                   "angle": msg["angle_deg"], "alt": msg["altitude_m"],
+                  "speed": msg["glider_speed_ms"],
                   "rssi": last_rssi, "batt": msg["batt_v"],
                   "battlow": bool(msg["flags"] & protocol.FLAG_BATTERY_LOW),
                   "battpct": msg["batt_pct"],
@@ -324,6 +327,7 @@ body{font-family:sans-serif;background:#111;color:#eee;margin:0;text-align:cente
 <div class=row><div class=cell><span id=gpsdot class=dot></span><span class=lbl>GPS</span></div>
 <div class=cell><span id=tdot class=dot></span><span class=lbl>TIME</span></div></div>
 <div id=clock class=lbl>--:--:--</div>
+<div class=cell><div class=lbl>SPEED km/h</div><div id=speed class=big>--</div></div>
 <div class=row><div class=cell><div class=lbl>FORCE</div><div id=force class=big>--</div></div>
 <div class=cell><div class=lbl>ANGLE</div><div id=angle class=big>--</div></div></div>
 <div class=row><div class=cell><div class=lbl>ALT m</div><div id=alt class=big>--</div></div>
@@ -335,6 +339,7 @@ function tick(){
  fetch('/data').then(function(r){return r.json()}).then(function(d){
   last=Date.now();document.body.className='';
   phase.textContent=d.phase;
+  speed.textContent=(d.speed*3.6).toFixed(0);
   force.textContent=d.force+(d.uncal?' c':' N');
   angle.textContent=d.angle.toFixed(1);
   alt.textContent=d.alt;

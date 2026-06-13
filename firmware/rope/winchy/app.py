@@ -516,7 +516,7 @@ async def telemetry_task(sx, state):
         frame = protocol.encode_telemetry(
             seq, protocol.PHASE_IDLE, force, state.angle_deg,
             state.baro_alt_m, state.batt_mv, flags,  # real cell, not sys rail
-            state.batt_pct)
+            state.batt_pct, state.glider_speed_ms)
         print("ADC value:", force)
         print("Seilwinkel:", state.angle_deg)
         ax, ay, az = state.accel

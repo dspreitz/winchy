@@ -14,7 +14,7 @@
 
 import struct
 
-VERSION = 4
+VERSION = 5
 
 # Frame types
 TELEMETRY = 1
@@ -54,7 +54,8 @@ FLAG_CHARGING = 0x20        # rope battery currently charging
 
 # version:B type:B seq:H | phase:B force:i angle:B(0.5 deg)
 # altitude:H(1 m, AMSL) battery:B(0.1 V) flags:B batt_pct:B(%, 255=unknown)
-_TELEMETRY_FMT = "<BBHBiBHBBB"
+# glider_speed:H(0.1 m/s) - CG-hook speed estimate
+_TELEMETRY_FMT = "<BBHBiBHBBBH"
 # version:B type:B seq:H | unix epoch seconds UTC:I
 _TIME_SYNC_FMT = "<BBHI"
 # version:B type:B seq:H | mass:H(0.1 kg) confidence:B(%)
@@ -67,13 +68,14 @@ _LINK_REPORT_FMT = "<BBHhbB"
 
 
 def encode_telemetry(seq, phase, force, angle_deg, altitude_m, batt_mv,
-                     flags, batt_pct=255):
+                     flags, batt_pct=255, glider_speed_ms=0.0):
     angle = max(0, min(255, int(round(angle_deg * 2))))
     altitude = max(0, min(65535, int(round(altitude_m))))
     batt = max(0, min(255, batt_mv // 100))
     pct = batt_pct & 0xFF   # 0..100 normal; 255 = unknown / no cell (-1 -> 255)
+    speed = max(0, min(65535, int(round(glider_speed_ms * 10))))
     return struct.pack(_TELEMETRY_FMT, VERSION, TELEMETRY, seq & 0xFFFF,
-                       phase, force, angle, altitude, batt, flags, pct)
+                       phase, force, angle, altitude, batt, flags, pct, speed)
 
 
 def encode_time_sync(seq, epoch_s):
@@ -112,11 +114,12 @@ def decode(frame):
 
     if ftype == TELEMETRY and len(frame) == struct.calcsize(_TELEMETRY_FMT):
         (_, _, seq, phase, force, angle, altitude, batt, flags,
-         batt_pct) = struct.unpack(_TELEMETRY_FMT, frame)
+         batt_pct, speed) = struct.unpack(_TELEMETRY_FMT, frame)
         return {"type": TELEMETRY, "seq": seq, "phase": phase,
                 "force": force, "angle_deg": angle / 2,
                 "altitude_m": altitude, "batt_v": batt / 10,
-                "flags": flags, "batt_pct": batt_pct}
+                "flags": flags, "batt_pct": batt_pct,
+                "glider_speed_ms": speed / 10}
 
     if ftype == TIME_SYNC and len(frame) == struct.calcsize(_TIME_SYNC_FMT):
         _, _, seq, epoch_s = struct.unpack(_TIME_SYNC_FMT, frame)
