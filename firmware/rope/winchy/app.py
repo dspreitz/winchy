@@ -87,6 +87,23 @@ RAW_LOG_REST_HOLD_S = 5     # continuous rest this long closes a segment
 MOTION_ACCEL_DEV_G = 0.10   # |norm-1g| over this = moving (rest <= 0.04)
 MOTION_GYRO_DPS = 10.0      # bias-corrected gyro magnitude over this = moving
 
+# Offload the raw log over WiFi when in range. The rope is battery-powered on
+# the cable, so WiFi is duty-cycled: only while IDLE (never during a launch),
+# only when the cell can spare it, and powered down between attempts. When it
+# joins the known network it pushes raw.csv to the same winchy-logs release as
+# the winch (separate asset). Credentials live in secrets.py (gitignored, on
+# the device only): WIFI_SSID, WIFI_PASSWORD, GITHUB_TOKEN. No secrets -> off.
+WIFI_ENABLED = True
+WIFI_JOIN_TIMEOUT_S = 15    # wait this long for join + DHCP, then give up
+WIFI_PERIOD_S = 600         # try to offload this often while idle (10 min)
+GITHUB_REPO = "dspreitz/winchy-logs"
+GITHUB_RELEASE_TAG = "logs"
+GITHUB_ASSET = "rope_rawlog.csv"
+try:
+    from secrets import WIFI_SSID, WIFI_PASSWORD, GITHUB_TOKEN
+except ImportError:
+    WIFI_SSID = WIFI_PASSWORD = GITHUB_TOKEN = None   # no secrets.py -> off
+
 # Closed-loop TX-power control (ADR). Drives the rope's output power from the
 # winch's reported downlink quality. Hardened after an earlier version starved
 # the link:
@@ -481,6 +498,84 @@ async def supervisor_task(pmu, state):
         await asyncio.sleep_ms(SUPERVISOR_PERIOD_MS)
 
 
+def _github_upload_raw():
+    # Replace the rolling rope-log asset on the 'logs' release: look up the
+    # release, delete any existing asset of the same name, then upload raw.csv.
+    # Blocks the asyncio loop for the round-trips (~secs) - only called while
+    # IDLE, so the launch path is never affected.
+    import urequests
+    hdr = {"Authorization": "Bearer " + GITHUB_TOKEN, "User-Agent": "winchy",
+           "Accept": "application/vnd.github+json"}
+    ok = False
+    try:
+        r = urequests.get("https://api.github.com/repos/%s/releases/tags/%s"
+                          % (GITHUB_REPO, GITHUB_RELEASE_TAG), headers=hdr)
+        rel = r.json()
+        r.close()
+        rid = rel["id"]
+        for a in rel.get("assets", ()):
+            if a.get("name") == GITHUB_ASSET:
+                urequests.delete(
+                    "https://api.github.com/repos/%s/releases/assets/%d"
+                    % (GITHUB_REPO, a["id"]), headers=hdr).close()
+        gc.collect()
+        body = open(RAW_LOG_PATH, "rb").read()
+        h2 = dict(hdr)
+        h2["Content-Type"] = "text/csv"
+        u = urequests.post(
+            "https://uploads.github.com/repos/%s/releases/%d/assets?name=%s"
+            % (GITHUB_REPO, rid, GITHUB_ASSET), data=body, headers=h2)
+        ok = 200 <= u.status_code < 300
+        print("GitHub upload %s: HTTP %d" % (GITHUB_ASSET, u.status_code))
+        u.close()
+    except Exception as e:
+        print("GitHub upload failed:", e)
+    gc.collect()
+    return ok
+
+
+async def wifi_task(state):
+    # Duty-cycled offload: while idle and the battery can spare it, bring WiFi
+    # up, try to join the known network, push raw.csv if it has new data, then
+    # power WiFi back down. WiFi is separate from the SX1262 LoRa link.
+    import network
+    last_uploaded = 0
+    wlan = network.WLAN(network.STA_IF)
+    while True:
+        await asyncio.sleep_ms(WIFI_PERIOD_S * 1000)
+        # Never during a launch; skip if the cell is low and not charging.
+        if state.phase != protocol.PHASE_IDLE:
+            continue
+        if state.batt_low and not state.charging:
+            continue
+        try:
+            size = os.stat(RAW_LOG_PATH)[6]
+        except OSError:
+            continue
+        if size <= last_uploaded:        # nothing new since the last upload
+            continue
+        try:
+            wlan.active(True)
+            if not wlan.isconnected():
+                wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+                for _ in range(WIFI_JOIN_TIMEOUT_S * 2):
+                    if wlan.isconnected():
+                        break
+                    await asyncio.sleep_ms(500)
+            if wlan.isconnected():
+                print("WiFi '%s' joined (%s); uploading raw log"
+                      % (WIFI_SSID, wlan.ifconfig()[0]))
+                if _github_upload_raw():
+                    last_uploaded = size
+            else:
+                print("WiFi: could not join '%s'" % WIFI_SSID)
+        except Exception as e:
+            print("WiFi/upload error:", e)
+        finally:
+            wlan.active(False)           # power WiFi down to save the battery
+            gc.collect()
+
+
 async def _main(pmu, adc, imu, baro, sx, display, state, gyro_bias, mag):
     gravity_filter = GravityKalman()
     vertical_filter = VerticalKalman()
@@ -495,6 +590,8 @@ async def _main(pmu, adc, imu, baro, sx, display, state, gyro_bias, mag):
     ]
     if display:
         tasks.append(display_task(display, state))
+    if WIFI_ENABLED and WIFI_SSID and GITHUB_TOKEN:
+        tasks.append(wifi_task(state))
     await asyncio.gather(*tasks)
 
 
