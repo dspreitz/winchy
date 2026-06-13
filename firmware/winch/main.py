@@ -155,6 +155,8 @@ def on_receive(events):
                   "angle": msg["angle_deg"], "alt": msg["altitude_m"],
                   "rssi": last_rssi, "batt": msg["batt_v"],
                   "battlow": bool(msg["flags"] & protocol.FLAG_BATTERY_LOW),
+                  "gps": bool(msg["flags"] & protocol.FLAG_GPS_FIX),
+                  "tsync": bool(msg["flags"] & protocol.FLAG_TIME_SYNCED),
                   "rx": received, "lost": lost}
         print("[RX]", msg)
         show_telemetry(msg)
@@ -176,9 +178,12 @@ body{font-family:sans-serif;background:#111;color:#eee;margin:0;text-align:cente
 .row{display:flex}.cell{flex:1;padding:8px}
 #warn{background:#c00;color:#fff;font-size:6vw;padding:10px;display:none}
 .stale{opacity:.35}
+.dot{display:inline-block;width:7vw;height:7vw;border-radius:50%;background:#555;vertical-align:middle;margin-right:2vw}
 </style></head><body>
 <div id=warn>! ROPE BATTERY LOW</div>
 <div id=phase>--</div>
+<div class=row><div class=cell><span id=gpsdot class=dot></span><span class=lbl>GPS</span></div>
+<div class=cell><span id=tdot class=dot></span><span class=lbl>TIME</span></div></div>
 <div class=row><div class=cell><div class=lbl>FORCE</div><div id=force class=big>--</div></div>
 <div class=cell><div class=lbl>ANGLE</div><div id=angle class=big>--</div></div></div>
 <div class=row><div class=cell><div class=lbl>ALT m</div><div id=alt class=big>--</div></div>
@@ -195,8 +200,11 @@ function tick(){
   alt.textContent=d.alt;batt.textContent=d.batt.toFixed(1);
   link.textContent='link '+d.rssi+' dBm   rx'+d.rx+' lost'+d.lost;
   warn.style.display=d.battlow?'block':'none';
+  gpsdot.style.background=d.gps?'#1c1':'#c33';
+  tdot.style.background=d.tsync?'#1c1':'#c33';
  }).catch(function(e){});
- if(Date.now()-last>3000)document.body.className='stale';
+ if(Date.now()-last>3000){document.body.className='stale';
+  gpsdot.style.background='#555';tdot.style.background='#555';}
 }
 setInterval(tick,500);tick();
 </script></body></html>"""
