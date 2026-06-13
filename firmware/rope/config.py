@@ -34,13 +34,16 @@ LORA_IRQ = 1
 LORA_RST = 5
 LORA_BUSY = 4  # 'gpio' parameter of the sx1262 driver
 
-# LoRa link parameters (amateur band) - must match the winch segment
+# LoRa link parameters - SF/BW/CR/sync/freq must match the winch segment.
+# SF7 (not 12): range to come is short and line-of-sight, and SF7/BW500 still
+# closes a multi-km airborne link while cutting airtime ~25x (~15 ms/frame),
+# which keeps the duty cycle sane and leaves room for the link back-channel.
 LORA_FREQ_MHZ = 868.0
 LORA_BW_KHZ = 500.0
-LORA_SF = 12
+LORA_SF = 7
 LORA_CR = 8
 LORA_SYNC_WORD = 0x12
-LORA_TX_POWER_DBM = -5
+LORA_TX_POWER_DBM = 14  # start at the EU ERP cap; ADR adapts down from here
 
 # ADS1232 force ADC
 ADS_PDWN = 39

@@ -44,3 +44,4 @@ class State:
         self.link_snr_db = 0
         self.link_loss_pct = 0
         self.link_report_ts = 0  # time.ticks_ms of last report; 0 = never
+        self.tx_power_dbm = 0    # current radio TX power, driven by ADR

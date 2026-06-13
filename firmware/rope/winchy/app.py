@@ -35,16 +35,53 @@ BARO_PERIOD_MS = 1000
 # it cannot chase real rotation.
 GYRO_BIAS_ALPHA = 0.01
 GYRO_STILL_TOLERANCE_G = 0.05
-TELEMETRY_PERIOD_MS = 500   # 2 Hz, the old loop cadence; the SF12/BW500
-                            # airtime (~130 ms/packet) caps what is sane here
+TELEMETRY_PERIOD_MS = 500   # 2 Hz. At SF7/BW500 airtime is ~15 ms so there is
+                            # rate headroom, but ~2% duty already nears the
+                            # 868.0-868.6 MHz 1% limit - raise rate with care.
 REPORT_REQUEST_EVERY = 2    # ask the winch for a LINK_REPORT every Nth frame
                             # (~1 Hz at 2 Hz telemetry); 0 disables feedback
-REPORT_WINDOW_MS = 600      # extra RX dwell after a request so the winch's
+REPORT_WINDOW_MS = 150      # extra RX dwell after a request so the winch's
                             # half-duplex reply lands before the next TX; must
-                            # exceed reply airtime + winch processing (~500 ms
-                            # at SF12, far less once SF drops)
+                            # exceed reply airtime + winch processing (~60 ms
+                            # at SF7, incl. the winch OLED update)
 DISPLAY_PERIOD_MS = 500
 SUPERVISOR_PERIOD_MS = 5000
+
+# Closed-loop TX-power control (ADR). Drives output power from the winch's
+# reported downlink SNR margin: back off when the link is strong (save the
+# battery / reduce interference), push up when it thins. Only power is
+# adapted here - changing SF/BW would need both ends retuned in lockstep, so
+# that stays a deliberate, handshaked step. Set ADR_ENABLED = False to pin
+# power at config.LORA_TX_POWER_DBM.
+ADR_ENABLED = True
+ADR_TX_POWER_MIN_DBM = -9   # SX1262 floor (driver clamps below this)
+ADR_TX_POWER_MAX_DBM = 14   # EU 868.0-868.6 MHz ERP cap (25 mW); raise only if
+                            # antenna gain / regulatory domain allows
+ADR_STEP_DB = 2             # per-adjustment increment, keeps changes gentle
+ADR_MARGIN_DB = 12          # desired SNR headroom above the SF's demod floor
+ADR_HYSTERESIS_DB = 4       # deadband around the target to avoid oscillation
+ADR_LOSS_HIGH_PCT = 50      # sustained loss above this forces power up
+ADR_REPORT_TIMEOUT_MS = 4000  # no fresh report this long -> ramp up (fail safe)
+
+# Approx LoRa demodulator SNR floor (dB) per spreading factor.
+_LORA_SNR_FLOOR_DB = {7: -7, 8: -10, 9: -12, 10: -15, 11: -17, 12: -20}
+
+
+def _adr_next_power(state):
+    """Return the next TX power (dBm) one step toward the SNR-margin target,
+    clamped. Ramps up when feedback is stale or loss is high (fail safe)."""
+    power = state.tx_power_dbm
+    fresh = (state.link_report_ts != 0 and time.ticks_diff(
+        time.ticks_ms(), state.link_report_ts) <= ADR_REPORT_TIMEOUT_MS)
+    if not fresh or state.link_loss_pct >= ADR_LOSS_HIGH_PCT:
+        return min(ADR_TX_POWER_MAX_DBM, power + ADR_STEP_DB)
+    floor = _LORA_SNR_FLOOR_DB.get(config.LORA_SF, -20)
+    margin = state.link_snr_db - (floor + ADR_MARGIN_DB)
+    if margin < -ADR_HYSTERESIS_DB:
+        return min(ADR_TX_POWER_MAX_DBM, power + ADR_STEP_DB)
+    if margin > ADR_HYSTERESIS_DB:
+        return max(ADR_TX_POWER_MIN_DBM, power - ADR_STEP_DB)
+    return power  # inside the deadband: hold
 
 # MicroPython's time.time() counts from 2000-01-01; the protocol carries
 # unix epoch seconds.
@@ -187,6 +224,22 @@ async def telemetry_task(sx, state):
         if state.qnh_hpa:
             print("Baro alt: %.1f m (GPS %.1f m, %+.1f m/s)"
                   % (state.baro_alt_m, state.alt_m, state.climb_rate_ms))
+        if ADR_ENABLED:
+            new_power = _adr_next_power(state)
+            if new_power != state.tx_power_dbm:
+                # setOutputPower must run from standby (it errors in RX). The
+                # SPI sequence can be corrupted if the RX IRQ (on_radio) fires
+                # mid-command, so guard it: on a collision, leave power as-is
+                # and retry next cycle. send() below recovers from any state.
+                try:
+                    sx.standby()
+                    sx.setOutputPower(new_power)
+                    print("ADR: tx power %d -> %d dBm (snr=%d loss=%d%%)"
+                          % (state.tx_power_dbm, new_power, state.link_snr_db,
+                             state.link_loss_pct))
+                    state.tx_power_dbm = new_power
+                except Exception as e:
+                    print("ADR power change deferred:", e)
         # Driver auto-returns to RX after this TX (non-blocking mode), so the
         # winch's reply is caught by on_radio with no explicit listen window;
         # we just dwell longer on report cycles so it isn't clobbered.
@@ -310,6 +363,7 @@ def run():
              crcOn=True, txIq=False, rxIq=False,
              tcxoVoltage=1.7, useRegulatorLDO=False, blocking=True)
     sx.setBlockingCallback(False, on_radio)
+    state.tx_power_dbm = config.LORA_TX_POWER_DBM  # ADR adjusts from here
 
     print("Starting asyncio runtime")
     asyncio.run(_main(pmu, adc, imu, baro, sx, display, state, gyro_bias))

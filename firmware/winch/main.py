@@ -20,16 +20,17 @@ from _sx126x import ERR_NONE
 
 import protocol
 
-# Radio parameters: must match firmware/rope/config.py.
+# Radio parameters: SF/BW/CR/sync/freq must match firmware/rope/config.py.
 LORA_FREQ_MHZ = 868.0
 LORA_BW_KHZ = 500.0
-LORA_SF = 12
+LORA_SF = 7
 LORA_CR = 8
 LORA_SYNC_WORD = 0x12
+LORA_TX_POWER_DBM = 14  # uplink (LINK_REPORT) power; fixed, no ADR on the winch
 
 lora = SX1262(spi_bus=1, clk=5, mosi=6, miso=3, cs=7, irq=33, rst=8, gpio=34)
 lora.begin(freq=LORA_FREQ_MHZ, bw=LORA_BW_KHZ, sf=LORA_SF, cr=LORA_CR,
-           syncWord=LORA_SYNC_WORD, power=10, currentLimit=60.0,
+           syncWord=LORA_SYNC_WORD, power=LORA_TX_POWER_DBM, currentLimit=60.0,
            preambleLength=8, implicit=False, crcOn=True,
            tcxoVoltage=1.7, useRegulatorLDO=False, blocking=True)
 
@@ -44,6 +45,9 @@ last_rssi = 0       # dBm of the most recent frame
 last_snr = 0        # dB of the most recent frame
 recv_window = 0     # frames received since the last report
 lost_window = 0     # frames lost since the last report
+loss_ema = 0.0      # smoothed loss %, so a single gap in the tiny per-report
+                    # window doesn't swing the figure to 50/100%
+LOSS_EMA_ALPHA = 0.3
 
 
 def show_telemetry(msg):
@@ -59,11 +63,13 @@ def show_telemetry(msg):
 
 
 def send_link_report():
-    # Report loss over the window since the previous report, not lifetime, so
-    # the rope sees recent conditions. Sending auto-returns the radio to RX.
-    global tx_seq, recv_window, lost_window
+    # EMA-smooth the per-report-window loss so a single gap in the (tiny)
+    # window doesn't swing the reported figure. Sending auto-returns to RX.
+    global tx_seq, recv_window, lost_window, loss_ema
     total = recv_window + lost_window
-    loss_pct = int(round(100 * lost_window / total)) if total else 0
+    window_loss = (100.0 * lost_window / total) if total else 0.0
+    loss_ema = LOSS_EMA_ALPHA * window_loss + (1 - LOSS_EMA_ALPHA) * loss_ema
+    loss_pct = int(round(loss_ema))
     lora.send(protocol.encode_link_report(tx_seq, last_rssi, last_snr,
                                           loss_pct))
     tx_seq = (tx_seq + 1) & 0xFFFF
