@@ -31,6 +31,36 @@ class GPS:
                 return
 
 
+def _ubx(cls, msg_id, payload=b""):
+    """Frame a UBX message (sync chars + class/id/len + Fletcher checksum)."""
+    body = bytes([cls, msg_id]) + len(payload).to_bytes(2, "little") + payload
+    a = b = 0
+    for x in body:
+        a = (a + x) & 0xFF
+        b = (b + a) & 0xFF
+    return b"\xb5\x62" + body + bytes([a, b])
+
+
+def configure(uart, rate_hz=5):
+    """Configure a u-blox M10 over UART: emit only the sentences we parse
+    (GGA + RMC) and raise the nav rate. RAM-only (resets on power cycle), so
+    call this at every boot.
+
+    At 9600 baud only GGA+RMC fit at 5 Hz (~770 B/s of the ~960 B/s budget) -
+    do NOT re-enable the other sentences here without a faster baud.
+    """
+    # NMEA message rates (class 0xF0): drop GLL/GSA/GSV/VTG, keep GGA/RMC.
+    for msg_class, msg_id, on in ((0xF0, 0x01, 0), (0xF0, 0x02, 0),
+                                  (0xF0, 0x03, 0), (0xF0, 0x05, 0),
+                                  (0xF0, 0x00, 1), (0xF0, 0x04, 1)):
+        uart.write(_ubx(0x06, 0x01, bytes([msg_class, msg_id, on])))
+        time.sleep_ms(20)
+    # CFG-RATE: measRate ms, navRate 1 cycle, timeRef 1 (GPS).
+    meas = max(50, min(1000, 1000 // rate_hz))
+    uart.write(_ubx(0x06, 0x08, meas.to_bytes(2, "little") + b"\x01\x00\x01\x00"))
+    time.sleep_ms(20)
+
+
 def _coord(value, hemisphere, degree_digits):
     """ddmm.mmmm / dddmm.mmmm -> signed decimal degrees."""
     if not value:

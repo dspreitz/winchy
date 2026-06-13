@@ -17,6 +17,9 @@ GPS_TX = 8
 GPS_RX = 9
 GPS_BAUD = 9600
 GPS_PPS = 6   # u-blox 1PPS (TIMEPULSE) -> ESP32 GPIO6, disciplines the RTC
+# Nav/output rate. At 9600 baud only GGA+RMC fit at 5 Hz (~770 B/s); higher
+# needs a faster baud. gps.configure() trims to GGA+RMC and applies this.
+GPS_NAV_RATE_HZ = 5
 
 # QMI8658 IMU on SPI2
 QMI_SCK = 36

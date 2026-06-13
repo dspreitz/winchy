@@ -24,7 +24,7 @@ from winchy.fusion.attitude import rope_angle_above_ground
 from winchy.fusion.kalman import GravityKalman, VerticalKalman
 from winchy.sensors.ads1232 import ADS1232
 from winchy.sensors.barometer import Barometer
-from winchy.sensors.gps import GPS, parse_nmea
+from winchy.sensors.gps import GPS, parse_nmea, configure as gps_configure
 from winchy.sensors.magnetometer import Magnetometer
 from winchy.sensors.qmi8658 import QMI8658
 from winchy.state import State
@@ -394,6 +394,7 @@ def _pps_arm_next(y, mo, d, h, mi, s):
 
 async def gps_task(state):
     global _pps_rtc
+    gps_configure(board.gps_uart, config.GPS_NAV_RATE_HZ)  # GGA+RMC, raise rate
     reader = asyncio.StreamReader(board.gps_uart)
     rtc = RTC()
     _pps_rtc = rtc
