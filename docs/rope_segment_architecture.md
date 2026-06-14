@@ -1,15 +1,17 @@
 # Rope Segment — Software Architecture
 
-Target architecture for the rope unit firmware (LilyGo T-Beam S3 Supreme,
-MicroPython). This replaces the current single-file `boot.py` monolith that
-was pulled from the device.
+Architecture of the rope unit firmware (LilyGo T-Beam S3 Supreme,
+MicroPython). The asyncio restructure described here is **implemented and
+running on hardware** (it replaced the original single-file `boot.py`
+monolith). The tow-phase state machine and the fusion/mass upgrades are still
+open work — see the Status note at the end.
 
-## Problems with the current code
+## Problems the restructure solved
 
-The snapshot in `rope_segment/` (commit `3a0159a`) is one 800-line `boot.py`
-that runs everything at import time, plus a `main.py` that never executes
-(it is actually winch-side receiver code for a different board). Concrete
-issues the new structure must solve:
+The original snapshot in `rope_segment/` (commit `3a0159a`) was one 800-line
+`boot.py` that ran everything at import time, plus a `main.py` that never
+executed (it was actually winch-side receiver code for a different board).
+Concrete issues the new structure solved:
 
 1. **Everything runs in `boot.py`.** MicroPython runs `boot.py` before
    `main.py` and before the USB console is fully serviced. A crash or hang
@@ -34,69 +36,72 @@ issues the new structure must solve:
 
 ## Constraints
 
-- MicroPython v1.23 on ESP32-S3 (8 MB flash, no PSRAM assumed). RAM is the
-  scarce resource; the AXP2101 driver alone is 95 KB of source. Vendored
-  drivers stay as-is; precompiling to `.mpy` is an option later.
+- MicroPython on ESP32-S3 with 8 MB PSRAM, which is used to buffer the raw
+  log in RAM during a launch (flash writes are deferred to idle). The AXP2101
+  driver alone is 95 KB of source. Vendored drivers stay as-is; precompiling
+  to `.mpy` is an option later.
 - Single-core cooperative scheduling is sufficient: use `asyncio`
   (uasyncio). No threads.
 - The device is sensor → radio, one direction, plus local logging. It must
   keep working (and logging) when the radio link or GPS is unavailable.
 - Radio regulations: amateur-band LoRa, parameters must live in config.
 
-## Target source tree
+## Source tree (as built)
 
 ```
 firmware/
 ├── shared/                  # deployed to BOTH devices
-│   └── protocol.py          # packet formats, versioning, encode/decode
+│   ├── protocol.py          # versioned binary frames, encode/decode
+│   ├── nmea.py              # GGA/RMC NMEA parsing (pure)
+│   ├── survey.py            # GPS survey-in averager (pure)
+│   └── wifi.py              # multi-AP join: scan + strongest-in-range
 ├── rope/
-│   ├── boot.py              # minimal: nothing but safe-mode check
-│   ├── main.py              # entry: build app from config, run scheduler
+│   ├── boot.py              # minimal: safe-mode (BOOT button) check
+│   ├── main.py              # crash-guarded entry; kbd_intr boot guard
 │   ├── config.py            # pins, buses, radio params, rates (constants)
 │   ├── winchy/
-│   │   ├── board.py         # T-Beam S3 Supreme: buses, pins, PMU rails
+│   │   ├── board.py         # T-Beam S3 Supreme: buses, pins, AXP2101 rails
+│   │   ├── state.py         # shared latest-value State object
+│   │   ├── app.py           # ALL asyncio tasks + radio RX/TX inline
 │   │   ├── sensors/
-│   │   │   ├── ads1232.py   # force ADC driver (IRQ-driven DRDY)
-│   │   │   ├── qmi8658.py   # IMU driver class (replaces inline pokes)
-│   │   │   ├── magnetometer.py  # QMC6310 wrapper + calibration
+│   │   │   ├── ads1232.py   # force ADC driver
+│   │   │   ├── qmi8658.py   # IMU driver (cold-start retry)
+│   │   │   ├── magnetometer.py  # QMC6310 wrapper + calibration.cal
 │   │   │   ├── barometer.py # BMP280 wrapper (async, non-blocking)
-│   │   │   └── gps.py       # NMEA parse, fix status, RTC time sync
-│   │   ├── fusion/
-│   │   │   ├── attitude.py  # rope angle from accel (today's math)
-│   │   │   ├── kalman.py    # sensor fusion (future, README goal)
-│   │   │   └── mass.py      # glider mass estimate from F and a (future)
-│   │   ├── comm/
-│   │   │   └── radio.py     # LoRa link: TX queue, retries, stats
-│   │   ├── logger.py        # measurement + debug logging to flash
-│   │   ├── display.py       # SH1106 status pages
-│   │   └── app.py           # tow state machine + asyncio tasks
+│   │   │   └── gps.py       # NMEA parse + 1PPS RTC discipline
+│   │   └── fusion/          # pure, desktop-testable
+│   │       ├── attitude.py  # rope angle from the gravity vector
+│   │       ├── altitude.py  # ISA pressure -> altitude
+│   │       ├── kalman.py    # gravity + vertical Kalman filters
+│   │       ├── speed.py     # glider (CG-hook) speed estimate
+│   │       └── geometry.py  # winch-relative geometry (cable len, elevation)
 │   └── lib/                 # vendored third-party drivers, unmodified
-│       ├── AXP2101.py  sx1262.py  sx126x.py  _sx126x.py
-│       ├── bmp280.py   sh1106.py  PiicoDev_QMC6310.py  PiicoDev_Unified.py
-│       └── I2CInterface.py
-└── winch/                   # ground segment (separate effort; the current
-    └── ...                  #   rope_segment/main.py draft moves here)
+└── winch/
+    └── main.py              # winch receiver + GPS survey-in + WiFi dashboard
 ```
 
-`rope_segment/` (the device snapshot) stays in git history as the
-reference; it is deleted from the tree once `firmware/rope/` reaches
-feature parity.
+Note the radio link, flash logging and the display were **not** split into
+`comm/`, `logger.py`, `display.py` packages as originally sketched — they live
+as tasks inside `app.py` (a `mass.py` estimator is not written yet either).
+The `rope_segment/` device snapshot has been removed from the tree; it remains
+in git history as the reference.
 
 ## Layering rules
 
 ```
-app.py ──► fusion, comm, logger, display, sensors   (orchestrates)
-sensors/, comm/, display ──► board.py, lib/          (hardware access)
-fusion/, shared/protocol.py ──► nothing hardware     (pure Python, testable
-                                                      on desktop CPython)
+app.py ──► fusion, sensors, shared    (orchestrates; also holds the radio,
+                                        logging & display tasks inline)
+sensors/ ──► board.py, lib/            (hardware access)
+fusion/, shared/ ──► nothing hardware  (pure Python, testable on desktop
+                                        CPython)
 ```
 
 - Only `board.py` knows pin numbers and PMU rail setup; it owns the I2C/SPI
-  bus singletons and hands them to drivers. (Today three different I2C
-  configurations of the same bus are created in different places.)
-- `fusion/` and `shared/protocol.py` import neither `machine` nor drivers,
-  so the angle math, Kalman filter, mass estimator and packet round-trip
-  get plain pytest tests on the desktop.
+  bus singletons and hands them to drivers.
+- `fusion/` and `shared/` import neither `machine` nor drivers, so the angle
+  math, the Kalman filters, the glider-speed and winch-relative geometry, the
+  GPS survey-in, the NMEA parsing and the packet round-trip all get plain
+  pytest tests on the desktop.
 - `lib/` is vendored upstream code: never edited, only replaced.
 
 ## Boot and startup sequence
@@ -111,31 +116,39 @@ if machine.Pin(0, machine.Pin.IN, machine.Pin.PULL_UP).value() == 0:
     raise SystemExit
 ```
 
-`main.py` builds and runs the application, with a top-level guard so a
-crash drops to the REPL with a logged traceback instead of a wedged unit:
+`main.py` builds and runs the application behind a crash guard: an unexpected
+exception is logged to `crash.log`, then the unit resets after an
+interruptible 10 s countdown. During the boot window `micropython.kbd_intr(-1)`
+blocks a stray host Ctrl-C from aborting startup.
 
-1. `board.init_power()` — AXP2101 rails (the current 250-line rail setup
-   collapses to a table of `(rail, mV, on/off)` tuples).
-2. Construct drivers, load calibration (`calibration.json`).
-3. Sync time: wait up to N s for GPS fix → set RTC; else continue without.
-4. `asyncio.run(app.main())`.
+1. `board.init_power()` — AXP2101 rails.
+2. Construct drivers; tare the force ADC; load the magnetometer
+   `calibration.cal`; seed the gyro bias from 50 at-rest samples.
+3. Init the SX1262 (with the RX IRQ callback) and the display.
+4. `asyncio.run(...)`. The GPS task sets the RTC from NMEA, then disciplines
+   it on every 1PPS rising edge once locked.
 
 ## Runtime model: asyncio tasks
 
-| Task        | Rate          | What it does |
-|-------------|---------------|--------------|
-| `force`     | 10–80 Hz      | ADS1232 samples; DRDY pin IRQ sets an `asyncio.ThreadSafeFlag` — no busy-wait |
-| `imu`       | 50 Hz         | accel read, feeds attitude/Kalman |
-| `baro`      | 1 Hz          | non-blocking forced measurement (kick, return, collect when ready) |
-| `gps`       | as data arrives | `asyncio.StreamReader` on UART; updates position/time |
-| `telemetry` | 4 Hz          | latest fused state → `protocol.encode()` → radio TX queue |
-| `logger`    | continuous    | ring-buffers samples, flushes to flash files |
-| `display`   | 2 Hz          | status page (force, angle, link, GPS, battery) |
-| `supervisor`| 1 Hz          | PMU IRQs, battery, link health, watchdog feed |
+| Task         | Rate            | What it does |
+|--------------|-----------------|--------------|
+| `force`      | ADC rate (~10 Hz) | ADS1232 conversions; `aread_raw` awaits the DRDY transition — no busy-wait |
+| `imu`        | 50 Hz (~21 Hz sustained) | accel/gyro; gravity Kalman → rope angle; glider-speed; queues raw-log rows |
+| `mag`        | 20 Hz           | QMC6310 read (slow I2C, kept off the IMU loop) |
+| `baro`       | 1 Hz            | non-blocking forced measurement; vertical Kalman climb rate; GPS-cal QNH while idle |
+| `gps`        | as data arrives | `StreamReader` on UART; position, RMC ground speed, 1PPS RTC; winch-relative geometry |
+| `telemetry`  | 2 Hz            | latest state → `protocol.encode_telemetry` → radio TX; ADR TX-power control |
+| `raw_writer` | continuous      | drains the raw-log row queue to `raw.csv` (writes deferred during a motion episode) |
+| `supervisor` | 0.2 Hz          | PMU/battery, low-battery warning, session-start latch |
+| `display`    | 2 Hz            | SH1106 status page (disabled by default — panel sits behind the ADS1232 PCB) |
+| `wifi`       | every 10 min    | duty-cycled (idle + battery OK): multi-AP join → GitHub upload of `raw.csv` |
+
+Radio **RX** is not a task: the SX1262 DIO1 IRQ (`on_radio`) decodes
+`LINK_REPORT` (downlink quality → ADR) and `WINCH_POS` (winch position) inline.
 
 Tasks communicate through one shared `State` object (latest values +
 timestamps), not by calling each other. The telemetry task samples it; the
-logger drains queues. Backpressure rule: radio TX queue keeps only the
+raw writer drains the row queue. Backpressure rule: each cycle sends only the
 newest telemetry frame — stale force data is worthless to the operator.
 
 ## Tow state machine (in `app.py`)
@@ -173,42 +186,51 @@ can switch modes without re-deriving them.
 One module, imported by both segments, defines all frames. Binary structs,
 each frame starting with `(version, type)`:
 
-| Frame       | Contents |
-|-------------|----------|
-| `TELEMETRY` | seq, phase, force (N), rope angle (0.5°), pressure/altitude, battery, flags |
-| `TIME_SYNC` | GPS epoch at startup (README requirement) |
-| `MASS`      | estimated glider mass + confidence, sent once per tow |
-| `SUMMARY`   | per-tow stats after release |
+| Frame         | Dir        | Contents |
+|---------------|------------|----------|
+| `TELEMETRY`   | rope→winch | seq, phase, force, rope angle (0.5°), altitude (AMSL), battery (V + %), flags, glider speed |
+| `LINK_REPORT` | winch→rope | RSSI / SNR / loss of the downlink — feeds the rope's ADR |
+| `WINCH_POS`   | winch→rope | surveyed winch lat/lon/alt + accuracy + fix/survey status |
+| `MASS`        | rope→winch | estimated glider mass + confidence, once per tow (planned) |
+| `SUMMARY`     | rope→winch | per-tow stats after release (planned) |
 
-Rules: explicit versioning (receiver tolerates unknown frame types), engi-
-neering units fixed in the protocol (force in N — not raw ADC counts like
-today; the rope unit owns its calibration), every frame carries a sequence
-number so the winch side can show link quality.
+Frame type 2 (`TIME_SYNC`) is **retired** — each segment now keeps its own
+GPS + 1PPS time, so time is never sent over the radio. Rules: explicit
+versioning (currently **v6**; receivers ignore unknown version/type/length),
+every frame carries a sequence number so the receiver can measure link
+quality across frame types. Force is still raw ADC counts with
+`FLAG_FORCE_UNCALIBRATED` set until the load cell is calibrated to newtons.
 
 ## Calibration and configuration
 
 - `config.py`: frozen constants (pins via `board.py`, radio params, rates,
   state-machine thresholds). Code, reviewed in git.
-- `calibration.json` on the device: force scale/offset, magnetometer
-  offsets (replaces `calibration.cal`), written by on-device calibration
-  routines, never by deploy.
+- `calibration.cal` on the device: magnetometer offsets, loaded at boot. The
+  force ADC is tared at boot (no stored scale yet — calibrating it to newtons
+  is pending); a richer on-device calibration file is a later option.
 
 ## Logging
 
-- `logger.py` writes binary measurement records (same structs as the radio
-  protocol — one definition, two sinks) to per-tow files, plus a small
-  rotating text log for debug/tracebacks.
-- Flash wear: buffer in RAM, flush on phase change and every few seconds;
-  cap total log size with oldest-first deletion.
-- WiFi upload (README goal) is a later `comm/upload.py` that drains the
-  same files; the on-disk format is designed for that from day one.
+- The raw logger (`raw_writer` task in `app.py`) writes **CSV** rows to
+  `raw.csv`: every filter input (raw accel/gyro/mag, pressure, force, GPS)
+  plus on-device outputs (baro alt/climb, angle, glider speed, winch geometry)
+  at the IMU cadence, for offline Kalman validation. Each row carries a
+  monotonic `t_ms` and an absolute `utc_ms`.
+- **Motion-gated**: a 5 s ring-buffer pre-roll captures the start of a launch;
+  recording stops after 5 s at rest. Writes are deferred (buffered in PSRAM)
+  during an episode so sampling never stalls on flash, then drained while idle.
+  `RAW_LOG_MAX_BYTES` caps the file.
+- WiFi upload is implemented (the `wifi` task): while idle it joins a known
+  network and pushes `raw.csv` to the `winchy-logs` GitHub release as a dated
+  asset, deleting the local file after a good upload. The winch uploads its RX
+  log the same way.
 
 ## Testing and tooling
 
 - `fusion/`, `shared/protocol.py`, state-machine transitions: pure-Python
   unit tests run by pytest on the desktop (no MicroPython needed).
-- `tools/deploy.ps1`: `mpremote fs cp` of `shared/` + `rope/` to the
-  device; `tools/pull_device.py` remains for rescue.
+- Deploy with `mpremote fs cp` of `firmware/shared/` + `firmware/rope/` to
+  the device; `tools/pull_device.py` remains for rescue.
 - During development, `mpremote mount` lets the device run code straight
   from the workstation without flashing.
 
@@ -228,4 +250,11 @@ number so the winch side can show link quality.
 6. **State machine, logger, calibration JSON** — new functionality.
 7. **Fusion upgrades**: Kalman filter, mass estimator, with desktop tests.
 
-Steps 1–4 are restructuring with unchanged behavior; 5+ change the system.
+**Status (2026-06):** steps 1–5 are complete and hardware-verified. Step 6's
+logging is done (motion-gated CSV + WiFi→GitHub upload) and the GPS+1PPS clock
+landed, but the **tow-phase state machine** (still hardcoded `IDLE`) and force
+calibration to newtons remain — the state machine is the current keystone.
+Step 7: the gravity and vertical Kalman filters and the glider-speed / winch
+geometry are in; mass estimation is not. Added since the original plan: winch
+GPS survey-in (`WINCH_POS`) + rope-side geometry, multi-AP WiFi with auto-
+rejoin, and removal of `TIME_SYNC` in favour of per-segment GPS+PPS time.
