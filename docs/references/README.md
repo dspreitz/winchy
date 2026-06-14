@@ -26,6 +26,7 @@ source for licensing/reuse. (Same footing as the vendored drivers in
 | `rwth-santel-diploma-thesis-winch-launch-accidents-2010.pdf` | C. G. Santel — *An Investigation of Glider Winch Launch Accidents Utilizing Multipoint Aerodynamics Models in Flight Simulation* (Diploma Thesis, RWTH Inst. of Flight System Dynamics, Dec 2010) | RWTH publications (file 3454) |
 | `akaflieg-karlsruhe-47-jahresbericht-1998.pdf` | Akaflieg Karlsruhe — *47. Jahresbericht der Akademischen Fliegergruppe an der Universität Karlsruhe e.V.* | Akaflieg Karlsruhe |
 | `sailplane-and-gliding-1996-vol47-no4.pdf` | *Sailplane & Gliding*, Vol. XLVII No. 4 (Aug–Sept 1996) — BGA magazine | BGA / S&G |
+| `bga-safe-winch-launching-sailplane-gliding.pdf` | *Safe Winch Launching* — BGA Safety Initiative "essential reading" feature (from Sailplane & Gliding) | BGA / S&G |
 
 All `RWTH publications` files are from the RWTH Aachen publications server
 (`publications.rwth-aachen.de/record/<id>/files/<n>.pdf`); the server now
@@ -52,5 +53,4 @@ identified automatically — add a title + source and rename when known:
 
 | File | Notes |
 |------|-------|
-| `winchlaunch_save-to-identify.pdf` | 3 pp, scanned/image |
 | `ojs-1796-6945-to-identify.pdf` | 9 pp, scanned/image; filename is an OJS journal galley id (1796-6945) |
