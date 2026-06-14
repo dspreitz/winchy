@@ -1,3 +1,15 @@
+# Winchy - glider winch rope force & advice system
+# Copyright (C) 2026 Dominic Spreitz
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version. Distributed WITHOUT ANY WARRANTY.
+# See the GNU General Public License for more details, and the LICENSE
+# file or <https://www.gnu.org/licenses/> for the full text.
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 # Attitude math. Pure functions, no hardware imports - runs and tests on
 # desktop CPython as well as on the device.
 
