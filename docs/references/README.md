@@ -45,12 +45,3 @@ against.)
 
 The single-file `.html` snapshots preserve article text; styling/images may be
 incomplete (the John Gibson page includes its `_files/` assets, so it renders).
-
-## Unidentified (title/source still needed)
-
-These are **image-only** PDFs (no text layer or metadata), so they could not be
-identified automatically — add a title + source and rename when known:
-
-| File | Notes |
-|------|-------|
-| `ojs-1796-6945-to-identify.pdf` | 9 pp, scanned/image; filename is an OJS journal galley id (1796-6945) |
