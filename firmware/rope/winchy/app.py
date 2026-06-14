@@ -99,7 +99,10 @@ RAW_GC_EVERY = 20           # gc.collect() every N flushes in the writer
 RAW_Q_MAX = 4000            # safety cap on the pending-write queue (~80 s @50 Hz)
 # Written at file open and after an offload-reset; a file of exactly this size
 # holds no episodes, so the uploader skips it.
-RAW_LOG_HEADER = ("# boot\n# t_ms,ax,ay,az,gx,gy,gz,mx,my,mz,force,"
+# t_ms is the monotonic boot clock (for filter dt); utc_ms is unix-epoch
+# milliseconds (UTC), valid once the GPS has synced the RTC, so rope and winch
+# logs can be aligned in absolute time.
+RAW_LOG_HEADER = ("# boot\n# t_ms,utc_ms,ax,ay,az,gx,gy,gz,mx,my,mz,force,"
                   "pressure_hpa,baro_alt_m,climb_ms,gps_alt_m,gps_lat,"
                   "gps_lon,gps_fix,gps_sats,gps_speed_ms,angle_deg,"
                   "glider_speed_ms,cable_len_m,winch_dist_m,elev_deg\n")
@@ -255,10 +258,11 @@ async def imu_task(imu, state, filt, gyro_bias):
         # flash writes never stall this 50 Hz loop.
         if RAW_LOG and len(state.raw_q) < RAW_Q_MAX:
             mx, my, mz = state.mag   # held; mag_task refreshes it at ~20 Hz
-            row = ("%d,%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f,%d,"
+            utc_ms = time.time_ns() // 1000000 + 946684800000  # unix epoch ms
+            row = ("%d,%d,%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f,%d,"
                    "%.2f,%.1f,%.2f,%.1f,%.7f,%.7f,%d,%d,%.2f,%.1f,%.2f,"
                    "%.1f,%.1f,%.2f\n" % (
-                       now, accel[0], accel[1], accel[2], gyro[0], gyro[1],
+                       now, utc_ms, accel[0], accel[1], accel[2], gyro[0], gyro[1],
                        gyro[2], mx, my, mz, state.force_raw, state.pressure_hpa,
                        state.baro_alt_m, state.climb_rate_ms, state.alt_m,
                        state.lat, state.lon, state.gps_fix, state.gps_sats,

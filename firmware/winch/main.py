@@ -123,7 +123,7 @@ except ImportError:
 latest = {"phase": "--", "force": 0, "uncal": True, "angle": 0.0, "alt": 0,
           "speed": 0.0, "rssi": 0, "batt": 0.0, "battlow": False,
           "battpct": 255, "charging": False, "tsync": False,
-          "time": "--:--:--", "tsrc": "--", "rx": 0, "lost": 0,
+          "time": "--:--:--", "rx": 0, "lost": 0,
           "wsats": 0, "wfix": False, "wlat": None, "wlon": None,
           "wacc": None, "wconv": False}
 
@@ -138,8 +138,7 @@ def _survey_fields():
 
 # Winch RTC: set from the winch's own GPS+PPS (the exact UTC second boundary).
 # No NTP and no time-over-radio any more - both segments keep their own GPS time.
-clock_set = False           # is the winch RTC set?
-clock_src = "--"            # "PPS" once GPS-locked, else "--"
+clock_set = False           # is the winch RTC set (from its own GPS+PPS)?
 log_start = None            # "yyyymmdd-hhmm" session start, latched once synced
 
 
@@ -225,7 +224,7 @@ async def _gps_task():
     # Drain NMEA, feed the survey-in, periodically send WINCH_POS, and own the
     # OLED when the rope link is idle. RX/TX of the LoRa link is unaffected
     # (it is IRQ-driven); this only shares the radio for the low-rate send.
-    global gps_sats, gps_has_fix, _gps_buf, _pps_rtc, clock_set, clock_src
+    global gps_sats, gps_has_fix, _gps_buf, _pps_rtc, clock_set
     _pps_rtc = RTC()
     Pin(GPS_PPS_PIN, Pin.IN).irq(trigger=Pin.IRQ_RISING, handler=_on_pps)
     last_send = time.ticks_ms()
@@ -250,7 +249,6 @@ async def _gps_task():
                     if not clock_set:    # rough set now; PPS refines on the edge
                         RTC().datetime((y, mo, d, 0, h, mi, s, 0))
                         clock_set = True
-                        clock_src = "PPS"
                         print("RTC set from GPS RMC; PPS disciplining on GPIO %d"
                               % GPS_PPS_PIN)
                     _pps_arm_next(y, mo, d, h, mi, s)
@@ -277,13 +275,12 @@ _pps_count = 0          # rising edges seen (liveness / debug)
 
 
 def _pps_apply(_):
-    global _pps_armed, clock_set, clock_src
+    global _pps_armed, clock_set
     a = _pps_armed
     if a is not None and _pps_rtc is not None:
         _pps_rtc.datetime(a)
         _pps_armed = None
         clock_set = True
-        clock_src = "PPS"
 
 
 def _on_pps(pin):
@@ -376,7 +373,7 @@ def _reset_log(uploaded):
 
 def on_receive(events):
     global last_seq, received, lost, last_rssi, last_snr
-    global recv_window, lost_window, latest, clock_set, clock_src, last_rx_ms
+    global recv_window, lost_window, latest, clock_set, last_rx_ms
     if not (events & SX1262.RX_DONE):
         return
     frame, err = lora.recv()
@@ -401,11 +398,16 @@ def on_receive(events):
 
     if msg["type"] == protocol.TELEMETRY:
         last_rx_ms = time.ticks_ms()    # telemetry owns the OLED over the GPS
-        tm = time.localtime()           # RTC is UTC (GPS+PPS)
+        tm = time.localtime()           # RTC is UTC (GPS+PPS); for the dash clock
         if LOG_TO_FLASH:  # buffer only; the main loop does the flash write
+            # ms-precision UTC stamp, PPS-disciplined; one ns read keeps the
+            # seconds and the ms consistent (no second-boundary race).
+            ns = time.time_ns()
+            g = time.gmtime(ns // 1000000000)
+            ms = (ns // 1000000) % 1000
             log_buf.append(
-                "%04d-%02d-%02dT%02d:%02d:%02dZ,%d,%d,%d,%.1f,%d,%.1f,%d,%d,%d,%d,%.1f\n"
-                % (tm[0], tm[1], tm[2], tm[3], tm[4], tm[5], seq, msg["phase"],
+                "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ,%d,%d,%d,%.1f,%d,%.1f,%d,%d,%d,%d,%.1f\n"
+                % (g[0], g[1], g[2], g[3], g[4], g[5], ms, seq, msg["phase"],
                    msg["force"], msg["angle_deg"], msg["altitude_m"],
                    msg["batt_v"], msg["batt_pct"], msg["flags"],
                    last_rssi, last_snr, msg["glider_speed_ms"]))
@@ -422,7 +424,6 @@ def on_receive(events):
                   "tsync": clock_set,   # winch RTC set from GPS+PPS?
                   "time": ("%02d:%02d:%02d" % (tm[3], tm[4], tm[5])
                            if clock_set else "--:--:--"),
-                  "tsrc": clock_src,
                   "rx": received, "lost": lost}
         latest.update(_survey_fields())
         print("[RX]", msg)
@@ -473,7 +474,7 @@ function tick(){
   warn.style.display=d.battlow?'block':'none';
   gpsdot.style.background=d.gps?'#1c1':'#c33';
   tdot.style.background=d.tsync?'#1c1':'#c33';
-  clock.textContent=d.time+' UTC'+(d.tsrc!='--'?' ('+d.tsrc+')':'');
+  clock.textContent=d.time+' UTC';
  }).catch(function(e){});
  if(Date.now()-last>3000){document.body.className='stale';
   gpsdot.style.background='#555';tdot.style.background='#555';}
