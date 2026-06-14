@@ -22,6 +22,7 @@ from _sx126x import ERR_NONE
 
 import protocol
 import nmea
+import wifi
 from survey import SurveyIn
 
 # Radio parameters: SF/BW/CR/sync/freq must match firmware/rope/config.py.
@@ -94,15 +95,19 @@ log_buf = []        # pending CSV rows: utc,seq,phase,force,angle_deg,alt_m,
 # - a real operator display alongside the small OLED. WiFi is winch-only and
 # never touches the LoRa link. Credentials live in secrets.py (gitignored, on
 # the device only) so they stay out of the repo:
-#     WIFI_SSID = "spreitz intern"
-#     WIFI_PASSWORD = "..."
-# Browse to the IP printed at boot. Set WIFI_ENABLED = False for OLED-only.
+#     WIFI_NETWORKS = [("ssid1", "pass1"), ("ssid2", "pass2"), ...]
+# It joins the strongest in-range network from the list (see wifi.py). Browse
+# to the IP printed at boot. Set WIFI_ENABLED = False for OLED-only.
 WIFI_ENABLED = True
 WIFI_HOSTNAME = "winchy"    # reachable as winchy.local (mDNS) + via router DNS
 try:
-    from secrets import WIFI_SSID, WIFI_PASSWORD
+    from secrets import WIFI_NETWORKS              # [(ssid, password), ...]
 except ImportError:
-    WIFI_SSID = WIFI_PASSWORD = None   # no secrets.py -> dashboard stays off
+    try:                                           # back-compat: single AP
+        from secrets import WIFI_SSID, WIFI_PASSWORD
+        WIFI_NETWORKS = [(WIFI_SSID, WIFI_PASSWORD)]
+    except ImportError:
+        WIFI_NETWORKS = []
 
 # Winch-direct GitHub upload of the received log (no PC in the loop). Needs a
 # fine-grained PAT scoped to GITHUB_REPO ("Contents: read and write") stored in
@@ -528,25 +533,20 @@ def _flush_log():
 
 
 async def _serve():
-    if WIFI_ENABLED and WIFI_SSID:
+    if WIFI_ENABLED and WIFI_NETWORKS:
         try:                              # MUST precede active(True) so mDNS
             network.hostname(WIFI_HOSTNAME)   # advertises <name>.local
         except Exception:
             pass
         wlan = network.WLAN(network.STA_IF)
         wlan.active(True)
-        if not wlan.isconnected():
-            wlan.connect(WIFI_SSID, WIFI_PASSWORD)
-            for _ in range(40):           # wait up to ~20 s for join + DHCP
-                if wlan.isconnected():
-                    break
-                await asyncio.sleep_ms(500)
-        if wlan.isconnected():
+        joined = await wifi.connect_any(wlan, WIFI_NETWORKS, 15)
+        if joined:
             print("WiFi '%s' joined - http://%s/  or  http://%s.local/"
-                  % (WIFI_SSID, wlan.ifconfig()[0], WIFI_HOSTNAME))
+                  % (joined, wlan.ifconfig()[0], WIFI_HOSTNAME))
             await asyncio.start_server(handle, "0.0.0.0", 80)
         else:
-            print("WiFi: could not join '%s'; dashboard off" % WIFI_SSID)
+            print("WiFi: no known network in range; dashboard off")
     else:
         print("WiFi: no secrets.py; dashboard off")
     global log_start

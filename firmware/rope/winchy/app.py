@@ -18,6 +18,7 @@ from sx1262 import SX1262
 
 import config
 import protocol
+import wifi
 from winchy import board
 from winchy.fusion import altitude
 from winchy.fusion.attitude import rope_angle_above_ground
@@ -121,19 +122,28 @@ MOTION_GYRO_DPS = 10.0      # bias-corrected gyro magnitude over this = moving
 # Offload the raw log over WiFi when in range. The rope is battery-powered on
 # the cable, so WiFi is duty-cycled: only while IDLE (never during a launch),
 # only when the cell can spare it, and powered down between attempts. When it
-# joins the known network it pushes raw.csv to the same winchy-logs release as
-# the winch (separate asset). Credentials live in secrets.py (gitignored, on
-# the device only): WIFI_SSID, WIFI_PASSWORD, GITHUB_TOKEN. No secrets -> off.
+# joins a known network it pushes raw.csv to the same winchy-logs release as
+# the winch (separate asset). secrets.py (gitignored, on the device only):
+# WIFI_NETWORKS = [(ssid, password), ...] and GITHUB_TOKEN. No secrets -> off.
+# It connects to the strongest in-range network from the list (see wifi.py).
 WIFI_ENABLED = True
-WIFI_JOIN_TIMEOUT_S = 15    # wait this long for join + DHCP, then give up
+WIFI_JOIN_TIMEOUT_S = 15    # wait this long per network for join + DHCP
 WIFI_PERIOD_S = 600         # try to offload this often while idle (10 min)
 GITHUB_REPO = "dspreitz/winchy-logs"
 GITHUB_RELEASE_TAG = "logs"
 GITHUB_ASSET = "rope_rawlog.csv"
 try:
-    from secrets import WIFI_SSID, WIFI_PASSWORD, GITHUB_TOKEN
+    from secrets import GITHUB_TOKEN
 except ImportError:
-    WIFI_SSID = WIFI_PASSWORD = GITHUB_TOKEN = None   # no secrets.py -> off
+    GITHUB_TOKEN = None
+try:
+    from secrets import WIFI_NETWORKS               # [(ssid, password), ...]
+except ImportError:
+    try:                                            # back-compat: single AP
+        from secrets import WIFI_SSID, WIFI_PASSWORD
+        WIFI_NETWORKS = [(WIFI_SSID, WIFI_PASSWORD)]
+    except ImportError:
+        WIFI_NETWORKS = []
 
 # Closed-loop TX-power control (ADR). Drives the rope's output power from the
 # winch's reported downlink quality. Hardened after an earlier version starved
@@ -683,24 +693,20 @@ async def wifi_task(state):
             continue
         try:
             wlan.active(True)
-            if not wlan.isconnected():
-                wlan.connect(WIFI_SSID, WIFI_PASSWORD)
-                for _ in range(WIFI_JOIN_TIMEOUT_S * 2):
-                    if wlan.isconnected():
-                        break
-                    await asyncio.sleep_ms(500)
-            if wlan.isconnected():
+            joined = await wifi.connect_any(wlan, WIFI_NETWORKS,
+                                            WIFI_JOIN_TIMEOUT_S)
+            if joined:
                 # Prepend the session start (first GPS time) to the asset so
                 # each session is a distinct, dated file on the release.
                 stamp = state.log_start or _log_stamp()
                 asset = (stamp + "_" if stamp else "") + GITHUB_ASSET
                 print("WiFi '%s' joined (%s); uploading %s"
-                      % (WIFI_SSID, wlan.ifconfig()[0], asset))
+                      % (joined, wlan.ifconfig()[0], asset))
                 if _github_upload_raw(asset):
                     # Tell imu_task (the file owner) it may reclaim the flash.
                     state.raw_uploaded_bytes = size
             else:
-                print("WiFi: could not join '%s'" % WIFI_SSID)
+                print("WiFi: no known network in range")
         except Exception as e:
             print("WiFi/upload error:", e)
         finally:
@@ -727,7 +733,7 @@ async def _main(pmu, adc, imu, baro, sx, display, state, gyro_bias, mag):
     ]
     if display:
         tasks.append(display_task(display, state))
-    if WIFI_ENABLED and WIFI_SSID and GITHUB_TOKEN:
+    if WIFI_ENABLED and WIFI_NETWORKS and GITHUB_TOKEN:
         tasks.append(wifi_task(state))
     await asyncio.gather(*tasks)
 
