@@ -14,12 +14,14 @@
 import os
 import time
 
-from machine import I2C, Pin, RTC
+from machine import I2C, Pin, RTC, UART
 import ssd1306
 from sx1262 import SX1262
 from _sx126x import ERR_NONE
 
 import protocol
+import nmea
+from survey import SurveyIn
 
 # Radio parameters: SF/BW/CR/sync/freq must match firmware/rope/config.py.
 LORA_FREQ_MHZ = 868.0
@@ -38,6 +40,23 @@ lora.begin(freq=LORA_FREQ_MHZ, bw=LORA_BW_KHZ, sf=LORA_SF, cr=LORA_CR,
 i2c = I2C(0, sda=Pin(18), scl=Pin(17))
 display = ssd1306.SSD1306_I2C(128, 64, i2c)
 
+# GPS (interim u-blox 7 on UART1; see tools/gps_uart_probe.py). We survey-in the
+# parked winch's position and send it to the rope as WINCH_POS. The survey is
+# receiver-agnostic, so this same code runs on the Supreme's M10 later - only
+# these pins change. Verified on the T3S3: rx=42, tx=41, 9600 baud NMEA.
+GPS_UART_ID = 1
+GPS_RX_PIN = 42
+GPS_TX_PIN = 41
+GPS_BAUD = 9600
+WINCH_POS_PERIOD_S = 15      # how often to (re)send the surveyed position
+
+gps_uart = UART(GPS_UART_ID, baudrate=GPS_BAUD, rx=GPS_RX_PIN, tx=GPS_TX_PIN,
+                timeout=50)
+survey = SurveyIn()
+gps_sats = 0
+gps_has_fix = False
+_gps_buf = b""
+
 last_seq = None
 received = 0
 lost = 0
@@ -51,6 +70,7 @@ loss_ema = 0.0      # smoothed loss %, so a single gap in the tiny per-report
 LOSS_EMA_ALPHA = 0.3
 blink = 0           # render counter; alternates the bottom line when warning
 WARN_BLINK_FRAMES = 4   # frames per state (~2 s at 2 Hz) when battery is low
+last_rx_ms = 0      # ticks_ms of last telemetry RX; GPS owns the OLED when idle
 
 # Flash logging of received frames, for range tests when the winch is
 # untethered (so we see the downlink directly instead of inferring it from
@@ -101,7 +121,18 @@ except ImportError:
 latest = {"phase": "--", "force": 0, "uncal": True, "angle": 0.0, "alt": 0,
           "speed": 0.0, "rssi": 0, "batt": 0.0, "battlow": False,
           "battpct": 255, "charging": False, "tsync": False,
-          "time": "--:--:--", "tsrc": "--", "rx": 0, "lost": 0}
+          "time": "--:--:--", "tsrc": "--", "rx": 0, "lost": 0,
+          "wsats": 0, "wfix": False, "wlat": None, "wlon": None,
+          "wacc": None, "wconv": False}
+
+
+def _survey_fields():
+    # Winch GPS / survey-in status for the OLED and dashboard.
+    acc = survey.accuracy_m
+    return {"wsats": gps_sats, "wfix": gps_has_fix, "wconv": survey.converged,
+            "wlat": round(survey.lat, 6) if survey.lat is not None else None,
+            "wlon": round(survey.lon, 6) if survey.lon is not None else None,
+            "wacc": None if acc == float("inf") else round(acc, 1)}
 
 # Winch RTC sync: NTP (via WiFi) is preferred; the rope's GPS time over the
 # radio (TIME_SYNC frame) is the fallback when there's no internet/WiFi.
@@ -148,6 +179,75 @@ def send_link_report():
     lost_window = 0
     print("[TX] link report rssi={} snr={} loss={}%".format(
         last_rssi, last_snr, loss_pct))
+
+
+def _send_winch_pos():
+    # Send the surveyed winch position to the rope (low rate). Like the
+    # LINK_REPORT, a send auto-returns the radio to RX. accuracy_m may be inf
+    # (n<2) or large; the byte field saturates at 25.5 m.
+    global tx_seq
+    acc = survey.accuracy_m
+    if acc == float("inf") or acc > 25.5:
+        acc = 25.5
+    status = 0
+    if gps_has_fix:
+        status |= protocol.WINCH_FIX
+    if survey.converged:
+        status |= protocol.WINCH_SURVEY_DONE
+    lora.send(protocol.encode_winch_pos(tx_seq, survey.lat, survey.lon,
+                                        survey.alt or 0.0, acc, status))
+    tx_seq = (tx_seq + 1) & 0xFFFF
+    print("[TX] winch_pos lat=%.6f lon=%.6f acc=%.1f conv=%s"
+          % (survey.lat, survey.lon, acc, survey.converged))
+
+
+def _show_survey():
+    # OLED screen shown while no telemetry is arriving, so the operator can
+    # watch the GPS lock and the survey converge.
+    display.fill(0)
+    display.text("WINCH GPS", 0, 0)
+    display.text("sat %d  %s" % (gps_sats, "FIX" if gps_has_fix else "no fix"),
+                 0, 14)
+    if survey.lat is None:
+        display.text("waiting for fix", 0, 34)
+    else:
+        acc = survey.accuracy_m
+        display.text("n=%d" % survey.n, 0, 26)
+        display.text("acc %s m" % ("--" if acc == float("inf")
+                                   else "%.1f" % acc), 0, 38)
+        display.text("SURVEYED" if survey.converged else "surveying...", 0, 54)
+    display.show()
+
+
+async def _gps_task():
+    # Drain NMEA, feed the survey-in, periodically send WINCH_POS, and own the
+    # OLED when the rope link is idle. RX/TX of the LoRa link is unaffected
+    # (it is IRQ-driven); this only shares the radio for the low-rate send.
+    global gps_sats, gps_has_fix, _gps_buf
+    last_send = time.ticks_ms()
+    while True:
+        if gps_uart.any():
+            _gps_buf += gps_uart.read() or b""
+            if len(_gps_buf) > 1024:           # guard a wedged/garbage stream
+                _gps_buf = _gps_buf[-256:]
+            while b"\n" in _gps_buf:
+                line, _gps_buf = _gps_buf.split(b"\n", 1)
+                m = nmea.parse_nmea(line)
+                if not m or m["type"] != "GGA":
+                    continue
+                gps_sats = m["sats"]
+                gps_has_fix = m["fix"] > 0
+                if gps_has_fix and m["lat"] is not None and m["lon"] is not None:
+                    survey.add(m["lat"], m["lon"], m["alt_m"] or 0.0)
+        now = time.ticks_ms()
+        if (survey.lat is not None
+                and time.ticks_diff(now, last_send) >= WINCH_POS_PERIOD_S * 1000):
+            _send_winch_pos()
+            last_send = now
+        latest.update(_survey_fields())
+        if time.ticks_diff(now, last_rx_ms) > 3000:   # link idle -> show GPS
+            _show_survey()
+        await asyncio.sleep_ms(200)
 
 
 def _set_rtc_unix(epoch_s):
@@ -245,7 +345,7 @@ def _reset_log(uploaded):
 
 def on_receive(events):
     global last_seq, received, lost, last_rssi, last_snr
-    global recv_window, lost_window, latest, clock_set, clock_src
+    global recv_window, lost_window, latest, clock_set, clock_src, last_rx_ms
     if not (events & SX1262.RX_DONE):
         return
     frame, err = lora.recv()
@@ -269,6 +369,7 @@ def on_receive(events):
     last_seq = seq
 
     if msg["type"] == protocol.TELEMETRY:
+        last_rx_ms = time.ticks_ms()    # telemetry owns the OLED over the GPS
         tm = time.localtime()           # RTC is UTC (NTP/GPS-synced)
         if LOG_TO_FLASH:  # buffer only; the main loop does the flash write
             log_buf.append(
@@ -292,6 +393,7 @@ def on_receive(events):
                            if clock_set else "--:--:--"),
                   "tsrc": clock_src,
                   "rx": received, "lost": lost}
+        latest.update(_survey_fields())
         print("[RX]", msg)
         show_telemetry(msg)
         if msg["flags"] & protocol.FLAG_REQUEST_REPORT:
@@ -333,6 +435,7 @@ body{font-family:sans-serif;background:#111;color:#eee;margin:0;text-align:cente
 <div class=row><div class=cell><div class=lbl>ALT m</div><div id=alt class=big>--</div></div>
 <div class=cell><div class=lbl>BATT</div><div id=batt class=big>--</div><div id=battsub class=lbl>--</div></div></div>
 <div id=link class=lbl>link --</div>
+<div id=winch class=lbl>winch GPS --</div>
 <script>
 var last=Date.now();
 function tick(){
@@ -346,6 +449,7 @@ function tick(){
   batt.textContent=(d.battpct>100?'--':d.battpct+'%')+(d.charging?' CHG':'');
   battsub.textContent=d.batt.toFixed(1)+' V';
   link.textContent='link '+d.rssi+' dBm   rx'+d.rx+' lost'+d.lost;
+  winch.textContent='winch '+(d.wfix?'fix':'no fix')+' '+(d.wsats||0)+'sat'+(d.wacc!=null?'  '+d.wacc+'m':'')+(d.wconv?'  SURVEYED':'');
   warn.style.display=d.battlow?'block':'none';
   gpsdot.style.background=d.gps?'#1c1':'#c33';
   tdot.style.background=d.tsync?'#1c1':'#c33';
@@ -403,7 +507,7 @@ def _flush_log():
 
 
 async def _serve():
-    if WIFI_SSID:
+    if WIFI_ENABLED and WIFI_SSID:
         try:                              # MUST precede active(True) so mDNS
             network.hostname(WIFI_HOSTNAME)   # advertises <name>.local
         except Exception:
@@ -459,13 +563,17 @@ if LOG_TO_FLASH:
     logf.write(LOG_HEADER)      # delimiter; data rows carry UTC once synced
     logf.flush()
 
+import asyncio
 if WIFI_ENABLED:
-    import asyncio
     import network
     import json
-    # RX stays IRQ-driven; this runs WiFi + dashboard + periodic flush.
-    asyncio.run(_serve())
-else:
-    while True:
-        time.sleep(1)
-        _flush_log()
+
+
+async def _main():
+    # RX stays IRQ-driven. Run the GPS survey-in + WINCH_POS alongside the
+    # WiFi dashboard and periodic flush.
+    asyncio.create_task(_gps_task())
+    await _serve()
+
+
+asyncio.run(_main())
