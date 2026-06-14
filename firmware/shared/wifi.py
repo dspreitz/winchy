@@ -19,6 +19,15 @@ async def connect_any(wlan, networks, timeout_s=15):
     if not networks:
         return None
 
+    # A dropped AP can leave the STA mid-(auto)reconnect, which makes scan()
+    # come back empty and connect() raise "Wifi Internal Error". Force a clean
+    # disconnect and let the driver settle before scanning/connecting.
+    try:
+        wlan.disconnect()
+    except Exception:
+        pass
+    await asyncio.sleep_ms(700)
+
     # Scan once; map ssid -> best RSSI seen.
     seen = {}
     try:

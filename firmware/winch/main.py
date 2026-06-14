@@ -100,6 +100,7 @@ log_buf = []        # pending CSV rows: utc,seq,phase,force,angle_deg,alt_m,
 # to the IP printed at boot. Set WIFI_ENABLED = False for OLED-only.
 WIFI_ENABLED = True
 WIFI_HOSTNAME = "winchy"    # reachable as winchy.local (mDNS) + via router DNS
+WIFI_RETRY_S = 30           # when WiFi is down, retry the join this often (s)
 try:
     from secrets import WIFI_NETWORKS              # [(ssid, password), ...]
 except ImportError:
@@ -533,6 +534,12 @@ def _flush_log():
 
 
 async def _serve():
+    # Bring up the STA interface; the actual (re)join happens in the loop so a
+    # dropped link recovers without a reboot. The HTTP server binds 0.0.0.0 and
+    # is started once, on the first successful join (the binding survives later
+    # rejoins / IP changes).
+    wlan = None
+    server_started = False
     if WIFI_ENABLED and WIFI_NETWORKS:
         try:                              # MUST precede active(True) so mDNS
             network.hostname(WIFI_HOSTNAME)   # advertises <name>.local
@@ -540,23 +547,29 @@ async def _serve():
             pass
         wlan = network.WLAN(network.STA_IF)
         wlan.active(True)
-        joined = await wifi.connect_any(wlan, WIFI_NETWORKS, 15)
-        if joined:
-            print("WiFi '%s' joined - http://%s/  or  http://%s.local/"
-                  % (joined, wlan.ifconfig()[0], WIFI_HOSTNAME))
-            await asyncio.start_server(handle, "0.0.0.0", 80)
-        else:
-            print("WiFi: no known network in range; dashboard off")
     else:
-        print("WiFi: no secrets.py; dashboard off")
+        print("WiFi: disabled or no secrets.py; dashboard off")
     global log_start
     n = 0
-    while True:                           # keep-alive + periodic flash flush
+    while True:                           # keep-alive + WiFi upkeep + flush
         _flush_log()
         if clock_set and log_start is None:   # latch session start once synced
             log_start = _stamp()
-        n += 1
-        if GITHUB_TOKEN and n % UPLOAD_PERIOD_S == 0:
+        # (Re)join WiFi while it is down: at boot (n==0) and every WIFI_RETRY_S.
+        if (wlan is not None and not wlan.isconnected()
+                and n % WIFI_RETRY_S == 0):
+            joined = await wifi.connect_any(wlan, WIFI_NETWORKS, 15)
+            if joined:
+                print("WiFi '%s' joined - http://%s/  or  http://%s.local/"
+                      % (joined, wlan.ifconfig()[0], WIFI_HOSTNAME))
+                if not server_started:    # bind once; survives later rejoins
+                    await asyncio.start_server(handle, "0.0.0.0", 80)
+                    server_started = True
+            else:
+                print("WiFi: no known network in range; will retry")
+        # Periodic GitHub offload, only while connected and with data to send.
+        if (GITHUB_TOKEN and n and n % UPLOAD_PERIOD_S == 0
+                and wlan is not None and wlan.isconnected()):
             try:                          # only if there are rows to offload
                 has_data = os.stat(LOG_PATH)[6] > len(LOG_HEADER)
             except OSError:
@@ -565,6 +578,7 @@ async def _serve():
                 up = _github_upload()     # interim periodic; later: per launch
                 if up:
                     _reset_log(up)        # reclaim flash after a good upload
+        n += 1
         await asyncio.sleep_ms(1000)
 
 
