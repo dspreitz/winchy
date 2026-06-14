@@ -14,7 +14,7 @@
 
 import struct
 
-VERSION = 5
+VERSION = 6
 
 # Frame types
 TELEMETRY = 1
@@ -22,6 +22,7 @@ TIME_SYNC = 2
 MASS = 3
 SUMMARY = 4
 LINK_REPORT = 5  # winch -> rope: downlink quality as seen by the receiver
+WINCH_POS = 6    # winch -> rope: surveyed (averaged) winch position, low rate
 
 # Tow phases (TELEMETRY.phase) - see docs/winch_launch_physics.md
 PHASE_IDLE = 0
@@ -52,6 +53,10 @@ FLAG_REQUEST_REPORT = 0x08  # winch should reply with a LINK_REPORT
 FLAG_BATTERY_LOW = 0x10     # rope battery low (set only while IDLE)
 FLAG_CHARGING = 0x20        # rope battery currently charging
 
+# WINCH_POS.status bits
+WINCH_FIX = 0x01            # winch GPS currently has a position fix
+WINCH_SURVEY_DONE = 0x02    # survey-in has converged to target accuracy
+
 # version:B type:B seq:H | phase:B force:i angle:B(0.5 deg)
 # altitude:H(1 m, AMSL) battery:B(0.1 V) flags:B batt_pct:B(%, 255=unknown)
 # glider_speed:H(0.1 m/s) - CG-hook speed estimate
@@ -65,6 +70,9 @@ _MASS_FMT = "<BBHHB"
 _SUMMARY_FMT = "<BBHHiHH"
 # version:B type:B seq:H | rssi:h(dBm) snr:b(dB) loss:B(%) - winch uplink
 _LINK_REPORT_FMT = "<BBHhbB"
+# version:B type:B seq:H | lat:i(1e-7 deg) lon:i(1e-7 deg)
+# altitude:H(1 m, AMSL) hacc:B(0.1 m, saturates at 25.5) status:B
+_WINCH_POS_FMT = "<BBHiiHBB"
 
 
 def encode_telemetry(seq, phase, force, angle_deg, altitude_m, batt_mv,
@@ -105,6 +113,15 @@ def encode_link_report(seq, rssi_dbm, snr_db, loss_pct):
                        rssi, snr, loss)
 
 
+def encode_winch_pos(seq, lat_deg, lon_deg, altitude_m, hacc_m=25.5, status=0):
+    lat = max(-2147483648, min(2147483647, int(round(lat_deg * 1e7))))
+    lon = max(-2147483648, min(2147483647, int(round(lon_deg * 1e7))))
+    alt = max(0, min(65535, int(round(altitude_m))))
+    hacc = max(0, min(255, int(round(hacc_m * 10))))
+    return struct.pack(_WINCH_POS_FMT, VERSION, WINCH_POS, seq & 0xFFFF,
+                       lat, lon, alt, hacc, status & 0xFF)
+
+
 def decode(frame):
     """Decode any frame into a dict with a 'type' key (one of the frame
     type constants). Returns None for unknown version/type/length."""
@@ -141,5 +158,12 @@ def decode(frame):
         _, _, seq, rssi, snr, loss = struct.unpack(_LINK_REPORT_FMT, frame)
         return {"type": LINK_REPORT, "seq": seq, "rssi_dbm": rssi,
                 "snr_db": snr, "loss_pct": loss}
+
+    if ftype == WINCH_POS and len(frame) == struct.calcsize(_WINCH_POS_FMT):
+        (_, _, seq, lat, lon, alt, hacc,
+         status) = struct.unpack(_WINCH_POS_FMT, frame)
+        return {"type": WINCH_POS, "seq": seq, "lat": lat / 1e7,
+                "lon": lon / 1e7, "altitude_m": alt, "hacc_m": hacc / 10,
+                "status": status}
 
     return None
