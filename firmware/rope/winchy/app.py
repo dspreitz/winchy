@@ -64,7 +64,6 @@ REPORT_WINDOW_MS = 150      # extra RX dwell after a request so the winch's
                             # at SF7, incl. the winch OLED update)
 DISPLAY_PERIOD_MS = 500
 SUPERVISOR_PERIOD_MS = 5000
-TIME_SYNC_RESEND_MS = 30000  # re-announce GPS time so a late/NTP-less winch syncs
 
 # Low-battery warning (rope cell terminal voltage from the AXP2101, mV).
 # Checked only while IDLE; hysteresis avoids flicker near the threshold.
@@ -170,10 +169,6 @@ def _adr_next_power(state):
     if rssi > ADR_RSSI_HIGH_DBM:
         return max(ADR_TX_POWER_MIN_DBM, power - ADR_STEP_DOWN_DB)
     return power  # within the window: hold
-
-# MicroPython's time.time() counts from 2000-01-01; the protocol carries
-# unix epoch seconds.
-_UNIX_EPOCH_OFFSET = 946684800
 
 # Barometric altitude calibration against GPS, only while IDLE (during a
 # launch the unit climbs and GPS/baro lag differently, so the reference is
@@ -494,7 +489,6 @@ async def gps_task(state):
                     # PPS then refines the second boundary on each edge.
                     rtc.datetime((y, mo, d, 0, h, mi, s, 0))
                     state.time_synced = True
-                    state.pending_time_sync = True
                     print("RTC synced from GPS: %04d-%02d-%02d %02d:%02d:%02dZ"
                           % (y, mo, d, h, mi, s))
                 _pps_arm_next(y, mo, d, h, mi, s)
@@ -511,15 +505,6 @@ async def telemetry_task(sx, state):
         gpslog.flush()
     gps_buf = []
     while True:
-        if state.pending_time_sync:
-            state.pending_time_sync = False
-            frame = protocol.encode_time_sync(
-                seq, time.time() + _UNIX_EPOCH_OFFSET)
-            sx.send(frame)
-            seq = (seq + 1) & 0xFFFF
-            state.tx_count += 1
-            print("Sent TIME_SYNC:", frame)
-
         force = state.force_raw - state.force_offset  # tared counts
         flags = protocol.FLAG_FORCE_UNCALIBRATED  # until calibration lands
         if state.gps_fix:
@@ -609,7 +594,6 @@ async def display_task(display, state):
 
 
 async def supervisor_task(pmu, state):
-    ticks = 0
     while True:
         state.system_mv = pmu.getSystemVoltage()
         state.batt_mv = pmu.getBattVoltage()
@@ -627,12 +611,6 @@ async def supervisor_task(pmu, state):
         # Latch the session start (first valid wall clock) for the log filename.
         if state.time_synced and state.log_start is None:
             state.log_start = _log_stamp()
-        # Re-announce GPS time periodically so a winch that powered up after
-        # the rope (and has no NTP) still gets synced.
-        ticks += 1
-        if (state.time_synced
-                and ticks % (TIME_SYNC_RESEND_MS // SUPERVISOR_PERIOD_MS) == 0):
-            state.pending_time_sync = True
         await asyncio.sleep_ms(SUPERVISOR_PERIOD_MS)
 
 

@@ -14,6 +14,7 @@
 import os
 import time
 
+import micropython
 from machine import I2C, Pin, RTC, UART
 import ssd1306
 from sx1262 import SX1262
@@ -48,6 +49,7 @@ GPS_UART_ID = 1
 GPS_RX_PIN = 42
 GPS_TX_PIN = 41
 GPS_BAUD = 9600
+GPS_PPS_PIN = 40            # GPS 1PPS -> exact UTC second boundary (RTC sync)
 WINCH_POS_PERIOD_S = 15      # how often to (re)send the surveyed position
 
 gps_uart = UART(GPS_UART_ID, baudrate=GPS_BAUD, rx=GPS_RX_PIN, tx=GPS_TX_PIN,
@@ -134,10 +136,10 @@ def _survey_fields():
             "wlon": round(survey.lon, 6) if survey.lon is not None else None,
             "wacc": None if acc == float("inf") else round(acc, 1)}
 
-# Winch RTC sync: NTP (via WiFi) is preferred; the rope's GPS time over the
-# radio (TIME_SYNC frame) is the fallback when there's no internet/WiFi.
+# Winch RTC: set from the winch's own GPS+PPS (the exact UTC second boundary).
+# No NTP and no time-over-radio any more - both segments keep their own GPS time.
 clock_set = False           # is the winch RTC set?
-clock_src = "--"            # "NTP" / "GPS" / "--"
+clock_src = "--"            # "PPS" once GPS-locked, else "--"
 log_start = None            # "yyyymmdd-hhmm" session start, latched once synced
 
 
@@ -223,7 +225,9 @@ async def _gps_task():
     # Drain NMEA, feed the survey-in, periodically send WINCH_POS, and own the
     # OLED when the rope link is idle. RX/TX of the LoRa link is unaffected
     # (it is IRQ-driven); this only shares the radio for the low-rate send.
-    global gps_sats, gps_has_fix, _gps_buf
+    global gps_sats, gps_has_fix, _gps_buf, _pps_rtc, clock_set, clock_src
+    _pps_rtc = RTC()
+    Pin(GPS_PPS_PIN, Pin.IN).irq(trigger=Pin.IRQ_RISING, handler=_on_pps)
     last_send = time.ticks_ms()
     while True:
         if gps_uart.any():
@@ -233,12 +237,23 @@ async def _gps_task():
             while b"\n" in _gps_buf:
                 line, _gps_buf = _gps_buf.split(b"\n", 1)
                 m = nmea.parse_nmea(line)
-                if not m or m["type"] != "GGA":
+                if not m:
                     continue
-                gps_sats = m["sats"]
-                gps_has_fix = m["fix"] > 0
-                if gps_has_fix and m["lat"] is not None and m["lon"] is not None:
-                    survey.add(m["lat"], m["lon"], m["alt_m"] or 0.0)
+                if m["type"] == "GGA":
+                    gps_sats = m["sats"]
+                    gps_has_fix = m["fix"] > 0
+                    if (gps_has_fix and m["lat"] is not None
+                            and m["lon"] is not None):
+                        survey.add(m["lat"], m["lon"], m["alt_m"] or 0.0)
+                elif m["type"] == "RMC" and m["datetime"]:
+                    y, mo, d, h, mi, s = m["datetime"]
+                    if not clock_set:    # rough set now; PPS refines on the edge
+                        RTC().datetime((y, mo, d, 0, h, mi, s, 0))
+                        clock_set = True
+                        clock_src = "PPS"
+                        print("RTC set from GPS RMC; PPS disciplining on GPIO %d"
+                              % GPS_PPS_PIN)
+                    _pps_arm_next(y, mo, d, h, mi, s)
         now = time.ticks_ms()
         if (survey.lat is not None
                 and time.ticks_diff(now, last_send) >= WINCH_POS_PERIOD_S * 1000):
@@ -250,10 +265,38 @@ async def _gps_task():
         await asyncio.sleep_ms(200)
 
 
-def _set_rtc_unix(epoch_s):
-    # epoch_s is Unix UTC seconds; gmtime wants seconds since 2000-01-01.
-    tm = time.gmtime(epoch_s - 946684800)
-    RTC().datetime((tm[0], tm[1], tm[2], tm[6], tm[3], tm[4], tm[5], 0))
+# GPS 1PPS RTC discipline (same approach as the rope): NMEA RMC gives the time
+# but arrives with latency; the PPS rising edge is the exact UTC second
+# boundary. So from each RMC we pre-arm the RTC for the NEXT whole second and
+# write that on the edge. The hard IRQ only schedules the apply (no allocation
+# in IRQ context). This is the winch's only time source now (no NTP, no
+# time-over-radio); the RTC stays unset until the GPS gets a fix.
+_pps_rtc = None         # RTC() handle
+_pps_armed = None       # datetime tuple to write on the next edge, or None
+_pps_count = 0          # rising edges seen (liveness / debug)
+
+
+def _pps_apply(_):
+    global _pps_armed, clock_set, clock_src
+    a = _pps_armed
+    if a is not None and _pps_rtc is not None:
+        _pps_rtc.datetime(a)
+        _pps_armed = None
+        clock_set = True
+        clock_src = "PPS"
+
+
+def _on_pps(pin):
+    global _pps_count
+    _pps_count += 1
+    micropython.schedule(_pps_apply, 0)
+
+
+def _pps_arm_next(y, mo, d, h, mi, s):
+    # Arm the RTC for the NEXT whole second (the upcoming PPS edge), UTC.
+    global _pps_armed
+    nxt = time.gmtime(time.mktime((y, mo, d, h, mi, s, 0, 0)) + 1)
+    _pps_armed = (nxt[0], nxt[1], nxt[2], nxt[6], nxt[3], nxt[4], nxt[5], 0)
 
 
 def _stamp():
@@ -262,18 +305,6 @@ def _stamp():
         return None
     t = time.localtime()
     return "%04d%02d%02d-%02d%02d" % (t[0], t[1], t[2], t[3], t[4])
-
-
-def _ntp_sync():
-    global clock_set, clock_src
-    try:
-        import ntptime
-        ntptime.settime()       # sets the RTC to UTC from pool.ntp.org
-        clock_set = True
-        clock_src = "NTP"
-        print("RTC set from NTP")
-    except Exception as e:
-        print("NTP sync failed:", e)
 
 
 def _github_upload():
@@ -370,7 +401,7 @@ def on_receive(events):
 
     if msg["type"] == protocol.TELEMETRY:
         last_rx_ms = time.ticks_ms()    # telemetry owns the OLED over the GPS
-        tm = time.localtime()           # RTC is UTC (NTP/GPS-synced)
+        tm = time.localtime()           # RTC is UTC (GPS+PPS)
         if LOG_TO_FLASH:  # buffer only; the main loop does the flash write
             log_buf.append(
                 "%04d-%02d-%02dT%02d:%02d:%02dZ,%d,%d,%d,%.1f,%d,%.1f,%d,%d,%d,%d,%.1f\n"
@@ -388,7 +419,7 @@ def on_receive(events):
                   "battpct": msg["batt_pct"],
                   "charging": bool(msg["flags"] & protocol.FLAG_CHARGING),
                   "gps": bool(msg["flags"] & protocol.FLAG_GPS_FIX),
-                  "tsync": clock_set,   # winch RTC set (NTP or GPS)?
+                  "tsync": clock_set,   # winch RTC set from GPS+PPS?
                   "time": ("%02d:%02d:%02d" % (tm[3], tm[4], tm[5])
                            if clock_set else "--:--:--"),
                   "tsrc": clock_src,
@@ -398,17 +429,6 @@ def on_receive(events):
         show_telemetry(msg)
         if msg["flags"] & protocol.FLAG_REQUEST_REPORT:
             send_link_report()
-    elif msg["type"] == protocol.TIME_SYNC:
-        # Rope's GPS time. NTP (over WiFi) has priority, so only use this as a
-        # fallback when the clock isn't already NTP-synced.
-        if clock_src != "NTP":
-            try:
-                _set_rtc_unix(msg["epoch_s"])
-                clock_set = True
-                clock_src = "GPS"
-            except Exception as e:
-                print("RTC from GPS failed:", e)
-        print("[RX] time sync, unix epoch", msg["epoch_s"])
     else:
         print("[RX]", msg)
 
@@ -523,7 +543,6 @@ async def _serve():
         if wlan.isconnected():
             print("WiFi '%s' joined - http://%s/  or  http://%s.local/"
                   % (WIFI_SSID, wlan.ifconfig()[0], WIFI_HOSTNAME))
-            _ntp_sync()                   # NTP has priority over rope GPS time
             await asyncio.start_server(handle, "0.0.0.0", 80)
         else:
             print("WiFi: could not join '%s'; dashboard off" % WIFI_SSID)
@@ -536,8 +555,6 @@ async def _serve():
         if clock_set and log_start is None:   # latch session start once synced
             log_start = _stamp()
         n += 1
-        if n % 3600 == 0:                 # re-sync NTP hourly (corrects drift)
-            _ntp_sync()
         if GITHUB_TOKEN and n % UPLOAD_PERIOD_S == 0:
             try:                          # only if there are rows to offload
                 has_data = os.stat(LOG_PATH)[6] > len(LOG_HEADER)

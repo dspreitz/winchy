@@ -7,10 +7,11 @@
 # with an unknown version, type or length (decode() returns None).
 #
 # The link is bidirectional but asymmetric: the rope unit transmits
-# TELEMETRY/TIME_SYNC/MASS/SUMMARY, and the winch unit transmits the
-# low-rate LINK_REPORT back (its measured RSSI/SNR/loss of the downlink)
-# whenever a TELEMETRY frame carries FLAG_REQUEST_REPORT. The feedback is
-# advisory: losing it must never stall the rope->winch telemetry.
+# TELEMETRY/MASS/SUMMARY, and the winch unit transmits the low-rate
+# LINK_REPORT (its measured RSSI/SNR/loss of the downlink, whenever a
+# TELEMETRY frame carries FLAG_REQUEST_REPORT) and WINCH_POS (its surveyed
+# position). The back-channel is advisory: losing it must never stall the
+# rope->winch telemetry.
 
 import struct
 
@@ -18,7 +19,7 @@ VERSION = 6
 
 # Frame types
 TELEMETRY = 1
-TIME_SYNC = 2
+# 2 retired (was TIME_SYNC; both segments now keep their own GPS+PPS time)
 MASS = 3
 SUMMARY = 4
 LINK_REPORT = 5  # winch -> rope: downlink quality as seen by the receiver
@@ -61,8 +62,6 @@ WINCH_SURVEY_DONE = 0x02    # survey-in has converged to target accuracy
 # altitude:H(1 m, AMSL) battery:B(0.1 V) flags:B batt_pct:B(%, 255=unknown)
 # glider_speed:H(0.1 m/s) - CG-hook speed estimate
 _TELEMETRY_FMT = "<BBHBiBHBBBH"
-# version:B type:B seq:H | unix epoch seconds UTC:I
-_TIME_SYNC_FMT = "<BBHI"
 # version:B type:B seq:H | mass:H(0.1 kg) confidence:B(%)
 _MASS_FMT = "<BBHHB"
 # version:B type:B seq:H | duration:H(0.1 s) max force:i release alt:H(m)
@@ -84,11 +83,6 @@ def encode_telemetry(seq, phase, force, angle_deg, altitude_m, batt_mv,
     speed = max(0, min(65535, int(round(glider_speed_ms * 10))))
     return struct.pack(_TELEMETRY_FMT, VERSION, TELEMETRY, seq & 0xFFFF,
                        phase, force, angle, altitude, batt, flags, pct, speed)
-
-
-def encode_time_sync(seq, epoch_s):
-    return struct.pack(_TIME_SYNC_FMT, VERSION, TIME_SYNC, seq & 0xFFFF,
-                       epoch_s)
 
 
 def encode_mass(seq, mass_kg, confidence_pct):
@@ -137,10 +131,6 @@ def decode(frame):
                 "altitude_m": altitude, "batt_v": batt / 10,
                 "flags": flags, "batt_pct": batt_pct,
                 "glider_speed_ms": speed / 10}
-
-    if ftype == TIME_SYNC and len(frame) == struct.calcsize(_TIME_SYNC_FMT):
-        _, _, seq, epoch_s = struct.unpack(_TIME_SYNC_FMT, frame)
-        return {"type": TIME_SYNC, "seq": seq, "epoch_s": epoch_s}
 
     if ftype == MASS and len(frame) == struct.calcsize(_MASS_FMT):
         _, _, seq, mass, confidence = struct.unpack(_MASS_FMT, frame)

@@ -44,14 +44,6 @@ def test_seq_wraps():
     assert protocol.decode(frame)["seq"] == 70000 & 0xFFFF
 
 
-def test_time_sync_roundtrip():
-    frame = protocol.encode_time_sync(seq=7, epoch_s=1781300467)
-    msg = protocol.decode(frame)
-    assert msg["type"] == protocol.TIME_SYNC
-    assert msg["seq"] == 7
-    assert msg["epoch_s"] == 1781300467
-
-
 def test_mass_roundtrip():
     frame = protocol.encode_mass(seq=8, mass_kg=540.3, confidence_pct=85)
     msg = protocol.decode(frame)
@@ -98,13 +90,13 @@ def test_winch_pos_negative_and_clamp():
 
 
 def test_rejects_unknown_version():
-    frame = bytearray(protocol.encode_time_sync(0, 1))
+    frame = bytearray(protocol.encode_mass(0, 100.0, 50))
     frame[0] = 99
     assert protocol.decode(bytes(frame)) is None
 
 
 def test_rejects_unknown_type():
-    frame = bytearray(protocol.encode_time_sync(0, 1))
+    frame = bytearray(protocol.encode_mass(0, 100.0, 50))
     frame[1] = 99
     assert protocol.decode(bytes(frame)) is None
 

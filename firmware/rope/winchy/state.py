@@ -36,8 +36,7 @@ class State:
         self.alt_m = 0.0
         self.ground_speed_ms = 0.0  # GPS speed over ground (RMC)
         self.gps_ts = 0
-        self.time_synced = False
-        self.pending_time_sync = False  # telemetry task owes a TIME_SYNC frame
+        self.time_synced = False        # rope RTC set from its own GPS+PPS
         self.log_start = None    # "yyyymmdd-hhmm" session start (first GPS time)
         self.raw_uploaded_bytes = 0  # >0 = raw.csv offloaded; writer resets it
         self.raw_q = []          # pending raw-log lines; drained by raw_writer_task
