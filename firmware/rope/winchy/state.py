@@ -56,3 +56,14 @@ class State:
         self.link_loss_pct = 0
         self.link_report_ts = 0  # time.ticks_ms of last report; 0 = never
         self.tx_power_dbm = 0    # current radio TX power, driven by ADR
+        # Winch position (from WINCH_POS over the radio) + derived geometry.
+        self.winch_lat = 0.0
+        self.winch_lon = 0.0
+        self.winch_alt_m = 0.0
+        self.winch_acc_m = 0.0   # surveyed horizontal accuracy, m
+        self.winch_status = 0    # protocol.WINCH_* bits (fix / survey-done)
+        self.winch_pos_ts = 0    # time.ticks_ms of last WINCH_POS; 0 = never
+        # Winch-relative geometry (computed in gps_task once both fixes exist).
+        self.cable_length_m = 0.0  # winch -> glider hook (slant + hook)
+        self.winch_dist_m = 0.0    # straight-line winch -> rope segment
+        self.elevation_deg = 0.0   # elevation of the rope seen from the winch

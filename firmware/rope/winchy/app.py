@@ -21,6 +21,7 @@ import protocol
 from winchy import board
 from winchy.fusion import altitude
 from winchy.fusion.attitude import rope_angle_above_ground
+from winchy.fusion.geometry import winch_relative
 from winchy.fusion.kalman import GravityKalman, VerticalKalman
 from winchy.fusion.speed import glider_speed
 from winchy.sensors.ads1232 import ADS1232
@@ -102,7 +103,7 @@ RAW_Q_MAX = 4000            # safety cap on the pending-write queue (~80 s @50 H
 RAW_LOG_HEADER = ("# boot\n# t_ms,ax,ay,az,gx,gy,gz,mx,my,mz,force,"
                   "pressure_hpa,baro_alt_m,climb_ms,gps_alt_m,gps_lat,"
                   "gps_lon,gps_fix,gps_sats,gps_speed_ms,angle_deg,"
-                  "glider_speed_ms\n")
+                  "glider_speed_ms,cable_len_m,winch_dist_m,elev_deg\n")
 # Motion gating: a winch sits idle most of the time, so logging only around
 # movement keeps the log (and the planned WiFi->GitHub upload) minimal. A
 # time-based ring buffer holds the last RAW_LOG_PREROLL_S so the START of a
@@ -260,13 +261,15 @@ async def imu_task(imu, state, filt, gyro_bias):
         if RAW_LOG and len(state.raw_q) < RAW_Q_MAX:
             mx, my, mz = state.mag   # held; mag_task refreshes it at ~20 Hz
             row = ("%d,%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f,%d,"
-                   "%.2f,%.1f,%.2f,%.1f,%.7f,%.7f,%d,%d,%.2f,%.1f,%.2f\n" % (
+                   "%.2f,%.1f,%.2f,%.1f,%.7f,%.7f,%d,%d,%.2f,%.1f,%.2f,"
+                   "%.1f,%.1f,%.2f\n" % (
                        now, accel[0], accel[1], accel[2], gyro[0], gyro[1],
                        gyro[2], mx, my, mz, state.force_raw, state.pressure_hpa,
                        state.baro_alt_m, state.climb_rate_ms, state.alt_m,
                        state.lat, state.lon, state.gps_fix, state.gps_sats,
                        state.ground_speed_ms, state.angle_deg,
-                       state.glider_speed_ms))
+                       state.glider_speed_ms, state.cable_length_m,
+                       state.winch_dist_m, state.elevation_deg))
 
             # Motion gate. Rest baselines (motion-test): accel_dev <= 0.04 g,
             # gyro_mag < 1 dps. A flat spin keeps |a| ~ 1 g, so the gyro term is
@@ -470,6 +473,17 @@ async def gps_task(state):
             if update["alt_m"] is not None:
                 state.alt_m = update["alt_m"]
             state.gps_ts = time.ticks_ms()
+            # Winch-relative geometry, once the winch has sent its position and
+            # we have our own fix. Updates at the GPS rate (cheap trig); the
+            # 50 Hz imu_task just logs the latest values. Reel-in rate is the
+            # offline derivative of winch_dist_m, so it needs nothing here.
+            if state.winch_pos_ts and state.gps_fix:
+                rel = winch_relative(
+                    state.winch_lat, state.winch_lon, state.winch_alt_m,
+                    state.lat, state.lon, state.alt_m, GLIDER_HOOK_DIST_M)
+                state.cable_length_m = rel["cable_length_m"]
+                state.winch_dist_m = rel["slant_m"]
+                state.elevation_deg = rel["elevation_deg"]
         elif update["type"] == "RMC":
             if update["speed_ms"] is not None:
                 state.ground_speed_ms = update["speed_ms"]
@@ -797,6 +811,15 @@ def run():
                     state.link_report_ts = time.ticks_ms()
                     print("Link report: rssi={} dBm snr={} dB loss={}%".format(
                         msg["rssi_dbm"], msg["snr_db"], msg["loss_pct"]))
+                elif msg and msg["type"] == protocol.WINCH_POS:
+                    state.winch_lat = msg["lat"]
+                    state.winch_lon = msg["lon"]
+                    state.winch_alt_m = msg["altitude_m"]
+                    state.winch_acc_m = msg["hacc_m"]
+                    state.winch_status = msg["status"]
+                    state.winch_pos_ts = time.ticks_ms()
+                    print("Winch pos: %.6f %.6f acc=%.1f m status=%d" % (
+                        msg["lat"], msg["lon"], msg["hacc_m"], msg["status"]))
                 else:
                     print("Receive: {}, {}".format(frame, SX1262.STATUS[err]))
             elif events & SX1262.TX_DONE:
