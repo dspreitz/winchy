@@ -53,15 +53,20 @@ LORA_RST = 5
 LORA_BUSY = 4  # 'gpio' parameter of the sx1262 driver
 
 # LoRa link parameters - SF/BW/CR/sync/freq must match the winch segment.
-# SF7 (not 12): range to come is short and line-of-sight, and SF7/BW500 still
-# closes a multi-km airborne link while cutting airtime ~25x (~15 ms/frame),
-# which keeps the duty cycle sane and leaves room for the link back-channel.
-LORA_FREQ_MHZ = 868.0
-LORA_BW_KHZ = 500.0
+# Band g3 (869.4-869.65 MHz: 500 mW ERP, 10% duty cycle), chosen over g1
+# (868.0-868.6) for: 10x the duty-cycle headroom, power/range headroom, and to
+# clear the FLARM collision-avoidance band (868.2-868.4 MHz, on every glider).
+# g3 is only 250 kHz wide, so BW must be <=250: 869.525 +/- 125 kHz fits it
+# exactly. SF7 keeps airtime low; BW250 is ~2x airtime vs BW500 but +3 dB more
+# sensitive - fine for the ~17-byte telemetry frames.
+LORA_FREQ_MHZ = 869.525
+LORA_BW_KHZ = 250.0
 LORA_SF = 7
 LORA_CR = 8
 LORA_SYNC_WORD = 0x12
-LORA_TX_POWER_DBM = 14  # start at the EU ERP cap; ADR adapts down from here
+LORA_TX_POWER_DBM = 14  # initial power; ADR ramps up to ADR_TX_POWER_MAX_DBM
+                        # (now +22 dBm in g3) when the link needs it, trims down
+                        # when it doesn't. +22 dBm needs OCP >= 140 mA (begin()).
 
 # ADS1232 force ADC
 ADS_PDWN = 39

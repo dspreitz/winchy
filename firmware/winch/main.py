@@ -38,16 +38,21 @@ import wifi
 from survey import SurveyIn
 
 # Radio parameters: SF/BW/CR/sync/freq must match firmware/rope/config.py.
-LORA_FREQ_MHZ = 868.0
-LORA_BW_KHZ = 500.0
+# Band g3 (869.525 MHz, BW 250 kHz): 10% duty cycle, power/range headroom, and
+# clear of the FLARM band (868.2-868.4 MHz). g3 is 250 kHz wide, so BW <= 250.
+LORA_FREQ_MHZ = 869.525
+LORA_BW_KHZ = 250.0
 LORA_SF = 7
 LORA_CR = 8
 LORA_SYNC_WORD = 0x12
-LORA_TX_POWER_DBM = 14  # uplink (LINK_REPORT) power; fixed, no ADR on the winch
+LORA_TX_POWER_DBM = 22  # +22 dBm (SX1262 max), within g3's 500 mW ERP; the winch
+                        # is mains-powered (no battery cost) and fixed (no ADR).
+                        # Keeps the link symmetric so the back-channel reaches the
+                        # rope at range. Needs OCP >= 140 mA (set in begin()).
 
 lora = SX1262(spi_bus=1, clk=5, mosi=6, miso=3, cs=7, irq=33, rst=8, gpio=34)
 lora.begin(freq=LORA_FREQ_MHZ, bw=LORA_BW_KHZ, sf=LORA_SF, cr=LORA_CR,
-           syncWord=LORA_SYNC_WORD, power=LORA_TX_POWER_DBM, currentLimit=60.0,
+           syncWord=LORA_SYNC_WORD, power=LORA_TX_POWER_DBM, currentLimit=140.0,
            preambleLength=8, implicit=False, crcOn=True,
            tcxoVoltage=1.7, useRegulatorLDO=False, blocking=True)
 

@@ -66,9 +66,9 @@ GLIDER_SPEED_5M_CORRECTION = False
 GLIDER_HOOK_DIST_M = 5.0    # rope segment -> CG-hook ring, along the rope
 ANGLE_RATE_ALPHA = 0.3      # EMA on the rope-angle rate
 ANGLE_RATE_MAX_DPS = 200.0  # clamp to reject finite-difference spikes
-TELEMETRY_PERIOD_MS = 500   # 2 Hz. At SF7/BW500 airtime is ~15 ms so there is
-                            # rate headroom, but ~2% duty already nears the
-                            # 868.0-868.6 MHz 1% limit - raise rate with care.
+TELEMETRY_PERIOD_MS = 500   # 2 Hz. SF7/BW250 airtime ~30 ms -> ~6% duty, well
+                            # under g3's 10% limit; phase-driven rate switching
+                            # (roadmap) would burst higher during a launch.
 REPORT_REQUEST_EVERY = 2    # ask the winch for a LINK_REPORT every Nth frame
                             # (~1 Hz at 2 Hz telemetry); 0 disables feedback
 REPORT_WINDOW_MS = 150      # extra RX dwell after a request so the winch's
@@ -169,7 +169,10 @@ except ImportError:
 # Only power is adapted; SF/BW stay fixed (would need both ends retuned).
 ADR_ENABLED = True
 ADR_TX_POWER_MIN_DBM = -9     # SX1262 floor (driver clamps below this)
-ADR_TX_POWER_MAX_DBM = 14     # EU 868.0-868.6 MHz ERP cap (25 mW)
+ADR_TX_POWER_MAX_DBM = 22     # SX1262 max (+22 dBm / 158 mW), within g3's 500 mW
+                              # ERP cap. Needs OCP >= 140 mA in sx.begin() or the
+                              # PA can't deliver it. Battery cost on the rope is
+                              # ~7 mA average (118 mA x ~6% TX duty).
 ADR_RSSI_LOW_DBM = -90        # winch RSSI below this -> raise (keeps ~20 dB above
                               # the ~-110 dBm SF7/BW500 sensitivity floor)
 ADR_RSSI_HIGH_DBM = -70       # winch RSSI above this -> trim (margin to spare)
@@ -838,7 +841,7 @@ def run():
     sx.begin(freq=config.LORA_FREQ_MHZ, bw=config.LORA_BW_KHZ,
              sf=config.LORA_SF, cr=config.LORA_CR,
              syncWord=config.LORA_SYNC_WORD,
-             power=config.LORA_TX_POWER_DBM, currentLimit=60.0,
+             power=config.LORA_TX_POWER_DBM, currentLimit=140.0,
              preambleLength=8, implicit=False, implicitLen=0xFF,
              crcOn=True, txIq=False, rxIq=False,
              tcxoVoltage=1.7, useRegulatorLDO=False, blocking=True)
