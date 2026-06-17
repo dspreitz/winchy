@@ -84,3 +84,10 @@ OLED_RST = 16
 OLED_ADDR = 0x3C
 OLED_WIDTH = 128
 OLED_HEIGHT = 64
+
+# Rope WiFi status dashboard (winchy/dashboard.py). With the OLED disabled this
+# small web page is the only live status view for walk/ground tests. True keeps
+# WiFi continuously on and serves the page (accepts the battery cost); False
+# falls back to the duty-cycled WiFi behaviour (power saving, upload-only).
+# Set False for flight. See app.py dashboard_task / wifi_task.
+ROPE_DASHBOARD = True

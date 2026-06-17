@@ -31,7 +31,7 @@ from sx1262 import SX1262
 import config
 import protocol
 import wifi
-from winchy import board
+from winchy import board, dashboard
 from winchy.fusion import altitude
 from winchy.fusion.attitude import rope_angle_above_ground
 from winchy.fusion.geometry import winch_relative
@@ -729,6 +729,49 @@ async def wifi_task(state):
             gc.collect()
 
 
+async def dashboard_task(state):
+    # Continuous-WiFi status dashboard for walk/ground tests (the rope OLED is
+    # disabled). Unlike wifi_task it keeps WiFi UP (no duty-cycling), serves the
+    # page (winchy/dashboard.py), rejoins if dropped, and uploads raw.csv
+    # opportunistically while IDLE. Battery cost is accepted for now; restore
+    # power saving for flight by setting config.ROPE_DASHBOARD = False.
+    import network
+    dashboard.state = state
+    try:
+        network.hostname("winchy-rope")   # mDNS may still advertise the default
+    except Exception:
+        pass
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    server_started = False
+    n = 0
+    while True:
+        if not wlan.isconnected() and n % 30 == 0:   # (re)join when down
+            joined = await wifi.connect_any(wlan, WIFI_NETWORKS,
+                                            WIFI_JOIN_TIMEOUT_S)
+            if joined:
+                print("Rope dashboard WiFi '%s' joined - http://%s/"
+                      % (joined, wlan.ifconfig()[0]))
+                if not server_started:
+                    await asyncio.start_server(dashboard.handle, "0.0.0.0", 80)
+                    server_started = True
+        # Opportunistic GitHub upload (WiFi already up): only while IDLE + data.
+        if (GITHUB_TOKEN and wlan.isconnected()
+                and state.phase == protocol.PHASE_IDLE
+                and n and n % WIFI_PERIOD_S == 0):
+            try:
+                size = os.stat(RAW_LOG_PATH)[6]
+            except OSError:
+                size = 0
+            if size > len(RAW_LOG_HEADER):
+                stamp = state.log_start or _log_stamp()
+                asset = (stamp + "_" if stamp else "") + GITHUB_ASSET
+                if _github_upload_raw(asset):
+                    state.raw_uploaded_bytes = size
+        n += 1
+        await asyncio.sleep_ms(1000)
+
+
 async def _main(pmu, adc, imu, baro, sx, display, state, gyro_bias, mag):
     # The app is up: re-enable Ctrl-C (main.py disabled it for the startup
     # window so a host attaching/probing during boot can't abort it). Now a
@@ -748,8 +791,11 @@ async def _main(pmu, adc, imu, baro, sx, display, state, gyro_bias, mag):
     ]
     if display:
         tasks.append(display_task(display, state))
-    if WIFI_ENABLED and WIFI_NETWORKS and GITHUB_TOKEN:
-        tasks.append(wifi_task(state))
+    if WIFI_ENABLED and WIFI_NETWORKS:
+        if config.ROPE_DASHBOARD:
+            tasks.append(dashboard_task(state))   # continuous WiFi + status page
+        elif GITHUB_TOKEN:
+            tasks.append(wifi_task(state))        # duty-cycled upload-only
     await asyncio.gather(*tasks)
 
 
