@@ -10,3 +10,4 @@ raw*.csv
 
 # WiFi credentials live only on the device, never in the repo
 secrets.py
+_devlogs/

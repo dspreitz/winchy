@@ -103,7 +103,7 @@ LOG_PATH = "winch_rxlog.csv"
 # Written at open and after an offload-reset; a file of exactly this size has
 # no data rows, so it isn't uploaded.
 LOG_HEADER = ("# boot\n# utc,seq,phase,force,angle_deg,alt_m,batt_v,batt_pct,"
-              "flags,rssi,snr,speed_ms\n")
+              "flags,rssi,snr,speed_ms,winch_lat,winch_lon\n")
 log_buf = []        # pending CSV rows: utc,seq,phase,force,angle_deg,alt_m,
                     # batt_v,batt_pct,flags,rssi,snr  (utc = ISO8601 Z)
 
@@ -118,6 +118,7 @@ log_buf = []        # pending CSV rows: utc,seq,phase,force,angle_deg,alt_m,
 WIFI_ENABLED = True
 WIFI_HOSTNAME = "winchy"    # reachable as winchy.local (mDNS) + via router DNS
 WIFI_RETRY_S = 30           # when WiFi is down, retry the join this often (s)
+WIFI_PROBE_S = 30           # how often to probe winchy-logs reachability (s)
 try:
     from secrets import WIFI_NETWORKS              # [(ssid, password), ...]
 except ImportError:
@@ -163,6 +164,7 @@ def _survey_fields():
 # No NTP and no time-over-radio any more - both segments keep their own GPS time.
 clock_set = False           # is the winch RTC set (from its own GPS+PPS)?
 log_start = None            # "yyyymmdd-hhmm" session start, latched once synced
+online = False              # winchy-logs (GitHub) currently reachable? -> OLED "I"
 
 
 def show_telemetry(msg):
@@ -172,7 +174,10 @@ def show_telemetry(msg):
     # Top line: phase left, glider speed (km/h) right-aligned.
     display.text(protocol.PHASE_NAMES.get(msg["phase"], "?"), 0, 0)
     spd = "%.0f" % (msg["glider_speed_ms"] * 3.6)
-    display.text(spd, 128 - len(spd) * 8, 0)   # 8 px per char, 128 px wide
+    right = 120 if online else 128             # leave the last cell for the "I"
+    display.text(spd, right - len(spd) * 8, 0)  # 8 px/char, 128 px wide
+    if online:                                  # winchy-logs reachable
+        display.text("I", 120, 0)
     unit = "cnt" if msg["flags"] & protocol.FLAG_FORCE_UNCALIBRATED else "N"
     display.text("F: {} {}".format(msg["force"], unit), 0, 14)
     display.text("Angle: {:.1f}".format(msg["angle_deg"]), 0, 26)
@@ -230,6 +235,8 @@ def _show_survey():
     # watch the GPS lock and the survey converge.
     display.fill(0)
     display.text("WINCH GPS", 0, 0)
+    if online:                                  # winchy-logs reachable
+        display.text("I", 120, 0)
     display.text("sat %d  %s" % (gps_sats, "FIX" if gps_has_fix else "no fix"),
                  0, 14)
     if survey.lat is None:
@@ -428,12 +435,16 @@ def on_receive(events):
             ns = time.time_ns()
             g = time.gmtime(ns // 1000000000)
             ms = (ns // 1000000) % 1000
+            # the winch's own surveyed position, so a walk/launch is mappable
+            # (and any survey drift/reposition is captured per frame)
+            wlat = survey.lat if survey.lat is not None else 0.0
+            wlon = survey.lon if survey.lon is not None else 0.0
             log_buf.append(
-                "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ,%d,%d,%d,%.1f,%d,%.1f,%d,%d,%d,%d,%.1f\n"
+                "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ,%d,%d,%d,%.1f,%d,%.1f,%d,%d,%d,%d,%.1f,%.6f,%.6f\n"
                 % (g[0], g[1], g[2], g[3], g[4], g[5], ms, seq, msg["phase"],
                    msg["force"], msg["angle_deg"], msg["altitude_m"],
                    msg["batt_v"], msg["batt_pct"], msg["flags"],
-                   last_rssi, last_snr, msg["glider_speed_ms"]))
+                   last_rssi, last_snr, msg["glider_speed_ms"], wlat, wlon))
         latest = {"phase": protocol.PHASE_NAMES.get(msg["phase"], "?"),
                   "force": msg["force"],
                   "uncal": bool(msg["flags"] & protocol.FLAG_FORCE_UNCALIBRATED),
@@ -550,6 +561,23 @@ def _flush_log():
     logf.flush()
 
 
+async def _internet_ok():
+    # Lightweight reachability check for winchy-logs: a TCP connect (no TLS) to
+    # GitHub's API host. True only if it actually connects, so a WiFi link with
+    # no real internet (e.g. a dataless hotspot) does NOT light the OLED "I".
+    try:
+        r, w = await asyncio.wait_for(
+            asyncio.open_connection("api.github.com", 443), 3)
+        w.close()
+        try:
+            await w.wait_closed()
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
 async def _serve():
     # Bring up the STA interface; the actual (re)join happens in the loop so a
     # dropped link recovers without a reboot. The HTTP server binds 0.0.0.0 and
@@ -566,7 +594,7 @@ async def _serve():
         wlan.active(True)
     else:
         print("WiFi: disabled or no secrets.py; dashboard off")
-    global log_start
+    global log_start, online
     n = 0
     while True:                           # keep-alive + WiFi upkeep + flush
         _flush_log()
@@ -584,6 +612,14 @@ async def _serve():
                     server_started = True
             else:
                 print("WiFi: no known network in range; will retry")
+        # winchy-logs reachability for the OLED "I": only when WiFi is up and a
+        # token exists, probed against GitHub every WIFI_PROBE_S (so a hotspot
+        # with no real internet shows no "I").
+        if wlan is not None and wlan.isconnected() and GITHUB_TOKEN:
+            if n % WIFI_PROBE_S == 0:
+                online = await _internet_ok()
+        else:
+            online = False
         # Periodic GitHub offload, only while connected and with data to send.
         if (GITHUB_TOKEN and n and n % UPLOAD_PERIOD_S == 0
                 and wlan is not None and wlan.isconnected()):
