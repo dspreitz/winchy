@@ -23,7 +23,8 @@ state = None   # the shared State object, set by app.py's dashboard task
 
 def _data(s):
     return {
-        "fix": s.gps_fix, "sats": s.gps_sats, "lat": s.lat, "lon": s.lon,
+        "fix": s.gps_fix, "sats": s.gps_sats, "hdop": s.gps_hdop,
+        "lat": s.lat, "lon": s.lon,
         "gspeed": s.ground_speed_ms, "baro_alt": s.baro_alt_m,
         "climb": s.climb_rate_ms, "force": s.force_raw - s.force_offset,
         "angle": s.angle_deg, "speed": s.glider_speed_ms,
@@ -71,10 +72,10 @@ function f(x,n){return (x==null)?'--':x.toFixed(n);}
 function tick(){
  fetch('/data').then(function(r){return r.json()}).then(function(d){
   last=Date.now();document.body.className='';
-  gps.innerHTML=(d.fix?'<span class=g>FIX</span>':'<span class=r>no fix</span>')+' '+d.sats+' sat';
+  gps.innerHTML=(d.fix?'<span class=g>FIX</span>':'<span class=r>no fix</span>')+' '+d.sats+' sat'+(d.hdop<50?'  hdop '+f(d.hdop,1):'');
   ll.textContent=f(d.lat,6)+', '+f(d.lon,6);
   alt.textContent=f(d.baro_alt,1)+' m   '+f(d.climb,2)+' m/s';
-  gs.textContent=f(d.gspeed,2)+' m/s';
+  gs.textContent=f(d.gspeed*3.6,1)+' km/h';
   spd.textContent=f(d.speed*3.6,1)+' km/h';
   force.textContent=d.force+' cnt';
   ang.textContent=f(d.angle,1)+' deg';

@@ -173,7 +173,7 @@ def parse_nmea(line):
 
     Returns a dict for the sentences we use, else None:
       {'type': 'GGA', 'fix': int, 'sats': int, 'lat': f|None,
-       'lon': f|None, 'alt_m': f|None}
+       'lon': f|None, 'alt_m': f|None, 'hdop': f|None}
       {'type': 'RMC', 'valid': bool,
        'datetime': (y, mo, d, h, mi, s) | None,    # UTC
        'speed_ms': f | None}                       # ground speed
@@ -195,6 +195,7 @@ def parse_nmea(line):
                 "lat": _coord(fields[2], fields[3], 2),
                 "lon": _coord(fields[4], fields[5], 3),
                 "alt_m": float(fields[9]) if fields[9] else None,
+                "hdop": float(fields[8]) if fields[8] else None,
             }
 
         if sentence == "RMC":

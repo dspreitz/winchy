@@ -44,6 +44,7 @@ class State:
         # GPS
         self.gps_fix = 0         # GGA fix quality (0 = none)
         self.gps_sats = 0
+        self.gps_hdop = 99.0     # GGA HDOP; high = poor geometry (default bad)
         self.lat = 0.0
         self.lon = 0.0
         self.alt_m = 0.0

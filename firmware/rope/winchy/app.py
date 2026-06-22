@@ -247,6 +247,13 @@ BARO_QNH_DEFAULT_HPA = 1013.25
 LAST_FIX_PATH = "last_fix.json"
 LAST_FIX_SAVE_S = 120         # min seconds between saves (flash wear)
 LAST_FIX_MIN_SATS = 5         # only persist a confident 3D fix
+# QNH GPS-calibration gating: the receiver's altitude can be hundreds of metres
+# off for a few seconds right at first lock, so don't calibrate QNH off a weak
+# or outlier fix (it would yank baro_alt and slowly fade back).
+QNH_CAL_MIN_SATS = 5          # need a confident fix to (re)calibrate QNH
+QNH_CAL_MAX_HDOP = 3.0        # ... and good geometry (HDOP is high indoors)
+QNH_CAL_MAX_JUMP_M = 100      # ignore a GPS alt this far off the baro alt ...
+QNH_CAL_FAR_HITS = 10         # ... unless it persists (the unit really moved)
 
 
 async def force_task(adc, state):
@@ -460,6 +467,7 @@ def _load_last_fix_alt():
 async def baro_task(baro, state, vertical):
     last = time.ticks_ms()
     seeded = False
+    qnh_far = 0          # consecutive GPS fixes whose alt is far from baro alt
     while True:
         pressure = await baro.apressure_hpa()
         now = time.ticks_ms()
@@ -481,19 +489,30 @@ async def baro_task(baro, state, vertical):
 
         gps_fresh = (state.gps_fix and time.ticks_diff(
             time.ticks_ms(), state.gps_ts) < BARO_CAL_GPS_MAX_AGE_MS)
-        if state.phase == protocol.PHASE_IDLE and gps_fresh:
+        if (state.phase == protocol.PHASE_IDLE and gps_fresh
+                and state.gps_sats >= QNH_CAL_MIN_SATS
+                and state.gps_hdop <= QNH_CAL_MAX_HDOP):
             ref = altitude.sea_level_pressure_hpa(pressure, state.alt_m)
-            if not state.qnh_gps_cal:
-                # First real fix: snap QNH to truth (replaces the seed/default)
-                # and re-seed the filter so the jump doesn't read as a climb.
-                state.qnh_hpa = ref
-                state.qnh_gps_cal = True
-                vertical.alt = None
-                vertical.vrate = 0.0
-                print("Baro QNH from GPS: %.1f hPa (alt %.1f m)"
-                      % (ref, state.alt_m))
+            # Reject a transient bad fix: a GPS altitude far off the current
+            # (seeded/calibrated) baro altitude is the large vertical error seen
+            # right at first lock. Accept anyway only if it persists, which means
+            # the unit really moved to a new field.
+            if (abs(state.alt_m - state.baro_alt_m) > QNH_CAL_MAX_JUMP_M
+                    and qnh_far < QNH_CAL_FAR_HITS):
+                qnh_far += 1
             else:
-                state.qnh_hpa += BARO_CAL_ALPHA * (ref - state.qnh_hpa)
+                qnh_far = 0
+                if not state.qnh_gps_cal:
+                    # First good fix: snap QNH to truth (replaces seed/default)
+                    # and re-seed the filter so the jump isn't read as a climb.
+                    state.qnh_hpa = ref
+                    state.qnh_gps_cal = True
+                    vertical.alt = None
+                    vertical.vrate = 0.0
+                    print("Baro QNH from GPS: %.1f hPa (alt %.1f m, %d sat)"
+                          % (ref, state.alt_m, state.gps_sats))
+                else:
+                    state.qnh_hpa += BARO_CAL_ALPHA * (ref - state.qnh_hpa)
         # Until a fix calibrates QNH, use the seed; absent any stored fix, fall
         # back to standard pressure so baro/climb still work.
         qnh = state.qnh_hpa or BARO_QNH_DEFAULT_HPA
@@ -579,6 +598,9 @@ async def gps_task(state):
         if update["type"] == "GGA":
             state.gps_fix = update["fix"]
             state.gps_sats = update["sats"]
+            state.gps_hdop = update["hdop"] if update["hdop"] is not None else 99.0
+            if not state.gps_fix:
+                state.ground_speed_ms = 0.0   # no fix -> no speed (don't latch)
             if update["lat"] is not None:
                 state.lat = update["lat"]
                 state.lon = update["lon"]
@@ -606,7 +628,9 @@ async def gps_task(state):
                 _save_last_fix(state.lat, state.lon, state.alt_m)
                 last_fix_save = time.ticks_ms()
         elif update["type"] == "RMC":
-            if update["speed_ms"] is not None:
+            # Only trust ground speed from a valid fix (RMC status 'A'); a void
+            # fix can still carry a stale/garbage speed field. No fix -> 0 above.
+            if update["valid"] and update["speed_ms"] is not None:
                 state.ground_speed_ms = update["speed_ms"]
             if update["datetime"]:
                 y, mo, d, h, mi, s = update["datetime"]
