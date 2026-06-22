@@ -24,6 +24,7 @@
 # Deploy protocol.py (from firmware/shared/) alongside this file.
 
 import os
+import struct
 import time
 
 import micropython
@@ -250,14 +251,129 @@ def _show_survey():
     display.show()
 
 
+# --- GPS cold-start aiding (UBX-AID-INI) -----------------------------------
+# Feed the u-blox 7 its last-known position (cached on flash) at boot, and -
+# once WiFi gives us the time - the time, so a cold start fixes in seconds
+# instead of ~30 s. The cache is for AIDING ONLY: WINCH_POS is still sent solely
+# from the live, converged survey, never from the cache. (AID-INI is the
+# u-blox 6/7 path - HW 00070000 / PROTVER 14 here; the M10 winch will use MGA.)
+AID_CACHE_PATH = "winch_aid.json"
+AID_SAVE_S = 300              # re-cache the converged position at most this often
+AID_POS_ACC_M = 100           # confidence the winch sits at the cached spot
+AID_TIME_ACC_MS = 5000        # coarse time (HTTP Date + latency + leap margin)
+_GPS_LEAP_S = 18              # GPS-UTC offset (18 s since 2017)
+_HTTP_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+_aid_utc = None               # (y,mo,d,h,mi,s) from the internet; set by _serve
+_aided_time = False           # time aiding already injected this boot
+_aid_save_ms = 0
+
+
+def _aid_ubx(cls, mid, payload):
+    body = bytes((cls, mid)) + len(payload).to_bytes(2, "little") + payload
+    a = b = 0
+    for x in body:
+        a = (a + x) & 0xFF
+        b = (b + a) & 0xFF
+    return b"\xb5\x62" + body + bytes((a, b))
+
+
+def _aid_ini(lat=None, lon=None, alt_m=0.0, week=None, tow_ms=0):
+    # UBX-AID-INI (0x0B 0x01): position (lat/lon 1e-7 deg, alt cm) and/or time
+    # (GPS week + TOW ms). flags: 0x01 pos, 0x20 lla(geodetic), 0x02 time.
+    flags = 0
+    ex = ey = ez = pacc = 0
+    if lat is not None:
+        ex = int(round(lat * 1e7)); ey = int(round(lon * 1e7))
+        ez = int(round(alt_m * 100)); pacc = int(AID_POS_ACC_M * 100)
+        flags |= 0x21
+    wn = tow = tacc = 0
+    if week is not None:
+        wn = week & 0xFFFF; tow = tow_ms & 0xFFFFFFFF; tacc = AID_TIME_ACC_MS
+        flags |= 0x02
+    payload = struct.pack("<iiiIHHIiIIiII",
+                          ex, ey, ez, pacc, 0, wn, tow, 0, tacc, 0, 0, 0, flags)
+    return _aid_ubx(0x0B, 0x01, payload)
+
+
+def _utc_to_gps(y, mo, d, h, mi, s):
+    # UTC -> (GPS week, time-of-week ms). mktime is 2000-epoch on the ESP32;
+    # +630720000 shifts to the 1980-01-06 GPS epoch, + leap seconds to GPS time.
+    g = time.mktime((y, mo, d, h, mi, s, 0, 0)) + 630720000 + _GPS_LEAP_S
+    return g // 604800, (g % 604800) * 1000
+
+
+def _save_aid(lat, lon, alt):
+    try:
+        with open(AID_CACHE_PATH, "w") as f:
+            f.write('{"lat":%.7f,"lon":%.7f,"alt":%.1f}' % (lat, lon, alt))
+    except OSError:
+        pass
+
+
+def _load_aid():
+    import json
+    try:
+        d = json.loads(open(AID_CACHE_PATH).read())
+        return d["lat"], d["lon"], d["alt"]
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def _parse_http_date(s):
+    # "Mon, 22 Jun 2026 20:43:21 GMT" -> (y, mo, d, h, mi, s) UTC, or None.
+    try:
+        p = s.split()
+        return (int(p[3]), _HTTP_MONTHS.index(p[2]) + 1, int(p[1]),
+                int(p[4][0:2]), int(p[4][3:5]), int(p[4][6:8]))
+    except (ValueError, IndexError, AttributeError):
+        return None
+
+
+def _aid_fetch_time():
+    # One-shot: UTC for GPS time aiding (the winch RTC is cold until a fix, so
+    # the internet is the only pre-fix clock). NTP first (accurate, no auth);
+    # HTTP Date as a fallback if NTP/UDP is blocked. Does NOT set the RTC - that
+    # stays GPS+PPS-disciplined; this only seeds the receiver's time aid.
+    global _aid_utc
+    if _aid_utc is not None:
+        return
+    try:
+        import ntptime
+        _aid_utc = time.gmtime(ntptime.time())[:6]
+        print("GPS aiding: NTP UTC", _aid_utc)
+        return
+    except Exception as e:
+        print("aid NTP failed, trying HTTP Date:", e)
+    import urequests
+    try:
+        # User-Agent required or GitHub 403s (and the 403 carries no Date).
+        r = urequests.get("https://api.github.com",
+                          headers={"User-Agent": "winchy"})
+        d = r.headers.get("Date") if getattr(r, "headers", None) else None
+        r.close()
+        t = _parse_http_date(d)
+        if t:
+            _aid_utc = t
+            print("GPS aiding: HTTP UTC", t)
+    except Exception as e:
+        print("aid HTTP date failed:", e)
+
+
 async def _gps_task():
     # Drain NMEA, feed the survey-in, periodically send WINCH_POS, and own the
     # OLED when the rope link is idle. RX/TX of the LoRa link is unaffected
     # (it is IRQ-driven); this only shares the radio for the low-rate send.
     global gps_sats, gps_has_fix, _gps_buf, _pps_rtc, clock_set
+    global _aided_time, _aid_save_ms
     _pps_rtc = RTC()
     Pin(GPS_PPS_PIN, Pin.IN).irq(trigger=Pin.IRQ_RISING, handler=_on_pps)
     last_send = time.ticks_ms()
+    pos = _load_aid()                         # cached last-known position
+    if pos is not None:                       # inject it now for a fast fix
+        gps_uart.write(_aid_ini(lat=pos[0], lon=pos[1], alt_m=pos[2]))
+        print("GPS aiding: position injected (%.6f, %.6f, %.0f m)"
+              % (pos[0], pos[1], pos[2]))
     while True:
         if gps_uart.any():
             _gps_buf += gps_uart.read() or b""
@@ -287,6 +403,18 @@ async def _gps_task():
                 and time.ticks_diff(now, last_send) >= WINCH_POS_PERIOD_S * 1000):
             _send_winch_pos()
             last_send = now
+        # Inject time aiding once the internet has given us UTC (via _serve).
+        if _aid_utc is not None and not _aided_time:
+            wk, tw = _utc_to_gps(*_aid_utc)
+            gps_uart.write(_aid_ini(week=wk, tow_ms=tw))
+            _aided_time = True
+            print("GPS aiding: time injected (GPS week %d)" % wk)
+        # Cache the converged position for the next boot's aiding (throttled,
+        # flash-wear-bounded). AIDING ONLY - WINCH_POS stays live-survey-sourced.
+        if (survey.converged and survey.lat is not None
+                and time.ticks_diff(now, _aid_save_ms) >= AID_SAVE_S * 1000):
+            _save_aid(survey.lat, survey.lon, survey.alt or 0.0)
+            _aid_save_ms = now
         latest.update(_survey_fields())
         if time.ticks_diff(now, last_rx_ms) > 3000:   # link idle -> show GPS
             _show_survey()
@@ -610,6 +738,7 @@ async def _serve():
                 if not server_started:    # bind once; survives later rejoins
                     await asyncio.start_server(handle, "0.0.0.0", 80)
                     server_started = True
+                _aid_fetch_time()         # one-shot UTC for GPS time aiding
             else:
                 print("WiFi: no known network in range; will retry")
         # winchy-logs reachability for the OLED "I": only when WiFi is up and a
