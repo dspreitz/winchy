@@ -41,7 +41,9 @@ from winchy.sensors.ads1232 import ADS1232
 from winchy.sensors.barometer import Barometer
 from winchy.sensors.gps import (GPS, parse_nmea, configure as gps_configure,
                                  set_baud as gps_set_baud,
-                                 save_config as gps_save_config)
+                                 feed_mga as gps_feed_mga,
+                                 mga_ini_time_utc as gps_ini_time,
+                                 poll_ubx as gps_poll_ubx)
 from winchy.sensors.magnetometer import Magnetometer
 from winchy.sensors.qmi8658 import QMI8658
 from winchy.state import State
@@ -157,6 +159,38 @@ except ImportError:
         WIFI_NETWORKS = [(WIFI_SSID, WIFI_PASSWORD)]
     except ImportError:
         WIFI_NETWORKS = []
+
+# AssistNow Predictive Orbits (u-blox MGA-ANO). Opportunistic: when the rope has
+# internet (the dashboard keeps WiFi up), fetch predicted orbit data and feed it
+# to the GPS - so a later cold start uses predicted ephemeris instead of waiting
+# ~30 s to download it over the air. The blob is cached on flash and re-fed at
+# every boot, so it helps even with no internet then.
+#
+# The legacy Online/Offline token flow was retired (EoS 2026-05-31); the new
+# service uses Zero-Touch Provisioning: the device registers once with its
+# UBX-SEC-UNIQID + UBX-MON-VER and a Device-Profile token to get a permanent
+# chipcode, then fetches data with the chipcode. secrets.py (device only):
+# UBLOX_ZTP_TOKEN (from the Thingstream Device Profile). No token -> the
+# download is skipped (any cached blob is still fed at boot).
+ASSISTNOW_ZTP_URL = "https://api.thingstream.io/ztp/assistnow/credentials"
+ASSISTNOW_GNSS = "gps"             # add ',gal,glo,bds' for more (bigger blob)
+ASSISTNOW_DATA = "uporb_7,ualm"    # 7-day predicted orbits + almanac (per plan's allowedData)
+ASSISTNOW_MAX_AGE_S = 3 * 86400    # re-download when the cache is older than this
+ASSISTNOW_PATH = "mga_offline.ubx"      # cached MGA blob
+ASSISTNOW_TS_PATH = "mga_offline.ts"    # blob download time (s, 2000-epoch)
+ASSISTNOW_CHIP_PATH = "mga_chip.json"   # cached ZTP chipcode + data serviceUrl
+_assistnow_done = False            # one download attempt per boot
+_gps_uniqid_hex = None             # UBX-SEC-UNIQID frame (hex), for ZTP register
+_gps_monver_hex = None             # UBX-MON-VER frame (hex), for ZTP register
+try:
+    from secrets import UBLOX_ZTP_TOKEN
+except ImportError:
+    UBLOX_ZTP_TOKEN = None
+try:
+    from secrets import UBLOX_ZTP_URL   # optional override of the endpoint
+    ASSISTNOW_ZTP_URL = UBLOX_ZTP_URL
+except ImportError:
+    pass
 
 # Closed-loop TX-power control (ADR). Drives the rope's output power from the
 # winch's reported downlink quality. Hardened after an earlier version starved
@@ -493,7 +527,8 @@ async def gps_task(state):
         board.gps_reopen(config.GPS_BAUD)
         gps_configure(board.gps_uart, 5)
         print("GPS: high baud failed, fell back to %d/5 Hz" % config.GPS_BAUD)
-    gps_save_config(board.gps_uart)          # persist nav/msg config to BBR+Flash
+    _assistnow_capture_identity()            # UBX identity for ZTP (before read loop)
+    _assistnow_feed_stored(state)            # warm the GPS with any cached orbits
     reader = asyncio.StreamReader(board.gps_uart)
     rtc = RTC()
     _pps_rtc = rtc
@@ -702,6 +737,147 @@ def _github_upload_raw(asset):
     return ok
 
 
+def _assistnow_capture_identity():
+    # Read the receiver's UBX-SEC-UNIQID + UBX-MON-VER (full frames, as hex) for
+    # the one-time ZTP registration. Only needed before we have a chipcode and
+    # only when a token is configured; done here (before the NMEA read loop) so
+    # the binary replies aren't eaten by the line reader.
+    global _gps_uniqid_hex, _gps_monver_hex
+    if not UBLOX_ZTP_TOKEN:
+        return
+    try:
+        os.stat(ASSISTNOW_CHIP_PATH)
+        return                           # already registered -> no identity needed
+    except OSError:
+        pass
+    import binascii
+    uid = gps_poll_ubx(board.gps_uart, 0x27, 0x03)   # UBX-SEC-UNIQID
+    ver = gps_poll_ubx(board.gps_uart, 0x0A, 0x04)   # UBX-MON-VER
+    if uid:
+        _gps_uniqid_hex = binascii.hexlify(uid).decode()
+    if ver:
+        _gps_monver_hex = binascii.hexlify(ver).decode()
+    print("AssistNow ZTP: identity %s/%s"
+          % ("ok" if uid else "?", "ok" if ver else "?"))
+
+
+def _assistnow_feed_stored(state):
+    # Feed the cached AssistNow blob (if any) to the GPS at boot so a cold start
+    # uses predicted orbits even with no internet. Time is injected only if the
+    # RTC is already set (usually not on a cold boot - then just the orbits go,
+    # still used once the receiver self-acquires time-of-week).
+    try:
+        blob = open(ASSISTNOW_PATH, "rb").read()
+    except OSError:
+        return
+    if not blob:
+        return
+    gc.collect()
+    t = time.localtime()
+    if state.time_synced and t[0] >= 2024:
+        gps_ini_time(board.gps_uart, t[:6])
+    gps_feed_mga(board.gps_uart, blob)
+    print("AssistNow: fed %d B of cached predicted orbits to GPS" % len(blob))
+    gc.collect()
+
+
+def _assistnow_should_download(state):
+    # Fetch if there is no cache, or (once we know the time) the cache is stale.
+    try:
+        os.stat(ASSISTNOW_PATH)
+    except OSError:
+        return True                      # no cache -> fetch
+    if not state.time_synced:
+        return False                     # have a cache, can't judge age yet
+    try:
+        ts = int(open(ASSISTNOW_TS_PATH).read())
+    except (OSError, ValueError):
+        return True                      # age unknown but we have time -> refresh
+    return time.time() - ts > ASSISTNOW_MAX_AGE_S
+
+
+def _assistnow_register():
+    # One-time ZTP registration: POST the receiver identity + Device-Profile
+    # token, cache the returned chipcode + data serviceUrl. Returns True on
+    # success (chipcode cached). Token never logged.
+    import urequests
+    if not (_gps_uniqid_hex and _gps_monver_hex):
+        print("AssistNow ZTP: no UBX identity captured, cannot register")
+        return False
+    body = ('{"token":"%s","messages":{"UBX-SEC-UNIQID":"%s",'
+            '"UBX-MON-VER":"%s"}}'
+            % (UBLOX_ZTP_TOKEN, _gps_uniqid_hex, _gps_monver_hex))
+    try:
+        gc.collect()
+        r = urequests.post(ASSISTNOW_ZTP_URL, data=body,
+                           headers={"Content-Type": "application/json"})
+        code = r.status_code
+        d = r.json() if 200 <= code < 300 else None
+        r.close()
+        if d and d.get("chipcode") and d.get("serviceUrl"):
+            with open(ASSISTNOW_CHIP_PATH, "w") as f:
+                f.write('{"chipcode":"%s","serviceUrl":"%s"}'
+                        % (d["chipcode"], d["serviceUrl"]))
+            print("AssistNow ZTP: registered, allowedData=%s"
+                  % d.get("allowedData"))
+            return True
+        print("AssistNow ZTP: register HTTP %d" % code)
+    except Exception as e:
+        print("AssistNow ZTP register failed:", e)
+    gc.collect()
+    return False
+
+
+def _assistnow_download(state):
+    # Fetch predicted-orbit data over WiFi (registering first if needed), cache
+    # it on flash, and feed it to the GPS (+ coarse time if the RTC is set).
+    # Blocks the loop for the round-trip (~secs) - only called while IDLE.
+    import urequests
+    import json
+    try:
+        meta = json.loads(open(ASSISTNOW_CHIP_PATH).read())
+    except (OSError, ValueError):
+        if not _assistnow_register():
+            return False
+        try:
+            meta = json.loads(open(ASSISTNOW_CHIP_PATH).read())
+        except (OSError, ValueError):
+            return False
+    url = ("%s?chipcode=%s&gnss=%s&data=%s"
+           % (meta["serviceUrl"], meta["chipcode"], ASSISTNOW_GNSS,
+              ASSISTNOW_DATA))
+    ok = False
+    try:
+        gc.collect()
+        r = urequests.get(url)
+        if r.status_code == 200:
+            blob = r.content
+            r.close()
+            if blob:
+                with open(ASSISTNOW_PATH, "wb") as f:
+                    f.write(blob)
+                t = time.localtime()
+                if state.time_synced and t[0] >= 2024:
+                    try:
+                        with open(ASSISTNOW_TS_PATH, "w") as f:
+                            f.write(str(time.time()))
+                    except OSError:
+                        pass
+                    gps_ini_time(board.gps_uart, t[:6])
+                gc.collect()
+                gps_feed_mga(board.gps_uart, blob)
+                print("AssistNow: downloaded + fed %d B to GPS%s"
+                      % (len(blob), " (+time)" if state.time_synced else ""))
+                ok = True
+        else:
+            print("AssistNow: data HTTP %d" % r.status_code)
+            r.close()
+    except Exception as e:
+        print("AssistNow download failed:", e)
+    gc.collect()
+    return ok
+
+
 async def wifi_task(state):
     # Duty-cycled offload: while idle and the battery can spare it, bring WiFi
     # up, try to join the known network, push raw.csv if it has new data, then
@@ -750,6 +926,7 @@ async def dashboard_task(state):
     # page (winchy/dashboard.py), rejoins if dropped, and uploads raw.csv
     # opportunistically while IDLE. Battery cost is accepted for now; restore
     # power saving for flight by setting config.ROPE_DASHBOARD = False.
+    global _assistnow_done
     import network
     dashboard.state = state
     try:
@@ -770,6 +947,17 @@ async def dashboard_task(state):
                 if not server_started:
                     await asyncio.start_server(dashboard.handle, "0.0.0.0", 80)
                     server_started = True
+        # Opportunistic AssistNow Predictive Orbits: while IDLE + online, fetch
+        # predicted orbits and feed them to the GPS (cached for the next cold
+        # start). First call also does the one-time ZTP registration.
+        if (UBLOX_ZTP_TOKEN and not _assistnow_done
+                and wlan.isconnected() and state.phase == protocol.PHASE_IDLE):
+            if _assistnow_should_download(state):
+                _assistnow_download(state)
+                _assistnow_done = True       # one attempt per boot
+            elif state.time_synced:
+                _assistnow_done = True        # cache confirmed fresh
+            # else: have a cache but no time yet -> re-check on a later loop
         # Opportunistic GitHub upload (WiFi already up): only while IDLE + data.
         if (GITHUB_TOKEN and wlan.isconnected()
                 and state.phase == protocol.PHASE_IDLE

@@ -66,42 +66,96 @@ def set_baud(uart, baud):
     time.sleep_ms(150)
 
 
+# M10 config-database keys (UBX-CFG-VALSET). Sizes are encoded in the key:
+# 0x3.. = U2, 0x2.. = U1/E1. NMEA message output is per (id, port).
+_CFG_RATE_MEAS = 0x30210001          # U2, ms between measurements
+_CFG_RATE_NAV = 0x30210002           # U2, measurements per nav solution
+_CFG_MSGOUT_UART1 = (                # (NMEA id key on UART1, keep on?)
+    (0x209100BB, True),              # GGA
+    (0x209100AC, True),              # RMC
+    (0x209100CA, False),             # GLL
+    (0x209100C0, False),             # GSA
+    (0x209100C5, False),             # GSV
+    (0x209100B1, False),             # VTG
+)
+
+
+def _valset(layers, items):
+    """Frame a UBX-CFG-VALSET. layers: bit0 RAM, bit1 BBR, bit2 Flash.
+    items: iterable of (key_u32, value_bytes)."""
+    p = bytes((0x00, layers, 0x00, 0x00))
+    for key, val in items:
+        p += key.to_bytes(4, "little") + val
+    return _ubx(0x06, 0x8A, p)
+
+
 def configure(uart, rate_hz=5):
-    """Configure a u-blox M10 over UART: emit only the sentences we parse
-    (GGA + RMC) and raise the nav rate. RAM-only (resets on power cycle), so
-    call this at every boot. Volume is ~150 B per epoch, so the baud must
-    support rate_hz * 150 B/s (10 Hz needs the raised baud, not 9600).
+    """Configure the u-blox M10 via the config database (UBX-CFG-VALSET): emit
+    only the sentences we parse (GGA + RMC) and set the nav rate. M10 dropped
+    the legacy UBX-CFG-MSG/CFG-RATE, so the keyed interface is the supported one
+    (its acceptance is ACK-verified on this module).
+
+    Written to RAM + BBR (layers 0x03): RAM applies it now; BBR persists it
+    across power cycles WITHOUT flash wear, retained by the AXP2101 backup-domain
+    charge (board.py) - the same rail that keeps the receiver's ephemeris/almanac
+    alive for a warm start. Baud stays RAM-only (see set_baud), so the tested
+    9600 -> high-baud boot bring-up is unchanged. Volume is ~150 B/epoch, so the
+    baud must support rate_hz * 150 B/s (10 Hz needs the raised baud, not 9600).
     """
-    # NMEA message rates (class 0xF0): drop GLL/GSA/GSV/VTG, keep GGA/RMC.
-    for msg_class, msg_id, on in ((0xF0, 0x01, 0), (0xF0, 0x02, 0),
-                                  (0xF0, 0x03, 0), (0xF0, 0x05, 0),
-                                  (0xF0, 0x00, 1), (0xF0, 0x04, 1)):
-        uart.write(_ubx(0x06, 0x01, bytes([msg_class, msg_id, on])))
-        time.sleep_ms(20)
-    # CFG-RATE: measRate ms, navRate 1 cycle, timeRef 1 (GPS).
     meas = max(50, min(1000, 1000 // rate_hz))
-    uart.write(_ubx(0x06, 0x08, meas.to_bytes(2, "little") + b"\x01\x00\x01\x00"))
+    items = [(_CFG_RATE_MEAS, meas.to_bytes(2, "little")),
+             (_CFG_RATE_NAV, (1).to_bytes(2, "little"))]
+    for key, keep in _CFG_MSGOUT_UART1:
+        items.append((key, b"\x01" if keep else b"\x00"))
+    uart.write(_valset(0x03, items))     # layers: RAM | BBR (no flash wear)
+    time.sleep_ms(50)
+
+
+def poll_ubx(uart, cls, mid, timeout_ms=1500):
+    """Send a UBX poll (zero-length) and return the full matching UBX frame
+    (sync..checksum) or None. Used to read UBX-SEC-UNIQID / UBX-MON-VER for the
+    AssistNow ZTP device registration. Call before the NMEA read loop starts so
+    the binary reply isn't consumed by the line reader."""
+    while uart.any():                    # flush stale NMEA
+        uart.read(uart.any())
+    uart.write(_ubx(cls, mid))
+    deadline = time.ticks_add(time.ticks_ms(), timeout_ms)
+    buf = b""
+    while time.ticks_diff(deadline, time.ticks_ms()) > 0:
+        if uart.any():
+            buf += uart.read(uart.any())
+        time.sleep_ms(20)
+    i = buf.find(bytes((0xB5, 0x62, cls, mid)))
+    if i < 0 or i + 6 > len(buf):
+        return None
+    end = i + 6 + (buf[i + 4] | (buf[i + 5] << 8)) + 2
+    return buf[i:end] if end <= len(buf) else None
+
+
+def feed_mga(uart, blob, chunk=128, gap_ms=15):
+    """Stream a UBX MGA blob (AssistNow Predictive Orbits = concatenated
+    UBX-MGA-ANO predicted-orbit messages) to the receiver. Already framed;
+    the receiver stores the ones matching the current date and uses them at the
+    next acquisition instead of downloading ephemeris over the air. Chunked with
+    small gaps so the module's input buffer keeps up at the working baud."""
+    for i in range(0, len(blob), chunk):
+        uart.write(blob[i:i + chunk])
+        time.sleep_ms(gap_ms)
+
+
+def mga_ini_time_utc(uart, t, acc_s=2):
+    """UBX-MGA-INI-TIME_UTC: coarse UTC time aiding so the predicted orbits
+    can be used immediately (the right day is picked) instead of waiting for the
+    satellite time-of-week. t = (year, month, day, hour, minute, second)."""
+    y, mo, d, h, mi, s = t
+    p = bytes((0x10, 0x00, 0x00, 0x80))             # type=UTC, ver=0, ref=0, leapSec=unknown
+    p += y.to_bytes(2, "little") + bytes((mo, d, h, mi, s, 0x00))
+    p += (0).to_bytes(4, "little")                  # ns
+    p += acc_s.to_bytes(2, "little")                # tAccS (seconds)
+    p += (0).to_bytes(2, "little")                  # reserved
+    p += (0).to_bytes(4, "little")                  # tAccNs
+    uart.write(_ubx(0x13, 0x40, p))
     time.sleep_ms(20)
-
-
-def save_config(uart):
-    """Persist the current navigation/message config to non-volatile storage
-    (UBX-CFG-CFG save) so a power cycle keeps the nav rate and GGA/RMC message
-    set instead of re-running the cold config dance. Pairs with the AXP2101
-    backup-domain charge (board.py) that keeps the receiver's battery-backed
-    RAM - and thus its ephemeris/almanac - alive between runs for a warm start.
-
-    saveMask 0xFFFE = all config sections except ioPort: the UART baud stays
-    volatile (resets to 9600) on purpose, so the tested 9600 -> high-baud boot
-    bring-up in gps_task is unchanged. deviceMask 0x17 = BBR | Flash | EEPROM |
-    SPI flash (bits for absent devices are ignored).
-    """
-    payload = (b"\x00\x00\x00\x00"      # clearMask: clear nothing
-               + b"\xfe\xff\x00\x00"     # saveMask: all sections except ioPort
-               + b"\x00\x00\x00\x00"     # loadMask: load nothing
-               + b"\x17")                # deviceMask: BBR | Flash | EEPROM | SPI
-    uart.write(_ubx(0x06, 0x09, payload))
-    time.sleep_ms(100)
 
 
 def _coord(value, hemisphere, degree_digits):
