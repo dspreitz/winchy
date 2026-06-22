@@ -84,6 +84,26 @@ def configure(uart, rate_hz=5):
     time.sleep_ms(20)
 
 
+def save_config(uart):
+    """Persist the current navigation/message config to non-volatile storage
+    (UBX-CFG-CFG save) so a power cycle keeps the nav rate and GGA/RMC message
+    set instead of re-running the cold config dance. Pairs with the AXP2101
+    backup-domain charge (board.py) that keeps the receiver's battery-backed
+    RAM - and thus its ephemeris/almanac - alive between runs for a warm start.
+
+    saveMask 0xFFFE = all config sections except ioPort: the UART baud stays
+    volatile (resets to 9600) on purpose, so the tested 9600 -> high-baud boot
+    bring-up in gps_task is unchanged. deviceMask 0x17 = BBR | Flash | EEPROM |
+    SPI flash (bits for absent devices are ignored).
+    """
+    payload = (b"\x00\x00\x00\x00"      # clearMask: clear nothing
+               + b"\xfe\xff\x00\x00"     # saveMask: all sections except ioPort
+               + b"\x00\x00\x00\x00"     # loadMask: load nothing
+               + b"\x17")                # deviceMask: BBR | Flash | EEPROM | SPI
+    uart.write(_ubx(0x06, 0x09, payload))
+    time.sleep_ms(100)
+
+
 def _coord(value, hemisphere, degree_digits):
     """ddmm.mmmm / dddmm.mmmm -> signed decimal degrees."""
     if not value:

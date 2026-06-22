@@ -91,6 +91,14 @@ def init_power():
     pmu.enableSystemVoltageMeasure()
     pmu.setChargingLedMode(pmu.XPOWERS_CHG_LED_OFF)
 
+    # Charge the GPS backup-domain cell/supercap on the AXP2101 VRTC rail so the
+    # u-blox keeps its ephemeris/almanac/time/last-fix across power cycles ->
+    # warm/hot GPS starts instead of a full cold start every boot (~30 s TTFF).
+    # Retention needs an energy source between runs (18650 fitted, or a charged
+    # backup cap), so this only helps when the unit isn't fully de-powered.
+    pmu.setButtonBatteryChargeVoltage(3300)
+    pmu.enableButtonBatteryCharge()
+
     pmu.disableIRQ(pmu.XPOWERS_AXP2101_ALL_IRQ)
     pmu.clearIrqStatus()
     pmu.enableIRQ(

@@ -40,7 +40,8 @@ from winchy.fusion.speed import glider_speed
 from winchy.sensors.ads1232 import ADS1232
 from winchy.sensors.barometer import Barometer
 from winchy.sensors.gps import (GPS, parse_nmea, configure as gps_configure,
-                                 set_baud as gps_set_baud)
+                                 set_baud as gps_set_baud,
+                                 save_config as gps_save_config)
 from winchy.sensors.magnetometer import Magnetometer
 from winchy.sensors.qmi8658 import QMI8658
 from winchy.state import State
@@ -203,6 +204,10 @@ def _adr_next_power(state):
 # frozen). EMA per 1 Hz barometer sample: ~30 s to settle.
 BARO_CAL_ALPHA = 0.1
 BARO_CAL_GPS_MAX_AGE_MS = 5000
+# Fallback reference until a GPS fix calibrates QNH: standard sea-level
+# pressure. Absolute altitude is then off by the local QNH offset, but climb
+# rate and relative changes are still correct, so baro/climb work before a fix.
+BARO_QNH_DEFAULT_HPA = 1013.25
 
 
 async def force_task(adc, state):
@@ -410,16 +415,25 @@ async def baro_task(baro, state, vertical):
             ref = altitude.sea_level_pressure_hpa(pressure, state.alt_m)
             if state.qnh_hpa == 0:
                 state.qnh_hpa = ref
+                # Re-seed the filter to the GPS-corrected reference so the
+                # snap from the default QNH doesn't read as a climb spike.
+                vertical.alt = None
+                vertical.vrate = 0.0
                 print("Baro reference initialised: QNH %.1f hPa "
                       "(GPS alt %.1f m)" % (ref, state.alt_m))
             else:
                 state.qnh_hpa += BARO_CAL_ALPHA * (ref - state.qnh_hpa)
-        if state.qnh_hpa:
-            state.baro_alt_m = altitude.pressure_to_altitude_m(
-                pressure, state.qnh_hpa)
-            vertical.predict(time.ticks_diff(now, last) / 1000.0)
-            vertical.update(state.baro_alt_m)
-            state.climb_rate_ms = vertical.vrate
+        # Use the calibrated QNH once a GPS fix sets it; until then fall back to
+        # standard pressure so baro/climb still work (absolute alt is offset).
+        qnh = state.qnh_hpa or BARO_QNH_DEFAULT_HPA
+        raw_alt = altitude.pressure_to_altitude_m(pressure, qnh)
+        vertical.predict(time.ticks_diff(now, last) / 1000.0)
+        vertical.update(raw_alt)
+        # Publish the Kalman-filtered altitude, not the noisy per-sample ISA
+        # value: removes sensor jitter while still tracking a real climb.
+        # raw.csv still logs raw pressure_hpa for offline replay.
+        state.baro_alt_m = vertical.alt
+        state.climb_rate_ms = vertical.vrate
         last = now
         await asyncio.sleep_ms(BARO_PERIOD_MS)
 
@@ -479,6 +493,7 @@ async def gps_task(state):
         board.gps_reopen(config.GPS_BAUD)
         gps_configure(board.gps_uart, 5)
         print("GPS: high baud failed, fell back to %d/5 Hz" % config.GPS_BAUD)
+    gps_save_config(board.gps_uart)          # persist nav/msg config to BBR+Flash
     reader = asyncio.StreamReader(board.gps_uart)
     rtc = RTC()
     _pps_rtc = rtc
