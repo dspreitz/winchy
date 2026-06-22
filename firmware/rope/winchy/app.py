@@ -238,10 +238,15 @@ def _adr_next_power(state):
 # frozen). EMA per 1 Hz barometer sample: ~30 s to settle.
 BARO_CAL_ALPHA = 0.1
 BARO_CAL_GPS_MAX_AGE_MS = 5000
-# Fallback reference until a GPS fix calibrates QNH: standard sea-level
-# pressure. Absolute altitude is then off by the local QNH offset, but climb
-# rate and relative changes are still correct, so baro/climb work before a fix.
+# Fallback reference if QNH can't be seeded (first boot ever, no stored fix):
+# standard sea-level pressure. Absolute altitude is then off by the local QNH
+# offset, but climb/relative are still correct, so baro/climb work before a fix.
 BARO_QNH_DEFAULT_HPA = 1013.25
+# Last good GPS fix, persisted to flash, so QNH can be seeded from the known
+# field elevation at the next boot (before any fix). Saved while IDLE, throttled.
+LAST_FIX_PATH = "last_fix.json"
+LAST_FIX_SAVE_S = 120         # min seconds between saves (flash wear)
+LAST_FIX_MIN_SATS = 5         # only persist a confident 3D fix
 
 
 async def force_task(adc, state):
@@ -435,30 +440,62 @@ async def raw_writer_task(state):
         await asyncio.sleep_ms(0)      # yield so imu_task samples between chunks
 
 
+def _save_last_fix(lat, lon, alt):
+    try:
+        with open(LAST_FIX_PATH, "w") as f:
+            f.write('{"lat":%.6f,"lon":%.6f,"alt":%.1f}' % (lat, lon, alt))
+    except OSError:
+        pass
+
+
+def _load_last_fix_alt():
+    # Return the last persisted GPS MSL altitude (m), or None.
+    try:
+        import json
+        return float(json.loads(open(LAST_FIX_PATH).read())["alt"])
+    except (OSError, ValueError, KeyError):
+        return None
+
+
 async def baro_task(baro, state, vertical):
     last = time.ticks_ms()
+    seeded = False
     while True:
         pressure = await baro.apressure_hpa()
         now = time.ticks_ms()
         state.pressure_hpa = pressure
         state.baro_ts = now
 
+        # One-time boot seed: with no GPS fix yet, derive QNH from the last known
+        # field elevation (persisted to flash) + today's pressure, so the
+        # absolute altitude is right immediately and weather-aware (no sea-level
+        # assumption). Only falls back to standard pressure if there is no stored
+        # fix (first boot ever). A real GPS fix below replaces it.
+        if state.qnh_hpa == 0 and not seeded:
+            seed_alt = _load_last_fix_alt()
+            if seed_alt is not None:
+                state.qnh_hpa = altitude.sea_level_pressure_hpa(pressure, seed_alt)
+                print("Baro QNH seeded from last fix %.1f m -> %.1f hPa"
+                      % (seed_alt, state.qnh_hpa))
+            seeded = True
+
         gps_fresh = (state.gps_fix and time.ticks_diff(
             time.ticks_ms(), state.gps_ts) < BARO_CAL_GPS_MAX_AGE_MS)
         if state.phase == protocol.PHASE_IDLE and gps_fresh:
             ref = altitude.sea_level_pressure_hpa(pressure, state.alt_m)
-            if state.qnh_hpa == 0:
+            if not state.qnh_gps_cal:
+                # First real fix: snap QNH to truth (replaces the seed/default)
+                # and re-seed the filter so the jump doesn't read as a climb.
                 state.qnh_hpa = ref
-                # Re-seed the filter to the GPS-corrected reference so the
-                # snap from the default QNH doesn't read as a climb spike.
+                state.qnh_gps_cal = True
                 vertical.alt = None
                 vertical.vrate = 0.0
-                print("Baro reference initialised: QNH %.1f hPa "
-                      "(GPS alt %.1f m)" % (ref, state.alt_m))
+                print("Baro QNH from GPS: %.1f hPa (alt %.1f m)"
+                      % (ref, state.alt_m))
             else:
                 state.qnh_hpa += BARO_CAL_ALPHA * (ref - state.qnh_hpa)
-        # Use the calibrated QNH once a GPS fix sets it; until then fall back to
-        # standard pressure so baro/climb still work (absolute alt is offset).
+        # Until a fix calibrates QNH, use the seed; absent any stored fix, fall
+        # back to standard pressure so baro/climb still work.
         qnh = state.qnh_hpa or BARO_QNH_DEFAULT_HPA
         raw_alt = altitude.pressure_to_altitude_m(pressure, qnh)
         vertical.predict(time.ticks_diff(now, last) / 1000.0)
@@ -533,6 +570,7 @@ async def gps_task(state):
     rtc = RTC()
     _pps_rtc = rtc
     Pin(config.GPS_PPS, Pin.IN).irq(trigger=Pin.IRQ_RISING, handler=_on_pps)
+    last_fix_save = None
     while True:
         line = await reader.readline()
         update = parse_nmea(line)
@@ -558,6 +596,15 @@ async def gps_task(state):
                 state.cable_length_m = rel["cable_length_m"]
                 state.winch_dist_m = rel["slant_m"]
                 state.elevation_deg = rel["elevation_deg"]
+            # Persist the field position/elevation (throttled, IDLE, confident
+            # 3D fix) so the next boot can seed QNH from the known elevation.
+            if (state.phase == protocol.PHASE_IDLE and state.gps_fix
+                    and state.gps_sats >= LAST_FIX_MIN_SATS
+                    and update["alt_m"] is not None
+                    and (last_fix_save is None or time.ticks_diff(
+                        time.ticks_ms(), last_fix_save) >= LAST_FIX_SAVE_S * 1000)):
+                _save_last_fix(state.lat, state.lon, state.alt_m)
+                last_fix_save = time.ticks_ms()
         elif update["type"] == "RMC":
             if update["speed_ms"] is not None:
                 state.ground_speed_ms = update["speed_ms"]
@@ -737,6 +784,22 @@ def _github_upload_raw(asset):
     return ok
 
 
+_HTTP_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def _parse_http_date(s):
+    # "Mon, 22 Jun 2026 20:43:21 GMT" -> (y, mo, d, h, mi, s) UTC, or None.
+    try:
+        p = s.split()
+        d, y = int(p[1]), int(p[3])
+        mo = _HTTP_MONTHS.index(p[2]) + 1
+        hh, mm, ss = (int(x) for x in p[4].split(":"))
+        return (y, mo, d, hh, mm, ss)
+    except (ValueError, IndexError, AttributeError):
+        return None
+
+
 def _assistnow_capture_identity():
     # Read the receiver's UBX-SEC-UNIQID + UBX-MON-VER (full frames, as hex) for
     # the one-time ZTP registration. Only needed before we have a chipcode and
@@ -852,22 +915,38 @@ def _assistnow_download(state):
         r = urequests.get(url)
         if r.status_code == 200:
             blob = r.content
+            hdrs = getattr(r, "headers", None)            # server "Date" = trusted now
+            srv = _parse_http_date(hdrs.get("Date")) if hdrs else None
             r.close()
             if blob:
                 with open(ASSISTNOW_PATH, "wb") as f:
                     f.write(blob)
-                t = time.localtime()
-                if state.time_synced and t[0] >= 2024:
+                # Coarse time aid + cache age-stamp. Prefer the server Date: it
+                # works even with no GPS fix yet, lets the predicted orbits be
+                # used immediately, and gives _assistnow_should_download a real
+                # 'now' so a fresh cache isn't needlessly re-downloaded. Fall
+                # back to the RTC if the header was missing.
+                src = None
+                if srv:
+                    gps_ini_time(board.gps_uart, srv, acc_s=4)
+                    try:
+                        with open(ASSISTNOW_TS_PATH, "w") as f:
+                            f.write(str(time.mktime(srv + (0, 0))))
+                        src = "srv"
+                    except (OSError, OverflowError):
+                        pass
+                elif state.time_synced and time.localtime()[0] >= 2024:
+                    gps_ini_time(board.gps_uart, time.localtime()[:6])
                     try:
                         with open(ASSISTNOW_TS_PATH, "w") as f:
                             f.write(str(time.time()))
+                        src = "rtc"
                     except OSError:
                         pass
-                    gps_ini_time(board.gps_uart, t[:6])
                 gc.collect()
                 gps_feed_mga(board.gps_uart, blob)
-                print("AssistNow: downloaded + fed %d B to GPS%s"
-                      % (len(blob), " (+time)" if state.time_synced else ""))
+                print("AssistNow: downloaded + fed %d B to GPS (%s time)"
+                      % (len(blob), src or "no"))
                 ok = True
         else:
             print("AssistNow: data HTTP %d" % r.status_code)

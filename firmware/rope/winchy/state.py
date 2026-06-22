@@ -37,7 +37,8 @@ class State:
         # Barometer
         self.pressure_hpa = 0.0
         self.baro_ts = 0
-        self.qnh_hpa = 0.0      # sea-level reference, GPS-calibrated; 0 = none
+        self.qnh_hpa = 0.0      # sea-level reference; 0 = none (then seed/default)
+        self.qnh_gps_cal = False  # True once a real GPS fix has set qnh_hpa
         self.baro_alt_m = 0.0   # altitude from pressure + qnh_hpa
         self.climb_rate_ms = 0.0  # vertical Kalman estimate
         # GPS
