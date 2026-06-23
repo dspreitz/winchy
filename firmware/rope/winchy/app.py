@@ -1137,10 +1137,11 @@ async def dashboard_task(state):
             elif state.time_synced:
                 _assistnow_done = True        # cache confirmed fresh
             # else: have a cache but no time yet -> re-check on a later loop
-        # Opportunistic GitHub upload (WiFi already up): only while IDLE + data.
+        # GitHub upload of raw.csv (WiFi up, IDLE): the periodic auto-offload
+        # plus a manual trigger from the dashboard "Upload log" button.
         if (GITHUB_TOKEN and wlan.isconnected()
                 and state.phase == protocol.PHASE_IDLE
-                and n and n % WIFI_PERIOD_S == 0):
+                and (state.upload_request or (n and n % WIFI_PERIOD_S == 0))):
             try:
                 size = os.stat(RAW_LOG_PATH)[6]
             except OSError:
@@ -1150,6 +1151,7 @@ async def dashboard_task(state):
                 asset = (stamp + "_" if stamp else "") + GITHUB_ASSET
                 if _github_upload_raw(asset):
                     state.raw_uploaded_bytes = size
+            state.upload_request = False   # clear the manual request once handled
         n += 1
         await asyncio.sleep_ms(1000)
 

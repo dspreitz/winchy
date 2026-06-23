@@ -178,6 +178,7 @@ uploading = False   # True while a blocking GitHub round-trip runs: the OLED
                     # shows an upload notice and the IRQ telemetry redraw is
                     # suppressed, so the notice stays put through the freeze and
                     # the operator knows the pause is expected (not a crash).
+_upload_request = False   # dashboard "Upload log" button -> picked up by _serve
 
 
 def _begin_upload(what):
@@ -699,8 +700,12 @@ body{font-family:sans-serif;background:#111;color:#eee;margin:0;text-align:cente
 <div class=cell><div class=lbl>BATT</div><div id=batt class=big>--</div><div id=battsub class=lbl>--</div></div></div>
 <div id=link class=lbl>link --</div>
 <div id=winch class=lbl>winch GPS --</div>
+<button id=ulbtn onclick=ul() style="font-size:5vw;padding:12px;margin:8px 2px;width:96%;background:#235;color:#eee;border:1px solid #8ac;border-radius:6px">Upload log to GitHub</button>
+<div id=ulmsg class=lbl>&nbsp;</div>
 <script>
-var last=Date.now();
+var last=Date.now();var wasup=false;
+function ul(){ulmsg.textContent='requested...';
+ fetch('/upload',{method:'POST'}).then(function(r){return r.text()}).then(function(t){ulmsg.textContent=t;}).catch(function(e){ulmsg.textContent='error';});}
 function tick(){
  fetch('/data').then(function(r){return r.json()}).then(function(d){
   last=Date.now();document.body.className='';
@@ -717,6 +722,8 @@ function tick(){
   gpsdot.style.background=d.gps?'#1c1':'#c33';
   tdot.style.background=d.tsync?'#1c1':'#c33';
   clock.textContent=d.time+' UTC';
+  if(d.upreq){ulmsg.textContent='uploading...';wasup=true;}
+  else if(wasup){ulmsg.textContent='upload done';wasup=false;}
  }).catch(function(e){});
  if(Date.now()-last>3000){document.body.className='stale';
   gpsdot.style.background='#555';tdot.style.background='#555';}
@@ -726,6 +733,7 @@ setInterval(tick,500);tick();
 
 
 async def handle(reader, writer):
+    global _upload_request
     try:
         req = await reader.readline()
         while True:                       # drain request headers
@@ -734,9 +742,15 @@ async def handle(reader, writer):
                 break
         path = req.split(b" ")[1] if b" " in req else b"/"
         if path.startswith(b"/data"):
+            d = dict(latest)
+            d["upreq"] = _upload_request
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
                          b"Connection: close\r\n\r\n")
-            writer.write(json.dumps(latest).encode())
+            writer.write(json.dumps(d).encode())
+        elif path.startswith(b"/upload"):  # manual log upload (picked up by _serve)
+            _upload_request = True
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+                         b"Connection: close\r\n\r\nupload queued")
         elif path.startswith(b"/log"):   # serve the flash log for offload
             try:
                 body = open(LOG_PATH, "rb").read()
@@ -803,7 +817,7 @@ async def _serve():
         wlan.active(True)
     else:
         print("WiFi: disabled or no secrets.py; dashboard off")
-    global log_start, online
+    global log_start, online, _upload_request
     n = 0
     while True:                           # keep-alive + WiFi upkeep + flush
         _flush_log()
@@ -850,9 +864,11 @@ async def _serve():
                 online = await _internet_ok()
         else:
             online = False
-        # Periodic GitHub offload, only while connected, with data, not mid-launch.
-        if (GITHUB_TOKEN and not busy and n and n % UPLOAD_PERIOD_S == 0
-                and wlan is not None and wlan.isconnected()):
+        # GitHub offload: periodic auto + manual dashboard "Upload log" trigger.
+        # Only while connected, with data, and not mid-launch (held off if busy;
+        # a manual request stays pending until the launch ends).
+        if (GITHUB_TOKEN and not busy and wlan is not None and wlan.isconnected()
+                and (_upload_request or (n and n % UPLOAD_PERIOD_S == 0))):
             try:                          # only if there are rows to offload
                 has_data = os.stat(LOG_PATH)[6] > len(LOG_HEADER)
             except OSError:
@@ -863,6 +879,7 @@ async def _serve():
                 if up:
                     _reset_log(up)        # reclaim flash after a good upload
                 _end_upload()
+            _upload_request = False       # clear the manual request once handled
         n += 1
         await asyncio.sleep_ms(1000)
 

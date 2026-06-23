@@ -35,6 +35,7 @@ def _data(s):
         "txdbm": s.tx_power_dbm, "rssi": s.link_rssi_dbm,
         "snr": s.link_snr_db, "loss": s.link_loss_pct,
         "tsync": s.time_synced, "rec": s.raw_recording,
+        "upreq": s.upload_request,
     }
 
 
@@ -66,8 +67,12 @@ td.l{color:#8ac;width:46%}
 <tr><td class=l>Link (winch)</td><td id=link>--</td></tr>
 <tr><td class=l>Logging</td><td id=rec>--</td></tr>
 </table>
+<button id=ulbtn onclick=ul() style="font-size:5vw;padding:12px;margin:8px 2px;width:97%;background:#235;color:#eee;border:1px solid #8ac;border-radius:6px">Upload log to GitHub</button>
+<div id=ulmsg style="font-size:4vw;color:#8ac;padding:2px 6px">&nbsp;</div>
 <script>
-var last=Date.now();
+var last=Date.now();var wasup=false;
+function ul(){ulmsg.textContent='requested...';
+ fetch('/upload',{method:'POST'}).then(function(r){return r.text()}).then(function(t){ulmsg.textContent=t;}).catch(function(e){ulmsg.textContent='error';});}
 function f(x,n){return (x==null)?'--':x.toFixed(n);}
 function tick(){
  fetch('/data').then(function(r){return r.json()}).then(function(d){
@@ -87,6 +92,8 @@ function tick(){
   tx.textContent=d.txdbm+' dBm';
   link.textContent=d.rssi+' dBm  snr '+d.snr+'  loss '+d.loss+'%';
   rec.textContent=(d.rec?'recording':'idle')+(d.tsync?'':'  (no time)');
+  if(d.upreq){ulmsg.textContent='uploading...';wasup=true;}
+  else if(wasup){ulmsg.textContent='upload done';wasup=false;}
  }).catch(function(e){});
  if(Date.now()-last>3000) document.body.className='stale';
 }
@@ -106,6 +113,11 @@ async def handle(reader, writer):
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
                          b"Connection: close\r\n\r\n")
             writer.write(json.dumps(_data(state)).encode())
+        elif path.startswith(b"/upload"):  # manual log upload (picked up by app)
+            if state is not None:
+                state.upload_request = True
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+                         b"Connection: close\r\n\r\nupload queued")
         elif path.startswith(b"/raw"):    # download the raw log
             try:
                 body = open("raw.csv", "rb").read()

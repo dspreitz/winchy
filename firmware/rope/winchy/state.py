@@ -55,6 +55,7 @@ class State:
         self.raw_uploaded_bytes = 0  # >0 = raw.csv offloaded; writer resets it
         self.raw_q = []          # pending raw-log lines; drained by raw_writer_task
         self.raw_recording = False   # imu_task is mid-episode (gates the reset)
+        self.upload_request = False  # dashboard "Upload log" button -> wifi task
         # Power
         self.system_mv = 0
         self.batt_mv = 0
