@@ -849,4 +849,32 @@ async def _main():
     await _serve()
 
 
-asyncio.run(_main())
+# Crash guard (mirrors the rope's main.py): on an unexpected crash, log the
+# traceback to crash.log and self-heal by resetting after an interruptible
+# countdown, so a fielded winch can't be left dead - and so the traceback is
+# captured for a post-mortem instead of scrolling off the serial. A deliberate
+# Ctrl-C drops to the REPL.
+import sys
+import machine
+
+CRASH_RESET_DELAY_S = 10
+
+try:
+    asyncio.run(_main())
+except KeyboardInterrupt:
+    print("Application interrupted, dropping to REPL")
+except Exception as e:
+    sys.print_exception(e)
+    try:
+        with open("crash.log", "w") as f:
+            sys.print_exception(e, f)
+    except OSError:
+        pass
+    try:
+        print("Application crashed (traceback in crash.log). Resetting in "
+              "%ds - Ctrl-C for REPL." % CRASH_RESET_DELAY_S)
+        for _ in range(CRASH_RESET_DELAY_S):
+            time.sleep(1)
+        machine.reset()
+    except KeyboardInterrupt:
+        print("Auto-reset cancelled, dropping to REPL")
