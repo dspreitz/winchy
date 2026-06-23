@@ -138,6 +138,12 @@ GITHUB_RELEASE_TAG = "logs"
 GITHUB_ASSET = "winch_rxlog.csv"
 UPLOAD_PERIOD_S = 600       # interim: re-upload every 10 min while on WiFi
                             # (later: trigger once per launch via phase detection)
+# Blocking GitHub round-trips (log upload, IP announce) stall the single-thread
+# asyncio loop for seconds; never run them while a launch is active or the live
+# OLED/dashboard would freeze mid-launch (roadmap #12). "Active" = recent
+# telemetry with the glider moving faster than ground-handling. The phase stays
+# IDLE until the phase machine exists, so received glider speed is the signal.
+UPLOAD_PAUSE_SPEED_MS = 8   # >~29 km/h received glider speed = launch -> hold off
 try:
     from secrets import GITHUB_TOKEN
 except ImportError:
@@ -166,6 +172,32 @@ def _survey_fields():
 clock_set = False           # is the winch RTC set (from its own GPS+PPS)?
 log_start = None            # "yyyymmdd-hhmm" session start, latched once synced
 online = False              # winchy-logs (GitHub) currently reachable? -> OLED "I"
+
+
+uploading = False   # True while a blocking GitHub round-trip runs: the OLED
+                    # shows an upload notice and the IRQ telemetry redraw is
+                    # suppressed, so the notice stays put through the freeze and
+                    # the operator knows the pause is expected (not a crash).
+
+
+def _begin_upload(what):
+    global uploading
+    uploading = True
+    try:
+        display.fill(0)
+        display.text("WiFi upload:", 0, 8)
+        display.text(what, 0, 24)
+        display.text("display pauses", 0, 44)
+        display.text("back shortly...", 0, 54)
+        display.show()
+    except Exception:
+        pass
+
+
+def _end_upload():
+    # Normal screen behaviour resumes on the next telemetry / survey redraw.
+    global uploading
+    uploading = False
 
 
 def show_telemetry(msg):
@@ -636,7 +668,8 @@ def on_receive(events):
                   "rx": received, "lost": lost}
         latest.update(_survey_fields())
         print("[RX]", msg)
-        show_telemetry(msg)
+        if not uploading:           # keep the upload notice on screen if busy
+            show_telemetry(msg)
         if msg["flags"] & protocol.FLAG_REQUEST_REPORT:
             send_link_report()
     else:
@@ -786,20 +819,29 @@ async def _serve():
                 if not server_started:    # bind once; survives later rejoins
                     await asyncio.start_server(handle, "0.0.0.0", 80)
                     server_started = True
+                _begin_upload("time sync")
                 _aid_fetch_time()         # one-shot UTC for GPS time aiding
+                _end_upload()
             else:
                 print("WiFi: no known network in range; will retry")
+        # Hold off blocking GitHub round-trips while a launch is active, so the
+        # live OLED/dashboard never freezes mid-launch (roadmap #12).
+        busy = (time.ticks_diff(time.ticks_ms(), last_rx_ms) < 3000
+                and latest.get("speed", 0) >= UPLOAD_PAUSE_SPEED_MS)
         # Announce our IP as a tappable dashboard link in the release body, so
         # the winch is findable on any subnet. On IP change only (no API spam).
-        if (GITHUB_TOKEN and wlan is not None and wlan.isconnected()):
+        if (GITHUB_TOKEN and not busy
+                and wlan is not None and wlan.isconnected()):
             cur = wlan.ifconfig()[0]
             if cur and cur != "0.0.0.0" and cur != announced_ip:
                 try:
                     ssid = wlan.config("essid")
                 except Exception:
                     ssid = "?"
+                _begin_upload("IP announce")
                 if _github_announce_ip(cur, ssid):
                     announced_ip = cur
+                _end_upload()
         # winchy-logs reachability for the OLED "I": only when WiFi is up and a
         # token exists, probed against GitHub every WIFI_PROBE_S (so a hotspot
         # with no real internet shows no "I").
@@ -808,17 +850,19 @@ async def _serve():
                 online = await _internet_ok()
         else:
             online = False
-        # Periodic GitHub offload, only while connected and with data to send.
-        if (GITHUB_TOKEN and n and n % UPLOAD_PERIOD_S == 0
+        # Periodic GitHub offload, only while connected, with data, not mid-launch.
+        if (GITHUB_TOKEN and not busy and n and n % UPLOAD_PERIOD_S == 0
                 and wlan is not None and wlan.isconnected()):
             try:                          # only if there are rows to offload
                 has_data = os.stat(LOG_PATH)[6] > len(LOG_HEADER)
             except OSError:
                 has_data = False
             if has_data:
+                _begin_upload("log upload")
                 up = _github_upload()     # interim periodic; later: per launch
                 if up:
                     _reset_log(up)        # reclaim flash after a good upload
+                _end_upload()
         n += 1
         await asyncio.sleep_ms(1000)
 
