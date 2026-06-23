@@ -81,6 +81,11 @@ def init_power():
 
     pmu.setPowerKeyPressOffTime(pmu.XPOWERS_POWEROFF_6S)
     pmu.setPowerKeyPressOnTime(pmu.XPOWERS_POWERON_2S)
+    # Long-press the power key turns the rope OFF (not restart). app.py's
+    # button_task catches the long-press IRQ to switch the charging LED off
+    # first; this AXP2101 hardware auto-off is the fallback if that task is dead.
+    pmu.setLongPressPowerOFF()
+    pmu.enableLongPressShutdown()
 
     # No battery temperature sensor fitted; leaving TS measurement on
     # disturbs charging.
@@ -89,7 +94,7 @@ def init_power():
     pmu.enableVbusVoltageMeasure()
     pmu.enableBattVoltageMeasure()
     pmu.enableSystemVoltageMeasure()
-    pmu.setChargingLedMode(pmu.XPOWERS_CHG_LED_OFF)
+    pmu.setChargingLedMode(pmu.XPOWERS_CHG_LED_ON)  # steady on = rope powered on
 
     # Charge the GPS backup-domain cell/supercap on the AXP2101 VRTC rail so the
     # u-blox keeps its ephemeris/almanac/time/last-fix across power cycles ->

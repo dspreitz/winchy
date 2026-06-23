@@ -50,12 +50,16 @@ class QMI8658:
             time.sleep_ms(10)
         if who != _WHO_AM_I_VALUE:
             raise RuntimeError("QMI8658 not found (WHO_AM_I=0x%02x)" % who)
-        # Same register configuration as the original monolith.
+        # CTRL2/3 set ODR 250 Hz (was 31.25) and clear the stray self-test bits;
+        # CTRL5 widens the low-pass to ~9 Hz (mode 01 = 3.59% of ODR, was 0.82 Hz
+        # = 2.62% of 31.25 Hz) so rotation-rate / oscillation dynamics aren't
+        # smoothed away. ~9 Hz stays under Nyquist at the current ~21 Hz read
+        # loop; raising the read rate (then a wider LPF) is a future action.
         self._write(_REG_CTRL1, 0b00100000)
-        self._write(_REG_CTRL2, 0b10001000)
-        self._write(_REG_CTRL3, 0b11001000)
-        self._write(_REG_CTRL7, 0b10000011)
-        self._write(_REG_CTRL5, 0b00011001)
+        self._write(_REG_CTRL2, 0x05)   # accel: +/-2g, 250 Hz ODR, self-test off
+        self._write(_REG_CTRL3, 0x45)   # gyro:  +/-256 dps, 250 Hz ODR, self-test off
+        self._write(_REG_CTRL7, 0b10000011)  # accel + gyro enabled
+        self._write(_REG_CTRL5, 0x33)   # LPF on, mode 01 = 3.59% of ODR (~9 Hz)
 
     def _read(self, reg, length=1):
         self._cs.value(0)

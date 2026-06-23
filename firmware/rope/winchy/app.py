@@ -80,6 +80,7 @@ REPORT_WINDOW_MS = 150      # extra RX dwell after a request so the winch's
                             # at SF7, incl. the winch OLED update)
 DISPLAY_PERIOD_MS = 500
 SUPERVISOR_PERIOD_MS = 5000
+BUTTON_POLL_MS = 300        # power-key long-press poll (off via long press)
 
 # Low-battery warning (rope cell terminal voltage from the AXP2101, mV).
 # Checked only while IDLE; hysteresis avoids flicker near the threshold.
@@ -128,7 +129,7 @@ RAW_LOG_HEADER = ("# boot\n# t_ms,utc_ms,ax,ay,az,gx,gy,gz,mx,my,mz,force,"
 # launch is captured; once the unit has been at rest RAW_LOG_REST_HOLD_S, the
 # segment is closed. Set RAW_LOG_MOTION_GATED False to log everything (e.g. a
 # dedicated full-rate Kalman-validation capture).
-RAW_LOG_MOTION_GATED = True
+RAW_LOG_MOTION_GATED = True   # only log around movement; False = log everything
 RAW_LOG_PREROLL_S = 5       # rolling pre-roll captured before motion starts
 RAW_LOG_REST_HOLD_S = 5     # continuous rest this long closes a segment
 MOTION_ACCEL_DEV_G = 0.10   # |norm-1g| over this = moving (rest <= 0.04)
@@ -553,8 +554,16 @@ def _on_pps(pin):
 
 def _pps_arm_next(y, mo, d, h, mi, s):
     # Arm the RTC for the NEXT whole second (the upcoming PPS edge), UTC.
+    # Guard a glitched GPS date: time.mktime() overflows a 32-bit machine word
+    # for years beyond ~2068, which used to crash gps_task (crash-guard reset
+    # loop). Reject implausible dates and never let a bad fix take the unit down.
     global _pps_armed
-    nxt = time.gmtime(time.mktime((y, mo, d, h, mi, s, 0, 0)) + 1)
+    if not (2024 <= y <= 2050 and 1 <= mo <= 12 and 1 <= d <= 31):
+        return
+    try:
+        nxt = time.gmtime(time.mktime((y, mo, d, h, mi, s, 0, 0)) + 1)
+    except (OverflowError, ValueError):
+        return
     _pps_armed = (nxt[0], nxt[1], nxt[2], nxt[6], nxt[3], nxt[4], nxt[5], 0)
 
 
@@ -762,6 +771,23 @@ async def supervisor_task(pmu, state):
         if state.time_synced and state.log_start is None:
             state.log_start = _log_stamp()
         await asyncio.sleep_ms(SUPERVISOR_PERIOD_MS)
+
+
+async def button_task(pmu):
+    # Long-press the AXP2101 power key -> turn the rope off. Handled in software
+    # (polling the latched PKEY long-press IRQ) so the charging LED is switched
+    # off *before* shutdown - LED on = rope on, off = rope off. board.py also
+    # enables the hardware long-press auto-off as a fallback if this task dies.
+    while True:
+        await asyncio.sleep_ms(BUTTON_POLL_MS)
+        try:
+            pmu.getIrqStatus()              # refresh the latched IRQ flags
+            if pmu.isPekeyLongPressIrq():
+                pmu.setChargingLedMode(pmu.XPOWERS_CHG_LED_OFF)
+                pmu.clearIrqStatus()
+                pmu.shutdown()             # power the whole system off
+        except Exception:
+            pass
 
 
 def _log_stamp():
@@ -1094,6 +1120,7 @@ async def _main(pmu, adc, imu, baro, sx, display, state, gyro_bias, mag):
         gps_task(state),
         telemetry_task(sx, state),
         supervisor_task(pmu, state),
+        button_task(pmu),
     ]
     if display:
         tasks.append(display_task(display, state))

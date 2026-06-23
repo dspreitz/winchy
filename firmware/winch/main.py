@@ -449,8 +449,16 @@ def _on_pps(pin):
 
 def _pps_arm_next(y, mo, d, h, mi, s):
     # Arm the RTC for the NEXT whole second (the upcoming PPS edge), UTC.
+    # Guard a glitched GPS date: time.mktime() overflows a 32-bit machine word
+    # for years beyond ~2068, which crash-looped the unit (crash-guard reset).
+    # Reject implausible dates and never let a bad fix take the unit down.
     global _pps_armed
-    nxt = time.gmtime(time.mktime((y, mo, d, h, mi, s, 0, 0)) + 1)
+    if not (2024 <= y <= 2050 and 1 <= mo <= 12 and 1 <= d <= 31):
+        return
+    try:
+        nxt = time.gmtime(time.mktime((y, mo, d, h, mi, s, 0, 0)) + 1)
+    except (OverflowError, ValueError):
+        return
     _pps_armed = (nxt[0], nxt[1], nxt[2], nxt[6], nxt[3], nxt[4], nxt[5], 0)
 
 
