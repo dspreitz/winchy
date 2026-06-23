@@ -514,6 +514,45 @@ def _github_upload():
     return uploaded
 
 
+def _github_announce_ip(ip, ssid):
+    # Publish a TAPPABLE dashboard link in the winchy-logs release description.
+    # The release page renders the body as markdown, so on the phone you open
+    # the release and tap the IP -> http://<ip>/ opens the winch dashboard. Each
+    # segment owns one line ("rope:"/"winch:"); read-merge-write so we don't
+    # clobber the rope's line. Called on join / IP change (rare).
+    if not GITHUB_TOKEN:
+        return False
+    import urequests
+    import gc
+    hdr = {"Authorization": "Bearer " + GITHUB_TOKEN, "User-Agent": "winchy",
+           "Accept": "application/vnd.github+json"}
+    line = "winch: [http://%s/](http://%s/) (%s, %s)" % (
+        ip, ip, ssid, _stamp() or "?")
+    ok = False
+    try:
+        r = urequests.get("https://api.github.com/repos/%s/releases/tags/%s"
+                          % (GITHUB_REPO, GITHUB_RELEASE_TAG), headers=hdr)
+        rel = r.json()
+        r.close()
+        rid = rel["id"]
+        body = rel.get("body") or ""
+        keep = [ln for ln in body.split("\n")
+                if ln.strip() and not ln.startswith("winch:")]
+        keep.append(line)
+        gc.collect()
+        u = urequests.request(
+            "PATCH", "https://api.github.com/repos/%s/releases/%d"
+            % (GITHUB_REPO, rid),
+            data=json.dumps({"body": "\n".join(sorted(keep))}), headers=hdr)
+        ok = 200 <= u.status_code < 300
+        print("IP announce %s (%s): HTTP %d" % (ip, ssid, u.status_code))
+        u.close()
+    except Exception as e:
+        print("IP announce failed:", e)
+    gc.collect()
+    return ok
+
+
 def _reset_log(uploaded):
     # Reclaim flash after a successful offload, but only if nothing new was
     # flushed since (else keep the rows for the next upload). IRQ-buffered rows
@@ -721,6 +760,7 @@ async def _serve():
     # rejoins / IP changes).
     wlan = None
     server_started = False
+    announced_ip = None
     if WIFI_ENABLED and WIFI_NETWORKS:
         try:                              # MUST precede active(True) so mDNS
             network.hostname(WIFI_HOSTNAME)   # advertises <name>.local
@@ -749,6 +789,17 @@ async def _serve():
                 _aid_fetch_time()         # one-shot UTC for GPS time aiding
             else:
                 print("WiFi: no known network in range; will retry")
+        # Announce our IP as a tappable dashboard link in the release body, so
+        # the winch is findable on any subnet. On IP change only (no API spam).
+        if (GITHUB_TOKEN and wlan is not None and wlan.isconnected()):
+            cur = wlan.ifconfig()[0]
+            if cur and cur != "0.0.0.0" and cur != announced_ip:
+                try:
+                    ssid = wlan.config("essid")
+                except Exception:
+                    ssid = "?"
+                if _github_announce_ip(cur, ssid):
+                    announced_ip = cur
         # winchy-logs reachability for the OLED "I": only when WiFi is up and a
         # token exists, probed against GitHub every WIFI_PROBE_S (so a hotspot
         # with no real internet shows no "I").

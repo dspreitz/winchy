@@ -834,6 +834,43 @@ def _github_upload_raw(asset):
     return ok
 
 
+def _github_announce_ip(ip, ssid, tag="rope"):
+    # Publish a TAPPABLE dashboard link in the winchy-logs release description.
+    # The release page renders the body as markdown, so on the phone you open
+    # the release and tap the IP -> http://<ip>/ opens the dashboard. Each
+    # segment owns one line ("rope: ..."/"winch: ..."); read-merge-write so we
+    # don't clobber the other's line. Called on join / IP change (rare).
+    import urequests
+    import json as _json
+    hdr = {"Authorization": "Bearer " + GITHUB_TOKEN, "User-Agent": "winchy",
+           "Accept": "application/vnd.github+json"}
+    line = "%s: [http://%s/](http://%s/) (%s, %s)" % (
+        tag, ip, ip, ssid, _log_stamp() or "?")
+    ok = False
+    try:
+        r = urequests.get("https://api.github.com/repos/%s/releases/tags/%s"
+                          % (GITHUB_REPO, GITHUB_RELEASE_TAG), headers=hdr)
+        rel = r.json()
+        r.close()
+        rid = rel["id"]
+        body = rel.get("body") or ""
+        keep = [ln for ln in body.split("\n")
+                if ln.strip() and not ln.startswith(tag + ":")]
+        keep.append(line)
+        gc.collect()
+        u = urequests.request(
+            "PATCH", "https://api.github.com/repos/%s/releases/%d"
+            % (GITHUB_REPO, rid),
+            data=_json.dumps({"body": "\n".join(sorted(keep))}), headers=hdr)
+        ok = 200 <= u.status_code < 300
+        print("IP announce %s (%s): HTTP %d" % (ip, ssid, u.status_code))
+        u.close()
+    except Exception as e:
+        print("IP announce failed:", e)
+    gc.collect()
+    return ok
+
+
 _HTTP_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
@@ -1065,6 +1102,7 @@ async def dashboard_task(state):
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
     server_started = False
+    announced_ip = None
     n = 0
     while True:
         if not wlan.isconnected() and n % 30 == 0:   # (re)join when down
@@ -1076,6 +1114,18 @@ async def dashboard_task(state):
                 if not server_started:
                     await asyncio.start_server(dashboard.handle, "0.0.0.0", 80)
                     server_started = True
+        # Announce our IP as a tappable dashboard link in the winchy-logs
+        # release body, so it's findable on any subnet. On IP change only.
+        if (GITHUB_TOKEN and wlan.isconnected()
+                and state.phase == protocol.PHASE_IDLE):
+            cur = wlan.ifconfig()[0]
+            if cur and cur != "0.0.0.0" and cur != announced_ip:
+                try:
+                    ssid = wlan.config("essid")
+                except Exception:
+                    ssid = "?"
+                if _github_announce_ip(cur, ssid, "rope"):
+                    announced_ip = cur
         # Opportunistic AssistNow Predictive Orbits: while IDLE + online, fetch
         # predicted orbits and feed them to the GPS (cached for the next cold
         # start). First call also does the one-time ZTP registration.
