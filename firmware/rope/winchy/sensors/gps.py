@@ -70,6 +70,12 @@ def set_baud(uart, baud):
 # 0x3.. = U2, 0x2.. = U1/E1. NMEA message output is per (id, port).
 _CFG_RATE_MEAS = 0x30210001          # U2, ms between measurements
 _CFG_RATE_NAV = 0x30210002           # U2, measurements per nav solution
+_CFG_DYNMODEL = 0x20110021           # E1, navigation dynamic model
+_CFG_SIG_GPS = 0x1031001F            # L, GPS enable
+_CFG_SIG_SBAS = 0x10310020           # L, SBAS (EGNOS) enable
+_CFG_SIG_GAL = 0x10310021            # L, Galileo enable
+_CFG_SIG_BDS = 0x10310022            # L, BeiDou enable
+_DYN_AIRBORNE_2G = 7                 # allow launch dynamics (climb + accel)
 _CFG_MSGOUT_UART1 = (                # (NMEA id key on UART1, keep on?)
     (0x209100BB, True),              # GGA
     (0x209100AC, True),              # RMC
@@ -107,6 +113,17 @@ def configure(uart, rate_hz=5):
              (_CFG_RATE_NAV, (1).to_bytes(2, "little"))]
     for key, keep in _CFG_MSGOUT_UART1:
         items.append((key, b"\x01" if keep else b"\x00"))
+    # Airborne dynamic model: the rope rides a winch launch (hard acceleration,
+    # fast climb through rotation), so the default 'portable' model would smooth
+    # away exactly the dynamics we want. Pin the multi-GNSS + SBAS set too
+    # (already the M10 default here: GPS + Galileo + BeiDou + EGNOS) so it is
+    # guaranteed and documented; GLONASS is left off - the M10 concurrent-GNSS
+    # budget is better spent on Galileo+BeiDou for Europe.
+    items.append((_CFG_DYNMODEL, bytes((_DYN_AIRBORNE_2G,))))
+    items.append((_CFG_SIG_GPS, b"\x01"))
+    items.append((_CFG_SIG_SBAS, b"\x01"))
+    items.append((_CFG_SIG_GAL, b"\x01"))
+    items.append((_CFG_SIG_BDS, b"\x01"))
     uart.write(_valset(0x03, items))     # layers: RAM | BBR (no flash wear)
     time.sleep_ms(50)
 
