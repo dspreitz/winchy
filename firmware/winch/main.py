@@ -313,6 +313,24 @@ def _aid_ubx(cls, mid, payload):
     return b"\xb5\x62" + body + bytes((a, b))
 
 
+def _gps_configure():
+    # Tell the parked u-blox 7 it is a fixed base: Stationary dynamic model +
+    # static hold, so it applies strong position filtering instead of the
+    # default 'portable' model that let the fix jump ~520 m (field test
+    # 2026-06-24). Saved to BBR+Flash so it persists independently too. The chip
+    # has no hardware Survey-In (CFG-TMODE2 NAKs), so the software survey-in
+    # still owns convergence; this just feeds it much steadier fixes.
+    # CFG-NAV5 mask 0x0041 = apply dynModel (0x01) + staticHold (0x40).
+    nav5 = struct.pack("<HBBiIbBHHHHBBBBHHB5s",
+                       0x0041, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                       50, 0, 0, 0, 0, 20, 0, b"\x00" * 5)
+    gps_uart.write(_aid_ubx(0x06, 0x24, nav5))     # CFG-NAV5: stationary
+    time.sleep_ms(80)
+    gps_uart.write(_aid_ubx(0x06, 0x09,            # CFG-CFG: save to BBR+Flash
+                            struct.pack("<IIIB", 0, 0x0000FFFF, 0, 0x17)))
+    print("GPS: Stationary dynamic model + static hold set")
+
+
 def _aid_ini(lat=None, lon=None, alt_m=0.0, week=None, tow_ms=0):
     # UBX-AID-INI (0x0B 0x01): position (lat/lon 1e-7 deg, alt cm) and/or time
     # (GPS week + TOW ms). flags: 0x01 pos, 0x20 lla(geodetic), 0x02 time.
@@ -411,6 +429,7 @@ async def _gps_task():
     global _aided_time, _aid_save_ms
     _pps_rtc = RTC()
     Pin(GPS_PPS_PIN, Pin.IN).irq(trigger=Pin.IRQ_RISING, handler=_on_pps)
+    _gps_configure()                          # fixed-base GPS config (stable fix)
     last_send = time.ticks_ms()
     pos = _load_aid()                         # cached last-known position
     if pos is not None:                       # inject it now for a fast fix
