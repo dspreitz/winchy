@@ -326,9 +326,16 @@ def _gps_configure():
                        50, 0, 0, 0, 0, 20, 0, b"\x00" * 5)
     gps_uart.write(_aid_ubx(0x06, 0x24, nav5))     # CFG-NAV5: stationary
     time.sleep_ms(80)
+    # CFG-SBAS: keep SBAS/EGNOS on with range + differential corrections. SBAS
+    # is the available augmentation here: this module's RF is GPS-only (a
+    # NEO-7M), so enabling GLONASS is NAKed - full multi-GNSS waits for the M10
+    # winch GPS.
+    gps_uart.write(_aid_ubx(0x06, 0x16,
+                            bytes([0x01, 0x03, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00])))
+    time.sleep_ms(80)
     gps_uart.write(_aid_ubx(0x06, 0x09,            # CFG-CFG: save to BBR+Flash
                             struct.pack("<IIIB", 0, 0x0000FFFF, 0, 0x17)))
-    print("GPS: Stationary dynamic model + static hold set")
+    print("GPS: Stationary model + static hold + SBAS set")
 
 
 def _aid_ini(lat=None, lon=None, alt_m=0.0, week=None, tow_ms=0):
