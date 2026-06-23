@@ -167,9 +167,11 @@ def _survey_fields():
             "wlon": round(survey.lon, 6) if survey.lon is not None else None,
             "wacc": None if acc == float("inf") else round(acc, 1)}
 
-# Winch RTC: set from the winch's own GPS+PPS (the exact UTC second boundary).
-# No NTP and no time-over-radio any more - both segments keep their own GPS time.
-clock_set = False           # is the winch RTC set (from its own GPS+PPS)?
+# Winch RTC: set from whichever clock is ready first at start-up - NTP over WiFi
+# (in _aid_fetch_time) or the winch's own GPS+PPS. GPS+PPS is preferred (exact
+# UTC second boundary) and overrides an earlier NTP set once it locks.
+clock_set = False           # is the winch RTC set (from any source)?
+gps_synced = False          # has GPS+PPS set the RTC? (preferred; gates NTP)
 log_start = None            # "yyyymmdd-hhmm" session start, latched once synced
 online = False              # winchy-logs (GitHub) currently reachable? -> OLED "I"
 
@@ -364,40 +366,48 @@ def _parse_http_date(s):
 
 
 def _aid_fetch_time():
-    # One-shot: UTC for GPS time aiding (the winch RTC is cold until a fix, so
-    # the internet is the only pre-fix clock). NTP first (accurate, no auth);
-    # HTTP Date as a fallback if NTP/UDP is blocked. Does NOT set the RTC - that
-    # stays GPS+PPS-disciplined; this only seeds the receiver's time aid.
-    global _aid_utc
+    # One-shot: UTC for GPS time aiding AND to set the winch RTC from whatever
+    # clock is available first at start-up - if NTP is up before a GPS fix, use
+    # it so log timestamps start immediately; GPS+PPS is preferred and overrides
+    # this once it locks (gps_synced gate). NTP first (accurate, no auth), HTTP
+    # Date fallback if NTP/UDP is blocked.
+    global _aid_utc, clock_set
     if _aid_utc is not None:
         return
+    t = None
+    src = "?"
     try:
         import ntptime
-        _aid_utc = time.gmtime(ntptime.time())[:6]
-        print("GPS aiding: NTP UTC", _aid_utc)
+        t = time.gmtime(ntptime.time())[:6]
+        src = "NTP"
+    except Exception as e:
+        print("NTP failed, trying HTTP Date:", e)
+        import urequests
+        try:
+            r = urequests.get("https://api.github.com",
+                              headers={"User-Agent": "winchy"})
+            d = r.headers.get("Date") if getattr(r, "headers", None) else None
+            r.close()
+            t = _parse_http_date(d)
+            src = "HTTP"
+        except Exception as e:
+            print("HTTP date failed:", e)
+    if not t:
         return
-    except Exception as e:
-        print("aid NTP failed, trying HTTP Date:", e)
-    import urequests
-    try:
-        # User-Agent required or GitHub 403s (and the 403 carries no Date).
-        r = urequests.get("https://api.github.com",
-                          headers={"User-Agent": "winchy"})
-        d = r.headers.get("Date") if getattr(r, "headers", None) else None
-        r.close()
-        t = _parse_http_date(d)
-        if t:
-            _aid_utc = t
-            print("GPS aiding: HTTP UTC", t)
-    except Exception as e:
-        print("aid HTTP date failed:", e)
+    _aid_utc = t
+    print("GPS aiding: %s UTC %s" % (src, t))
+    if not gps_synced:        # set the RTC now; GPS+PPS overrides when it locks
+        y, mo, d, h, mi, s = t
+        RTC().datetime((y, mo, d, 0, h, mi, s, 0))
+        clock_set = True
+        print("Winch RTC set from %s (no GPS fix yet)" % src)
 
 
 async def _gps_task():
     # Drain NMEA, feed the survey-in, periodically send WINCH_POS, and own the
     # OLED when the rope link is idle. RX/TX of the LoRa link is unaffected
     # (it is IRQ-driven); this only shares the radio for the low-rate send.
-    global gps_sats, gps_has_fix, _gps_buf, _pps_rtc, clock_set
+    global gps_sats, gps_has_fix, _gps_buf, _pps_rtc, clock_set, gps_synced
     global _aided_time, _aid_save_ms
     _pps_rtc = RTC()
     Pin(GPS_PPS_PIN, Pin.IN).irq(trigger=Pin.IRQ_RISING, handler=_on_pps)
@@ -425,11 +435,12 @@ async def _gps_task():
                         survey.add(m["lat"], m["lon"], m["alt_m"] or 0.0)
                 elif m["type"] == "RMC" and m["datetime"]:
                     y, mo, d, h, mi, s = m["datetime"]
-                    if not clock_set:    # rough set now; PPS refines on the edge
-                        RTC().datetime((y, mo, d, 0, h, mi, s, 0))
+                    if not gps_synced:   # GPS overrides any earlier NTP set;
+                        RTC().datetime((y, mo, d, 0, h, mi, s, 0))  # PPS refines
                         clock_set = True
-                        print("RTC set from GPS RMC; PPS disciplining on GPIO %d"
-                              % GPS_PPS_PIN)
+                        gps_synced = True
+                        print("RTC set from GPS (preferred); PPS disciplining "
+                              "on GPIO %d" % GPS_PPS_PIN)
                     _pps_arm_next(y, mo, d, h, mi, s)
         now = time.ticks_ms()
         if (survey.lat is not None
@@ -503,11 +514,34 @@ def _stamp():
     return "%04d%02d%02d-%02d%02d" % (t[0], t[1], t[2], t[3], t[4])
 
 
+def _gzip_file(path):
+    # Stream a file through gzip and return (data, ext, content_type). CSV logs
+    # compress ~6-10x, so the upload (and the RAM to hold it) shrink a lot vs a
+    # raw read of the whole file. Falls back to raw bytes if `deflate` is absent.
+    try:
+        import deflate
+        import io
+    except ImportError:
+        return open(path, "rb").read(), "", "text/csv"
+    buf = io.BytesIO()
+    d = deflate.DeflateIO(buf, deflate.GZIP)
+    f = open(path, "rb")
+    while True:
+        chunk = f.read(4096)
+        if not chunk:
+            break
+        d.write(chunk)
+    d.close()                 # flush the gzip trailer
+    f.close()
+    return buf.getvalue(), ".gz", "application/gzip"
+
+
 def _github_upload():
     # Replace the rolling log asset on the 'logs' release: look up the release,
-    # delete any existing asset of the same name, then upload the current log.
-    # Blocks the asyncio loop for the round-trips (~secs); RX stays IRQ-driven.
-    # Returns the byte count offloaded (0 on failure) so the caller can reset.
+    # delete any existing asset of the same name, then upload the current log
+    # (gzip-compressed). Blocks the asyncio loop for the round-trips (~secs); RX
+    # stays IRQ-driven. Returns the UNCOMPRESSED byte count offloaded (0 on
+    # failure) so _reset_log's grew-during-upload check stays correct.
     if not GITHUB_TOKEN:
         return 0
     import urequests
@@ -525,21 +559,27 @@ def _github_upload():
         rel = r.json()
         r.close()
         rid = rel["id"]
+        gc.collect()
+        try:
+            orig_size = os.stat(LOG_PATH)[6]
+        except OSError:
+            orig_size = 0
+        body, ext, ctype = _gzip_file(LOG_PATH)
+        name = asset + ext
         for a in rel.get("assets", ()):
-            if a.get("name") == asset:
+            if a.get("name") == name:
                 urequests.delete(
                     "https://api.github.com/repos/%s/releases/assets/%d"
                     % (GITHUB_REPO, a["id"]), headers=hdr).close()
         gc.collect()
-        body = open(LOG_PATH, "rb").read()
         h2 = dict(hdr)
-        h2["Content-Type"] = "text/csv"
+        h2["Content-Type"] = ctype
         u = urequests.post(
             "https://uploads.github.com/repos/%s/releases/%d/assets?name=%s"
-            % (GITHUB_REPO, rid, asset), data=body, headers=h2)
-        print("GitHub upload %s: HTTP %d" % (asset, u.status_code))
+            % (GITHUB_REPO, rid, name), data=body, headers=h2)
+        print("GitHub upload %s: HTTP %d (%d B)" % (name, u.status_code, len(body)))
         if 200 <= u.status_code < 300:
-            uploaded = len(body)
+            uploaded = orig_size           # uncompressed size for the reset check
         u.close()
     except Exception as e:
         print("GitHub upload failed:", e)

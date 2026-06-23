@@ -798,11 +798,33 @@ def _log_stamp():
     return "%04d%02d%02d-%02d%02d" % (t[0], t[1], t[2], t[3], t[4])
 
 
+def _gzip_file(path):
+    # Stream a file through gzip and return (data, ext, content_type). CSV logs
+    # compress ~6-10x, so the upload (and the RAM to hold it) shrink a lot vs a
+    # raw read of the whole file. Falls back to raw bytes if `deflate` is absent.
+    try:
+        import deflate
+        import io
+    except ImportError:
+        return open(path, "rb").read(), "", "text/csv"
+    buf = io.BytesIO()
+    d = deflate.DeflateIO(buf, deflate.GZIP)
+    f = open(path, "rb")
+    while True:
+        chunk = f.read(4096)
+        if not chunk:
+            break
+        d.write(chunk)
+    d.close()                 # flush the gzip trailer
+    f.close()
+    return buf.getvalue(), ".gz", "application/gzip"
+
+
 def _github_upload_raw(asset):
     # Replace the rolling rope-log asset on the 'logs' release: look up the
-    # release, delete any existing asset of the same name, then upload raw.csv.
-    # Blocks the asyncio loop for the round-trips (~secs) - only called while
-    # IDLE, so the launch path is never affected.
+    # release, delete any existing asset of the same name, then upload the log
+    # (gzip-compressed). Blocks the asyncio loop for the round-trips (~secs) -
+    # only called while IDLE, so the launch path is never affected.
     import urequests
     hdr = {"Authorization": "Bearer " + GITHUB_TOKEN, "User-Agent": "winchy",
            "Accept": "application/vnd.github+json"}
@@ -813,20 +835,22 @@ def _github_upload_raw(asset):
         rel = r.json()
         r.close()
         rid = rel["id"]
+        gc.collect()
+        body, ext, ctype = _gzip_file(RAW_LOG_PATH)
+        name = asset + ext
         for a in rel.get("assets", ()):
-            if a.get("name") == asset:
+            if a.get("name") == name:
                 urequests.delete(
                     "https://api.github.com/repos/%s/releases/assets/%d"
                     % (GITHUB_REPO, a["id"]), headers=hdr).close()
         gc.collect()
-        body = open(RAW_LOG_PATH, "rb").read()
         h2 = dict(hdr)
-        h2["Content-Type"] = "text/csv"
+        h2["Content-Type"] = ctype
         u = urequests.post(
             "https://uploads.github.com/repos/%s/releases/%d/assets?name=%s"
-            % (GITHUB_REPO, rid, asset), data=body, headers=h2)
+            % (GITHUB_REPO, rid, name), data=body, headers=h2)
         ok = 200 <= u.status_code < 300
-        print("GitHub upload %s: HTTP %d" % (asset, u.status_code))
+        print("GitHub upload %s: HTTP %d (%d B)" % (name, u.status_code, len(body)))
         u.close()
     except Exception as e:
         print("GitHub upload failed:", e)

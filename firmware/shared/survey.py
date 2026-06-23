@@ -89,7 +89,12 @@ class SurveyIn:
         d = _ground_dist_m(self.lat, self.lon, lat, lon)
         if d > self.reset_dist_m:
             self._far += 1
-            if self._far >= self.reset_hits:
+            # Only re-seed *before* convergence (a bad initial seed). Once the
+            # survey has converged, a parked winch does not move within a
+            # session, so a burst of far fixes is receiver noise (the u-blox 7
+            # can jump hundreds of metres) - reject it and keep the good fix.
+            # A genuine relocation is handled by the power-cycle re-survey.
+            if self._far >= self.reset_hits and not self.converged:
                 self._seed(lat, lon, alt)   # sustained move -> re-survey here
             return False                    # never average a far fix in
         self._far = 0
