@@ -770,8 +770,8 @@ body{font-family:sans-serif;background:#111;color:#eee;margin:0;text-align:cente
 <div id=ulmsg class=lbl>&nbsp;</div>
 <script>
 var last=Date.now();var wasup=false;
-function ul(){ulmsg.textContent='requested...';
- fetch('/upload',{method:'POST'}).then(function(r){return r.text()}).then(function(t){ulmsg.textContent=t;}).catch(function(e){ulmsg.textContent='error';});}
+function ul(){wasup=true;ulmsg.textContent='uploading...';
+ fetch('/upload',{method:'POST'}).catch(function(e){ulmsg.textContent='upload error';});}
 function tick(){
  fetch('/data').then(function(r){return r.json()}).then(function(d){
   last=Date.now();document.body.className='';

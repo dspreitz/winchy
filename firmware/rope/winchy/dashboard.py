@@ -71,8 +71,8 @@ td.l{color:#8ac;width:46%}
 <div id=ulmsg style="font-size:4vw;color:#8ac;padding:2px 6px">&nbsp;</div>
 <script>
 var last=Date.now();var wasup=false;
-function ul(){ulmsg.textContent='requested...';
- fetch('/upload',{method:'POST'}).then(function(r){return r.text()}).then(function(t){ulmsg.textContent=t;}).catch(function(e){ulmsg.textContent='error';});}
+function ul(){wasup=true;ulmsg.textContent='uploading...';
+ fetch('/upload',{method:'POST'}).catch(function(e){ulmsg.textContent='upload error';});}
 function f(x,n){return (x==null)?'--':x.toFixed(n);}
 function tick(){
  fetch('/data').then(function(r){return r.json()}).then(function(d){
