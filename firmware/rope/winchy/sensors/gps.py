@@ -13,6 +13,7 @@
 # u-blox M10S GPS: UART wrapper plus minimal NMEA parsing (GGA for fix and
 # position, RMC for UTC date/time used to sync the RTC at startup).
 
+import struct
 import time
 
 
@@ -76,9 +77,10 @@ _CFG_SIG_SBAS = 0x10310020           # L, SBAS (EGNOS) enable
 _CFG_SIG_GAL = 0x10310021            # L, Galileo enable
 _CFG_SIG_BDS = 0x10310022            # L, BeiDou enable
 _DYN_AIRBORNE_2G = 7                 # allow launch dynamics (climb + accel)
-_CFG_MSGOUT_UART1 = (                # (NMEA id key on UART1, keep on?)
-    (0x209100BB, True),              # GGA
-    (0x209100AC, True),              # RMC
+_CFG_MSGOUT_NAV_PVT = 0x20910007     # U1, UBX-NAV-PVT output on UART1
+_CFG_MSGOUT_UART1 = (                # NMEA off: we read binary UBX-NAV-PVT now
+    (0x209100BB, False),             # GGA
+    (0x209100AC, False),             # RMC
     (0x209100CA, False),             # GLL
     (0x209100C0, False),             # GSA
     (0x209100C5, False),             # GSV
@@ -124,6 +126,7 @@ def configure(uart, rate_hz=5):
     items.append((_CFG_SIG_SBAS, b"\x01"))
     items.append((_CFG_SIG_GAL, b"\x01"))
     items.append((_CFG_SIG_BDS, b"\x01"))
+    items.append((_CFG_MSGOUT_NAV_PVT, b"\x01"))   # one binary msg, all we need
     uart.write(_valset(0x03, items))     # layers: RAM | BBR (no flash wear)
     time.sleep_ms(50)
 
@@ -230,3 +233,77 @@ def parse_nmea(line):
     except (ValueError, IndexError, UnicodeError):
         pass
     return None
+
+
+def parse_nav_pvt(pl):
+    """Parse a UBX-NAV-PVT payload (>=92 B) into a dict, or None.
+
+    One binary message carries everything the old GGA+RMC pair did, plus a real
+    3-D velocity, direct accuracy estimates and pDOP:
+      fix (0=none / 2=2D / 3=3D, only if the gnssFixOK flag is set), sats,
+      lat, lon (deg), alt_m (MSL), pdop, hacc_m / vacc_m (position accuracy),
+      gspeed_ms (2-D ground speed), climb_ms (GPS vertical rate), sacc_ms
+      (speed accuracy), datetime (UTC, only once time is fully resolved).
+    """
+    if len(pl) < 92:
+        return None
+    year, month, day, hour, mn, sec, valid = struct.unpack_from("<HBBBBBB", pl, 4)
+    fix_type, flags, _f2, num_sv = struct.unpack_from("<BBBB", pl, 20)
+    lon, lat, _h, hmsl = struct.unpack_from("<iiii", pl, 24)
+    hacc, vacc = struct.unpack_from("<II", pl, 40)
+    _vn, _ve, veld, gspeed = struct.unpack_from("<iiii", pl, 48)
+    sacc = struct.unpack_from("<I", pl, 68)[0]
+    pdop = struct.unpack_from("<H", pl, 76)[0]
+    gnss_ok = bool(flags & 0x01)
+    return {
+        "fix": fix_type if gnss_ok else 0,
+        "sats": num_sv,
+        "lat": lat * 1e-7, "lon": lon * 1e-7,
+        "alt_m": hmsl / 1000.0,
+        "pdop": pdop * 0.01,
+        "hacc_m": hacc / 1000.0, "vacc_m": vacc / 1000.0,
+        "gspeed_ms": gspeed / 1000.0,
+        "climb_ms": -veld / 1000.0,            # velD is +down; climb is +up
+        "sacc_ms": sacc / 1000.0,
+        "datetime": ((year, month, day, hour, mn, sec)
+                     if (valid & 0x04) else None),    # bit2 = fullyResolved
+    }
+
+
+_ubx_buf = b""
+
+
+async def read_ubx(reader):
+    """Await one valid UBX frame on `reader` (asyncio StreamReader) and return
+    (cls, id, payload). Accumulates with read() and frames in a persistent
+    buffer - readexactly() does not drain this UART stream, while read() (what
+    readline used) does. Resyncs past noise and drops bad-checksum frames."""
+    global _ubx_buf
+    while True:
+        b = _ubx_buf
+        i = b.find(b"\xb5\x62")
+        if i < 0:
+            _ubx_buf = b[-1:] if b else b          # keep a possible lone sync
+        elif len(b) - i < 6:
+            _ubx_buf = b[i:]                        # need the header
+        else:
+            ln = b[i + 4] | (b[i + 5] << 8)
+            if ln > 512:
+                _ubx_buf = b[i + 2:]               # bogus length -> skip sync
+                continue
+            end = i + 6 + ln + 2
+            if len(b) < end:
+                _ubx_buf = b[i:]                   # need the rest of the frame
+            else:
+                frame = b[i:end]
+                _ubx_buf = b[end:]
+                ca = cb = 0
+                for x in frame[2:6 + ln]:
+                    ca = (ca + x) & 0xFF
+                    cb = (cb + ca) & 0xFF
+                if ca == frame[-2] and cb == frame[-1]:
+                    return frame[2], frame[3], frame[6:6 + ln]
+                continue                           # bad checksum -> rescan
+        data = await reader.read(128)
+        if data:
+            _ubx_buf += data

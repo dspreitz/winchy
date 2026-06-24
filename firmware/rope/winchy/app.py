@@ -39,7 +39,8 @@ from winchy.fusion.kalman import GravityKalman, VerticalKalman
 from winchy.fusion.speed import glider_speed
 from winchy.sensors.ads1232 import ADS1232
 from winchy.sensors.barometer import Barometer
-from winchy.sensors.gps import (GPS, parse_nmea, configure as gps_configure,
+from winchy.sensors.gps import (GPS, parse_nav_pvt, read_ubx,
+                                 configure as gps_configure,
                                  set_baud as gps_set_baud,
                                  feed_mga as gps_feed_mga,
                                  mga_ini_time_utc as gps_ini_time,
@@ -122,7 +123,8 @@ RAW_Q_MAX = 4000            # safety cap on the pending-write queue (~80 s @50 H
 RAW_LOG_HEADER = ("# boot\n# t_ms,utc_ms,ax,ay,az,gx,gy,gz,mx,my,mz,force,"
                   "pressure_hpa,baro_alt_m,climb_ms,gps_alt_m,gps_lat,"
                   "gps_lon,gps_fix,gps_sats,gps_speed_ms,angle_deg,"
-                  "glider_speed_ms,cable_len_m,winch_dist_m,elev_deg\n")
+                  "glider_speed_ms,cable_len_m,winch_dist_m,elev_deg,"
+                  "gps_hacc_m,gps_climb_ms\n")
 # Motion gating: a winch sits idle most of the time, so logging only around
 # movement keeps the log (and the planned WiFi->GitHub upload) minimal. A
 # time-based ring buffer holds the last RAW_LOG_PREROLL_S so the START of a
@@ -252,7 +254,8 @@ LAST_FIX_MIN_SATS = 5         # only persist a confident 3D fix
 # off for a few seconds right at first lock, so don't calibrate QNH off a weak
 # or outlier fix (it would yank baro_alt and slowly fade back).
 QNH_CAL_MIN_SATS = 5          # need a confident fix to (re)calibrate QNH
-QNH_CAL_MAX_HDOP = 3.0        # ... and good geometry (HDOP is high indoors)
+QNH_CAL_MAX_HACC_M = 5.0      # ... and a tight fix (NAV-PVT horizontal accuracy,
+                              # metres - a direct quality measure, unlike DOP)
 QNH_CAL_MAX_JUMP_M = 100      # ignore a GPS alt this far off the baro alt ...
 QNH_CAL_FAR_HITS = 10         # ... unless it persists (the unit really moved)
 
@@ -338,14 +341,15 @@ async def imu_task(imu, state, filt, gyro_bias):
             utc_ms = time.time_ns() // 1000000 + 946684800000  # unix epoch ms
             row = ("%d,%d,%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f,%d,"
                    "%.2f,%.1f,%.2f,%.1f,%.7f,%.7f,%d,%d,%.2f,%.1f,%.2f,"
-                   "%.1f,%.1f,%.2f\n" % (
+                   "%.1f,%.1f,%.1f,%.1f,%.2f\n" % (
                        now, utc_ms, accel[0], accel[1], accel[2], gyro[0], gyro[1],
                        gyro[2], mx, my, mz, state.force_raw, state.pressure_hpa,
                        state.baro_alt_m, state.climb_rate_ms, state.alt_m,
                        state.lat, state.lon, state.gps_fix, state.gps_sats,
                        state.ground_speed_ms, state.angle_deg,
                        state.glider_speed_ms, state.cable_length_m,
-                       state.winch_dist_m, state.elevation_deg))
+                       state.winch_dist_m, state.elevation_deg,
+                       state.gps_hacc_m, state.gps_climb_ms))
 
             # Motion gate. Rest baselines (motion-test): accel_dev <= 0.04 g,
             # gyro_mag < 1 dps. A flat spin keeps |a| ~ 1 g, so the gyro term is
@@ -492,7 +496,7 @@ async def baro_task(baro, state, vertical):
             time.ticks_ms(), state.gps_ts) < BARO_CAL_GPS_MAX_AGE_MS)
         if (state.phase == protocol.PHASE_IDLE and gps_fresh
                 and state.gps_sats >= QNH_CAL_MIN_SATS
-                and state.gps_hdop <= QNH_CAL_MAX_HDOP):
+                and state.gps_hacc_m <= QNH_CAL_MAX_HACC_M):
             ref = altitude.sea_level_pressure_hpa(pressure, state.alt_m)
             # Reject a transient bad fix: a GPS altitude far off the current
             # (seeded/calibrated) baro altitude is the large vertical error seen
@@ -600,57 +604,53 @@ async def gps_task(state):
     Pin(config.GPS_PPS, Pin.IN).irq(trigger=Pin.IRQ_RISING, handler=_on_pps)
     last_fix_save = None
     while True:
-        line = await reader.readline()
-        update = parse_nmea(line)
+        cls, mid, payload = await read_ubx(reader)
+        if cls != 0x01 or mid != 0x07:        # only UBX-NAV-PVT
+            continue
+        update = parse_nav_pvt(payload)
         if not update:
             continue
-        if update["type"] == "GGA":
-            state.gps_fix = update["fix"]
-            state.gps_sats = update["sats"]
-            state.gps_hdop = update["hdop"] if update["hdop"] is not None else 99.0
-            if not state.gps_fix:
-                state.ground_speed_ms = 0.0   # no fix -> no speed (don't latch)
-            if update["lat"] is not None:
-                state.lat = update["lat"]
-                state.lon = update["lon"]
-            if update["alt_m"] is not None:
-                state.alt_m = update["alt_m"]
-            state.gps_ts = time.ticks_ms()
-            # Winch-relative geometry, once the winch has sent its position and
-            # we have our own fix. Updates at the GPS rate (cheap trig); the
-            # 50 Hz imu_task just logs the latest values. Reel-in rate is the
-            # offline derivative of winch_dist_m, so it needs nothing here.
-            if state.winch_pos_ts and state.gps_fix:
-                rel = winch_relative(
-                    state.winch_lat, state.winch_lon, state.winch_alt_m,
-                    state.lat, state.lon, state.alt_m, GLIDER_HOOK_DIST_M)
-                state.cable_length_m = rel["cable_length_m"]
-                state.winch_dist_m = rel["slant_m"]
-                state.elevation_deg = rel["elevation_deg"]
-            # Persist the field position/elevation (throttled, IDLE, confident
-            # 3D fix) so the next boot can seed QNH from the known elevation.
-            if (state.phase == protocol.PHASE_IDLE and state.gps_fix
-                    and state.gps_sats >= LAST_FIX_MIN_SATS
-                    and update["alt_m"] is not None
-                    and (last_fix_save is None or time.ticks_diff(
-                        time.ticks_ms(), last_fix_save) >= LAST_FIX_SAVE_S * 1000)):
-                _save_last_fix(state.lat, state.lon, state.alt_m)
-                last_fix_save = time.ticks_ms()
-        elif update["type"] == "RMC":
-            # Only trust ground speed from a valid fix (RMC status 'A'); a void
-            # fix can still carry a stale/garbage speed field. No fix -> 0 above.
-            if update["valid"] and update["speed_ms"] is not None:
-                state.ground_speed_ms = update["speed_ms"]
-            if update["datetime"]:
-                y, mo, d, h, mi, s = update["datetime"]
-                if not state.time_synced:
-                    # Rough initial set (NMEA-latency) so we have time at once;
-                    # PPS then refines the second boundary on each edge.
-                    rtc.datetime((y, mo, d, 0, h, mi, s, 0))
-                    state.time_synced = True
-                    print("RTC synced from GPS: %04d-%02d-%02d %02d:%02d:%02dZ"
-                          % (y, mo, d, h, mi, s))
-                _pps_arm_next(y, mo, d, h, mi, s)
+        state.gps_fix = update["fix"]
+        state.gps_sats = update["sats"]
+        state.gps_hdop = update["pdop"]       # pDOP, kept for reference/logging
+        state.gps_hacc_m = update["hacc_m"]   # gate + dashboard use this now
+        if state.gps_fix:
+            state.lat = update["lat"]
+            state.lon = update["lon"]
+            state.alt_m = update["alt_m"]
+            state.ground_speed_ms = update["gspeed_ms"]
+            state.gps_climb_ms = update["climb_ms"]
+        else:
+            state.ground_speed_ms = 0.0       # no fix -> no speed (don't latch)
+        state.gps_ts = time.ticks_ms()
+        # Winch-relative geometry, once the winch has sent its position and we
+        # have our own fix. Updates at the GPS rate (cheap trig); the 50 Hz
+        # imu_task just logs the latest values. Reel-in rate is the offline
+        # derivative of winch_dist_m, so it needs nothing here.
+        if state.winch_pos_ts and state.gps_fix:
+            rel = winch_relative(
+                state.winch_lat, state.winch_lon, state.winch_alt_m,
+                state.lat, state.lon, state.alt_m, GLIDER_HOOK_DIST_M)
+            state.cable_length_m = rel["cable_length_m"]
+            state.winch_dist_m = rel["slant_m"]
+            state.elevation_deg = rel["elevation_deg"]
+        # Persist the field position/elevation (throttled, IDLE, confident 3D
+        # fix) so the next boot can seed QNH from the known elevation.
+        if (state.phase == protocol.PHASE_IDLE and state.gps_fix
+                and state.gps_sats >= LAST_FIX_MIN_SATS
+                and (last_fix_save is None or time.ticks_diff(
+                    time.ticks_ms(), last_fix_save) >= LAST_FIX_SAVE_S * 1000)):
+            _save_last_fix(state.lat, state.lon, state.alt_m)
+            last_fix_save = time.ticks_ms()
+        # RTC: rough set at once (so we have time), PPS refines the second edge.
+        if update["datetime"]:
+            y, mo, d, h, mi, s = update["datetime"]
+            if not state.time_synced:
+                rtc.datetime((y, mo, d, 0, h, mi, s, 0))
+                state.time_synced = True
+                print("RTC synced from GPS: %04d-%02d-%02d %02d:%02d:%02dZ"
+                      % (y, mo, d, h, mi, s))
+            _pps_arm_next(y, mo, d, h, mi, s)
 
 
 async def telemetry_task(sx, state):

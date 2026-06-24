@@ -44,11 +44,13 @@ class State:
         # GPS
         self.gps_fix = 0         # GGA fix quality (0 = none)
         self.gps_sats = 0
-        self.gps_hdop = 99.0     # GGA HDOP; high = poor geometry (default bad)
+        self.gps_hdop = 99.0     # NAV-PVT pDOP; high = poor geometry (default bad)
+        self.gps_hacc_m = 99.0   # NAV-PVT horizontal accuracy estimate (m)
         self.lat = 0.0
         self.lon = 0.0
         self.alt_m = 0.0
-        self.ground_speed_ms = 0.0  # GPS speed over ground (RMC)
+        self.ground_speed_ms = 0.0  # GPS 2-D ground speed (NAV-PVT gSpeed)
+        self.gps_climb_ms = 0.0  # GPS vertical velocity (NAV-PVT -velD), m/s
         self.gps_ts = 0
         self.time_synced = False        # rope RTC set from its own GPS+PPS
         self.log_start = None    # "yyyymmdd-hhmm" session start (first GPS time)
