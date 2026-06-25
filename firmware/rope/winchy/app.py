@@ -812,17 +812,29 @@ async def supervisor_task(pmu, state):
 
 async def button_task(pmu):
     # Long-press the AXP2101 power key -> turn the rope off. Handled in software
-    # (polling the latched PKEY long-press IRQ) so the charging LED is switched
-    # off *before* shutdown - LED on = rope on, off = rope off. board.py also
-    # enables the hardware long-press auto-off as a fallback if this task dies.
+    # (polling the latched PKEY IRQs) so the charging LED is switched off *before*
+    # shutdown - LED on = rope on, off = rope off.
+    #
+    # Power off only AFTER the key is RELEASED. The AXP2101 powers ON whenever the
+    # key is held low for setPowerKeyPressOnTime (2 s, board.py), so calling
+    # shutdown() while the key is still held lets that press immediately re-power
+    # the system and it restarts. So on the long-press we switch the LED off
+    # (impending shutdown) and then wait for the positive (release) edge before
+    # shutting down - by then the key is high and the unit stays off.
     while True:
         await asyncio.sleep_ms(BUTTON_POLL_MS)
         try:
             pmu.getIrqStatus()              # refresh the latched IRQ flags
             if pmu.isPekeyLongPressIrq():
-                pmu.setChargingLedMode(pmu.XPOWERS_CHG_LED_OFF)
+                pmu.setChargingLedMode(pmu.XPOWERS_CHG_LED_OFF)  # LED off = powering down
                 pmu.clearIrqStatus()
-                pmu.shutdown()             # power the whole system off
+                while True:                 # defer shutdown until the key is up
+                    await asyncio.sleep_ms(BUTTON_POLL_MS)
+                    pmu.getIrqStatus()
+                    if pmu.isPekeyPositiveIrq():   # key released
+                        pmu.clearIrqStatus()
+                        pmu.shutdown()      # key is high now -> stays off
+                        break
         except Exception:
             pass
 

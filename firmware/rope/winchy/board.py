@@ -81,11 +81,12 @@ def init_power():
 
     pmu.setPowerKeyPressOffTime(pmu.XPOWERS_POWEROFF_6S)
     pmu.setPowerKeyPressOnTime(pmu.XPOWERS_POWERON_2S)
-    # Long-press the power key turns the rope OFF (not restart). app.py's
-    # button_task catches the long-press IRQ to switch the charging LED off
-    # first; this AXP2101 hardware auto-off is the fallback if that task is dead.
-    pmu.setLongPressPowerOFF()
-    pmu.enableLongPressShutdown()
+    # Power-off is done in software (app.py button_task) so it can wait for the
+    # key RELEASE before shutting down - otherwise the still-held key re-triggers
+    # the 2 s press-to-power-on and the unit restarts. The AXP2101 hardware
+    # long-press auto-off has the same quirk (it powers off while the key is
+    # held), so it is DISABLED here; button_task is the sole power-off path.
+    pmu.disableLongPressShutdown()
 
     # No battery temperature sensor fitted; leaving TS measurement on
     # disturbs charging.
@@ -110,7 +111,8 @@ def init_power():
         pmu.XPOWERS_AXP2101_BAT_INSERT_IRQ | pmu.XPOWERS_AXP2101_BAT_REMOVE_IRQ |
         pmu.XPOWERS_AXP2101_VBUS_INSERT_IRQ | pmu.XPOWERS_AXP2101_VBUS_REMOVE_IRQ |
         pmu.XPOWERS_AXP2101_PKEY_SHORT_IRQ | pmu.XPOWERS_AXP2101_PKEY_LONG_IRQ |
-        pmu.XPOWERS_AXP2101_BAT_CHG_DONE_IRQ | pmu.XPOWERS_AXP2101_BAT_CHG_START_IRQ
+        pmu.XPOWERS_AXP2101_PKEY_POSITIVE_IRQ |  # key release: button_task defers
+        pmu.XPOWERS_AXP2101_BAT_CHG_DONE_IRQ | pmu.XPOWERS_AXP2101_BAT_CHG_START_IRQ  # power-off until release
     )
 
     pmu.setPrechargeCurr(pmu.XPOWERS_AXP2101_PRECHARGE_50MA)
