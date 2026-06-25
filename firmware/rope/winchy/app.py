@@ -105,8 +105,9 @@ GPS_LOG_FLUSH_EVERY = 4     # flush after this many records (~2 s at 2 Hz)
 # Raw sensor log (rope-side, for offline Kalman validation): every filter input
 # (raw accel/gyro/mag, pressure, force, GPS alt) plus the on-device outputs
 # (baro alt/climb, angle) at the IMU cadence, to flash. Offloaded later (USB
-# now; WiFi->GitHub planned). ~16 min at 50 Hz fills the ~5.8 MB FS, so logging
-# stops at RAW_LOG_MAX_BYTES to protect it - clear/offload raw.csv per session.
+# now; WiFi->GitHub). At RAW_LOG_MAX_BYTES the log ROTATES (resets + keeps
+# logging) rather than halting, so the most recent ~RAW_LOG_MAX_BYTES is always
+# captured - a stuck/failed upload can never silently stop recording a test.
 RAW_LOG = True
 RAW_LOG_PATH = "raw.csv"
 RAW_LOG_FLUSH_EVERY = 100   # rows between flash flushes (flush itself is ~1 ms)
@@ -402,6 +403,23 @@ async def imu_task(imu, state, filt, gyro_bias):
         await asyncio.sleep_ms(IMU_PERIOD_MS)
 
 
+def _reset_raw_file(rawf):
+    """Close, delete, and reopen raw.csv with a fresh header; return the new
+    handle. Shared by the offload-reset and the cap rotation."""
+    try:
+        rawf.close()
+    except Exception:
+        pass
+    try:
+        os.remove(RAW_LOG_PATH)
+    except OSError:
+        pass
+    rawf = open(RAW_LOG_PATH, "a")
+    rawf.write(RAW_LOG_HEADER)
+    rawf.flush()
+    return rawf
+
+
 async def raw_writer_task(state):
     # Owns raw.csv. Drains state.raw_q a few lines at a time, yielding between
     # chunks so the slow per-line flash writes never block the 50 Hz imu_task.
@@ -428,15 +446,8 @@ async def raw_writer_task(state):
             except OSError:
                 cur = 0
             if cur <= state.raw_uploaded_bytes:
-                rawf.close()
-                try:
-                    os.remove(RAW_LOG_PATH)
-                except OSError:
-                    pass
-                rawf = open(RAW_LOG_PATH, "a")
-                rawf.write(RAW_LOG_HEADER)
-                rawf.flush()
-                raw_bytes = 0
+                rawf = _reset_raw_file(rawf)
+                raw_bytes = len(RAW_LOG_HEADER)
                 print("raw.csv offloaded; reset")
             state.raw_uploaded_bytes = 0
 
@@ -458,10 +469,17 @@ async def raw_writer_task(state):
         chunk = q[:RAW_WRITE_CHUNK]    # atomic slice+del (no await between)
         del q[:RAW_WRITE_CHUNK]
         for r in chunk:
-            if raw_bytes < RAW_LOG_MAX_BYTES:
-                rawf.write(r)
-                raw_bytes += len(r)
-                unflushed += 1
+            if raw_bytes >= RAW_LOG_MAX_BYTES:
+                # Rolling cap: rotate (drop the oldest) instead of halting, so a
+                # stuck/failed upload can never silently stop recording. Keeps
+                # the most recent ~RAW_LOG_MAX_BYTES.
+                rawf = _reset_raw_file(rawf)
+                raw_bytes = len(RAW_LOG_HEADER)
+                unflushed = 0
+                print("raw.csv hit cap; rotated (keeping recent data)")
+            rawf.write(r)
+            raw_bytes += len(r)
+            unflushed += 1
         if unflushed >= RAW_LOG_FLUSH_EVERY:
             rawf.flush()
             unflushed = 0
