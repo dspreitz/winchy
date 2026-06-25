@@ -818,24 +818,29 @@ def _log_stamp():
 
 
 def _gzip_file(path):
-    # Stream a file through gzip and return (data, ext, content_type). CSV logs
-    # compress ~6-10x, so the upload (and the RAM to hold it) shrink a lot vs a
-    # raw read of the whole file. Falls back to raw bytes if `deflate` is absent.
+    # Return (data, ext, content_type). Gzip the file if this build's deflate
+    # supports compression; otherwise upload the raw CSV. This ESP32-S3
+    # MicroPython is decompress-only: `deflate` imports fine but DeflateIO has
+    # no .write, so the compress path raises AttributeError - fall back to raw
+    # (the original behaviour; the rope uploads 4 MB this way fine).
     try:
         import deflate
         import io
-    except ImportError:
+        buf = io.BytesIO()
+        comp = deflate.DeflateIO(buf, deflate.GZIP)
+        comp.write            # AttributeError if compression isn't compiled in
+    except (ImportError, AttributeError):
         return open(path, "rb").read(), "", "text/csv"
-    buf = io.BytesIO()
-    d = deflate.DeflateIO(buf, deflate.GZIP)
     f = open(path, "rb")
-    while True:
-        chunk = f.read(4096)
-        if not chunk:
-            break
-        d.write(chunk)
-    d.close()                 # flush the gzip trailer
-    f.close()
+    try:
+        while True:
+            chunk = f.read(4096)
+            if not chunk:
+                break
+            comp.write(chunk)
+        comp.close()          # flush the gzip trailer
+    finally:
+        f.close()
     return buf.getvalue(), ".gz", "application/gzip"
 
 
