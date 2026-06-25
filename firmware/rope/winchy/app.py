@@ -50,6 +50,11 @@ from winchy.sensors.qmi8658 import QMI8658
 from winchy.state import State
 
 FORCE_TIMEOUT_MS = 1000
+# Periodic ADS1232 on-chip offset recalibration (sheds thermal offset drift).
+# Load-independent and returns the offset to the boot baseline, so no re-tare;
+# gated to IDLE + near-zero tared load so a launch is never interrupted.
+ADC_RECAL_PERIOD_S = 600       # recalibrate at most this often
+ADC_RECAL_QUIET_COUNTS = 500000  # only when |tared force| is below this (~6% FS)
 IMU_PERIOD_MS = 20          # 50 Hz sampling
 MAG_PERIOD_MS = 50          # 20 Hz magnetometer (slow I2C; kept off the IMU loop)
 IMU_WINDOW = 20             # samples for the boot-time accel print
@@ -262,12 +267,26 @@ QNH_CAL_FAR_HITS = 10         # ... unless it persists (the unit really moved)
 
 async def force_task(adc, state):
     # Free-running at the ADC conversion rate (10 SPS at gain 128).
+    last_recal = time.ticks_ms()
     while True:
         try:
             state.force_raw = await adc.aread_raw(FORCE_TIMEOUT_MS)
             state.force_ts = time.ticks_ms()
         except asyncio.TimeoutError:
             state.force_errors += 1
+        # Periodically re-run the ADC's on-chip offset calibration to shed
+        # thermal offset drift. Gated to IDLE + near-zero tared load so it never
+        # interrupts a launch; load-independent + no re-tare needed (see driver).
+        if (state.phase == protocol.PHASE_IDLE
+                and time.ticks_diff(time.ticks_ms(), last_recal)
+                    > ADC_RECAL_PERIOD_S * 1000
+                and abs(state.force_raw - state.force_offset)
+                    < ADC_RECAL_QUIET_COUNTS):
+            try:
+                adc.calibrate_offset()
+            except OSError:
+                state.force_errors += 1
+            last_recal = time.ticks_ms()
 
 
 async def mag_task(mag, state):
@@ -1235,7 +1254,16 @@ def run():
 
     adc = ADS1232(pdwn=config.ADS_PDWN, sclk=config.ADS_SCLK,
                   dout=config.ADS_DOUT, gain0=config.ADS_GAIN0,
-                  gain1=config.ADS_GAIN1, gain=config.ADS_GAIN)
+                  gain1=config.ADS_GAIN1, gain=config.ADS_GAIN,
+                  speed=config.ADS_SPEED)
+    if config.ADS_SPEED is not None:
+        adc.set_speed(config.ADS_SPEED_HZ)
+        print("Force ADC data rate %d SPS" % config.ADS_SPEED_HZ)
+    try:
+        adc.calibrate_offset()   # zero the ADC internal offset before taring
+        print("Force ADC offset-calibrated")
+    except OSError as e:
+        print("Force ADC offset cal skipped:", e)
     state.force_offset = adc.tare()
     print("Force ADC tared, offset", state.force_offset)
 

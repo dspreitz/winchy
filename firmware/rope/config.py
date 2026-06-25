@@ -75,6 +75,11 @@ ADS_DOUT = 46
 ADS_GAIN0 = 38
 ADS_GAIN1 = 2
 ADS_GAIN = 128
+# SPEED pin is hardwired to DGND on the daughterboard -> 10 SPS. To enable
+# 80 SPS (tension-oscillation capture), rework the board (cut SPEED from DGND,
+# run it to a free GPIO), then set ADS_SPEED to that GPIO. None = leave as-is.
+ADS_SPEED = None
+ADS_SPEED_HZ = 80      # data rate driven when ADS_SPEED is wired (10 or 80)
 
 # SH1106 OLED. Disabled: the panel is physically blocked by the ADS1232
 # breakout PCB, so it only wastes power. Set True to re-enable the status

@@ -15,26 +15,33 @@
 import asyncio
 import time
 
+import machine
 from machine import Pin
 
 
 class ADS1232:
     """Force ADC.
 
-    Data-ready is signalled by DOUT falling; a pin interrupt latches that
-    into a flag so waiting for a sample sleeps instead of busy-spinning
-    (the old monolith's tight DOUT poll blocked Ctrl-C and starved
-    everything else). Ready for an asyncio ThreadSafeFlag in step 4.
+    Data-ready is signalled by DOUT falling; a pin interrupt latches that into a
+    flag so waiting for a sample sleeps instead of busy-spinning.
+
+    The serial readout runs with interrupts masked: a stretched SCLK high phase
+    would otherwise risk an unintended standby (the ADS1232 enters standby if
+    SCLK is held high past t10 ~ one conversion, i.e. ~12.5 ms at 80 SPS;
+    datasheet 7.4.2), and masking also keeps the bit-banged pulses clean.
     """
 
     _GAINS = {1: (0, 0), 2: (1, 0), 64: (0, 1), 128: (1, 1)}
 
-    def __init__(self, pdwn, sclk, dout, gain0, gain1, gain=128):
+    def __init__(self, pdwn, sclk, dout, gain0, gain1, gain=128, speed=None):
         self._pdwn = Pin(pdwn, Pin.OUT)
         self._sclk = Pin(sclk, Pin.OUT)
         self._dout = Pin(dout, Pin.IN)
         self._gain0 = Pin(gain0, Pin.OUT)
         self._gain1 = Pin(gain1, Pin.OUT)
+        # SPEED pin: None = hardwired on the daughterboard (DGND -> 10 SPS).
+        # Wire it to a GPIO to select the data rate via set_speed().
+        self._speed = Pin(speed, Pin.OUT) if speed is not None else None
         self.offset = 0
         self._ready = False
         self._flag = asyncio.ThreadSafeFlag()
@@ -55,39 +62,53 @@ class ADS1232:
         self._gain1.value(g1)
         print("Gain set to %dx" % gain)
 
+    def set_speed(self, sps):
+        """Set the data rate via the SPEED pin: 10 or 80 SPS. Returns False if
+        SPEED is hardwired (speed=None at construction). After a change the
+        digital filter needs ~4 conversions to resettle (discard them)."""
+        if self._speed is None:
+            return False
+        if sps not in (10, 80):
+            raise ValueError("sps must be 10 or 80")
+        self._speed.value(1 if sps == 80 else 0)
+        return True
+
     def _clock_out(self):
-        """Shift out the 24-bit conversion. DRDY (DOUT low) must be true."""
+        """Shift out the 24-bit conversion (DRDY/DOUT must be low). Runs with
+        interrupts masked so a pulse can't be stretched into a standby event;
+        a 25th pulse forces DOUT high to end the frame."""
+        irq = machine.disable_irq()
         result = 0
         for _ in range(24):
             self._sclk.value(1)
             result = (result << 1) | self._dout.value()
             self._sclk.value(0)
+        self._sclk.value(1)   # 25th pulse: force DOUT high
+        self._sclk.value(0)
+        machine.enable_irq(irq)
         if result & 0x800000:  # sign-extend
             result |= ~0xFFFFFF
-        # One extra clock pulse completes the cycle and forces DOUT high.
-        self._sclk.value(1)
-        self._sclk.value(0)
-        # Clear only after clocking: the data shift itself produces falling
-        # edges on DOUT that re-trigger the IRQ.
         self._ready = False
         return result
 
-    def read_raw(self, timeout_ms=250):
-        """One signed 24-bit conversion, no offset applied. Blocking."""
+    def _wait_drdy(self, timeout_ms, what="read"):
         deadline = time.ticks_add(time.ticks_ms(), timeout_ms)
         while not self._ready and self._dout.value() == 1:
             if time.ticks_diff(deadline, time.ticks_ms()) < 0:
-                raise OSError("ADS1232 DRDY timeout")
+                raise OSError("ADS1232 DRDY timeout (%s)" % what)
             time.sleep_ms(1)
+
+    def read_raw(self, timeout_ms=250):
+        """One signed 24-bit conversion, no offset applied. Blocking."""
+        self._wait_drdy(timeout_ms)
         return self._clock_out()
 
     async def aread_raw(self, timeout_ms=250):
         """One signed 24-bit conversion, yielding to other tasks while the
-        conversion completes. Raises asyncio.TimeoutError if DRDY stays
-        away (ADC unpowered/unwired)."""
-        # Loop: a stale flag set by the falling edges of the previous data
-        # shift returns immediately, but DOUT is still high then, so we
-        # wait again on the (now cleared) flag for the genuine DRDY edge.
+        conversion completes. Raises asyncio.TimeoutError if DRDY stays away."""
+        # A stale flag (set by a previous shift's DOUT edges) returns
+        # immediately while DOUT is still high, so wait again on the cleared
+        # flag for the genuine DRDY edge.
         while self._dout.value() == 1:
             await asyncio.wait_for_ms(self._flag.wait(), timeout_ms)
         return self._clock_out()
@@ -95,6 +116,27 @@ class ADS1232:
     def read(self, timeout_ms=250):
         """Offset-corrected (tared) reading."""
         return self.read_raw(timeout_ms) - self.offset
+
+    def calibrate_offset(self, timeout_ms=500):
+        """Run the ADS1232 on-chip offset calibration (datasheet 7.4.1): after
+        the 24 data bits a 25th SCLK forces DOUT high and the falling edge of a
+        26th SCLK starts calibration. The analog inputs are disconnected
+        internally, so this is load-independent; DRDY/DOUT returns low when done
+        and the first conversion after is fully settled. Re-zeros the ADC's
+        internal offset and its thermal drift.
+
+        Run once at boot BEFORE tare(); the tare baseline then stays valid across
+        later recalibrations (each returns the ADC offset to ~0, so no re-tare is
+        needed). Blocks ~1-2 conversion periods. Raises OSError on timeout."""
+        self._wait_drdy(timeout_ms, "calibrate")
+        irq = machine.disable_irq()
+        for _ in range(26):   # 24 data + 25th (DOUT high) + 26th (start cal)
+            self._sclk.value(1)
+            self._sclk.value(0)
+        machine.enable_irq(irq)
+        self._ready = False
+        self._wait_drdy(timeout_ms, "calibrate done")  # DRDY low = cal complete
+        self._ready = False
 
     def tare(self, samples=10):
         # The ADC needs a moment to start converting after wake/gain-set, so
