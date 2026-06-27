@@ -108,6 +108,30 @@ LOG_HEADER = ("# boot\n# utc,seq,phase,force,angle_deg,alt_m,batt_v,batt_pct,"
 log_buf = []        # pending CSV rows: utc,seq,phase,force,angle_deg,alt_m,
                     # batt_v,batt_pct,flags,rssi,snr  (utc = ISO8601 Z)
 
+
+def _fw_line(role, app_path):
+    # One-time firmware fingerprint written to the log at boot, so a later
+    # debugger can tell which build produced a log: MicroPython version + build
+    # date, whether this build has deflate compression (only the custom Winchy
+    # builds do), and whether the app is frozen into the image (app source is
+    # absent from the filesystem). Written only at boot, not on log rotations,
+    # so the "header-only = no data" upload check stays valid.
+    import sys
+    try:
+        import deflate
+        import io
+        deflate.DeflateIO(io.BytesIO(), deflate.GZIP).write
+        comp = "y"
+    except (ImportError, AttributeError):
+        comp = "n"
+    try:
+        os.stat(app_path)
+        frozen = "n"
+    except OSError:
+        frozen = "y"
+    return "# fw: %s | %s | deflate=%s frozen=%s\n" % (
+        role, sys.version, comp, frozen)
+
 # Optional WiFi dashboard: the winch joins an existing WiFi network and serves
 # a live telemetry page (HTTP poll, ~2 Hz) to any phone/laptop on that network
 # - a real operator display alongside the small OLED. WiFi is winch-only and
@@ -1025,6 +1049,7 @@ logf = None
 if LOG_TO_FLASH:
     logf = open(LOG_PATH, "a")  # append so a reboot mid-run keeps prior data
     logf.write(LOG_HEADER)      # delimiter; data rows carry UTC once synced
+    logf.write(_fw_line("winch", "winch_app.py"))   # one-time fw fingerprint
     logf.flush()
 
 import asyncio

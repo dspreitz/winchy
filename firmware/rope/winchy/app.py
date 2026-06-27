@@ -403,6 +403,30 @@ async def imu_task(imu, state, filt, gyro_bias):
         await asyncio.sleep_ms(IMU_PERIOD_MS)
 
 
+def _fw_line(role, app_path):
+    # One-time firmware fingerprint written to the log at boot, so a later
+    # debugger can tell which build produced a log: MicroPython version + build
+    # date, whether this build has deflate compression (only the custom Winchy
+    # builds do), and whether the app is frozen into the image (app source is
+    # absent from the filesystem). Written only at boot, not on the cap/offload
+    # rotation, so the "header-only = no episodes" checks stay valid.
+    import sys
+    try:
+        import deflate
+        import io
+        deflate.DeflateIO(io.BytesIO(), deflate.GZIP).write
+        comp = "y"
+    except (ImportError, AttributeError):
+        comp = "n"
+    try:
+        os.stat(app_path)
+        frozen = "n"
+    except OSError:
+        frozen = "y"
+    return "# fw: %s | %s | deflate=%s frozen=%s\n" % (
+        role, sys.version, comp, frozen)
+
+
 def _reset_raw_file(rawf):
     """Close, delete, and reopen raw.csv with a fresh header; return the new
     handle. Shared by the offload-reset and the cap rotation."""
@@ -432,6 +456,7 @@ async def raw_writer_task(state):
     except OSError:
         raw_bytes = 0
     rawf.write(RAW_LOG_HEADER)
+    rawf.write(_fw_line("rope", "winchy/app.py"))   # one-time fw fingerprint
     rawf.flush()
     unflushed = 0
     flushes = 0
