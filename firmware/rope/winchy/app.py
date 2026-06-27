@@ -634,14 +634,18 @@ def _pps_arm_next(y, mo, d, h, mi, s):
 
 
 def _gps_alive(uart, timeout_ms=1500):
-    """True if NMEA is arriving - used to confirm the high-baud switch took."""
+    """True if the configured GPS stream is arriving at the current baud - used
+    to confirm the high-baud switch took. Look for the UBX sync bytes: the module
+    is configured for UBX NAV-PVT with NMEA OFF, so checking for NMEA '$G' here
+    ALWAYS failed -> the 9600 fallback fired even when the module was at high
+    baud, leaving host@9600 vs module@115200 -> garbage, no fix."""
     t0 = time.ticks_ms()
     buf = b""
     while time.ticks_diff(time.ticks_ms(), t0) < timeout_ms:
         n = uart.any()
         if n:
             buf += uart.read(n)
-            if b"$G" in buf:
+            if b"\xb5\x62" in buf:        # UBX sync char (NAV-PVT etc.)
                 return True
         time.sleep_ms(10)
     return False
@@ -707,12 +711,44 @@ async def gps_task(state):
         # RTC: rough set at once (so we have time), PPS refines the second edge.
         if update["datetime"]:
             y, mo, d, h, mi, s = update["datetime"]
-            if not state.time_synced:
+            # GPS time wins over an earlier NTP fallback (more accurate, and
+            # PPS-disciplined below). Set the RTC unless GPS already owns it.
+            if state.time_source != "gps":
                 rtc.datetime((y, mo, d, 0, h, mi, s, 0))
                 state.time_synced = True
+                state.time_source = "gps"
                 print("RTC synced from GPS: %04d-%02d-%02d %02d:%02d:%02dZ"
                       % (y, mo, d, h, mi, s))
             _pps_arm_next(y, mo, d, h, mi, s)
+
+
+def _ntp_time_aid(state):
+    # GPS time is preferred (more accurate + PPS-disciplined), so this only acts
+    # before GPS has synced. When WiFi is up it uses NTP to (a) set the clock as
+    # a fallback, so logs are timestamped even with no GPS fix, and (b) inject
+    # coarse time into the GPS (UBX-MGA-INI-TIME) so it acquires a fix FASTER.
+    # GPS later overrides both (gps_task sets time_source="gps"). Blocks briefly
+    # (a UDP round-trip); callers gate it to IDLE, like the GitHub uploads.
+    if state.time_source == "gps":
+        return
+    try:
+        import ntptime
+        ntptime.settime()                 # set the RTC to UTC from NTP
+    except Exception as e:
+        print("NTP time failed:", e)
+        return
+    tm = time.gmtime()
+    if tm[0] < 2024:                       # sanity: reject a bogus result
+        return
+    if state.time_source != "gps":
+        state.time_synced = True
+        state.time_source = "ntp"
+        print("RTC synced from NTP: %04d-%02d-%02d %02d:%02d:%02dZ" % tm[:6])
+    try:                                   # speed up the GPS fix with coarse time
+        gps_ini_time(board.gps_uart, tm[:6])
+        print("GPS time-aided from NTP")
+    except Exception as e:
+        print("GPS time-aid failed:", e)
 
 
 async def telemetry_task(sx, state):
@@ -1171,6 +1207,8 @@ async def wifi_task(state):
             joined = await wifi.connect_any(wlan, WIFI_NETWORKS,
                                             WIFI_JOIN_TIMEOUT_S)
             if joined:
+                if state.time_source is None:   # NTP fallback + GPS time-aiding
+                    _ntp_time_aid(state)
                 # Prepend the session start (first GPS time) to the asset so
                 # each session is a distinct, dated file on the release.
                 stamp = state.log_start or _log_stamp()
@@ -1229,6 +1267,13 @@ async def dashboard_task(state):
                     ssid = "?"
                 if _github_announce_ip(cur, ssid, "rope"):
                     announced_ip = cur
+        # NTP time fallback + GPS time-aiding: while WiFi is up and neither GPS
+        # nor NTP has set the clock yet, sync from NTP (so logs are timestamped
+        # even without a GPS fix) and inject coarse time into the GPS to speed up
+        # its fix. GPS overrides later (gps_task). IDLE only; retried until set.
+        if (wlan.isconnected() and state.time_source is None
+                and state.phase == protocol.PHASE_IDLE and n % 10 == 0):
+            _ntp_time_aid(state)
         # Opportunistic AssistNow Predictive Orbits: while IDLE + online, fetch
         # predicted orbits and feed them to the GPS (cached for the next cold
         # start). First call also does the one-time ZTP registration.
