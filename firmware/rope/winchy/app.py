@@ -634,18 +634,20 @@ def _pps_arm_next(y, mo, d, h, mi, s):
 
 
 def _gps_alive(uart, timeout_ms=1500):
-    """True if the configured GPS stream is arriving at the current baud - used
-    to confirm the high-baud switch took. Look for the UBX sync bytes: the module
-    is configured for UBX NAV-PVT with NMEA OFF, so checking for NMEA '$G' here
-    ALWAYS failed -> the 9600 fallback fired even when the module was at high
-    baud, leaving host@9600 vs module@115200 -> garbage, no fix."""
+    """True if recognisable GPS framing is arriving at the current baud - used to
+    confirm the high-baud switch took. Checked BEFORE (re)configuring, when the
+    module is streaming its existing config, so accept EITHER UBX (b5 62, the
+    NAV-PVT we set, retained in BBR) OR NMEA ($G, the factory default) - whichever
+    the module currently emits. (Checking only NMEA broke once NMEA was turned
+    off; checking only UBX broke right after a CFG change briefly stalled the UBX
+    stream - hence the check now runs before configure, see gps_task.)"""
     t0 = time.ticks_ms()
     buf = b""
     while time.ticks_diff(time.ticks_ms(), t0) < timeout_ms:
         n = uart.any()
         if n:
             buf += uart.read(n)
-            if b"\xb5\x62" in buf:        # UBX sync char (NAV-PVT etc.)
+            if b"\xb5\x62" in buf or b"$G" in buf:
                 return True
         time.sleep_ms(10)
     return False
@@ -654,14 +656,21 @@ def _gps_alive(uart, timeout_ms=1500):
 async def gps_task(state):
     global _pps_rtc
     # Raise the module baud (sent at the boot baud; ignored if already raised),
-    # reopen the host UART to match, then trim to GGA+RMC and set the nav rate.
+    # reopen the host UART to match, then CONFIRM the module is talking at high
+    # baud BEFORE (re)configuring it. Order matters: a CFG-VALSET can briefly
+    # restart the GNSS engine and stall the stream, so a check placed *after*
+    # configure missed the data and wrongly fell back to 9600 (host@9600 vs
+    # module@115200 -> garbage, no fix). At this point the module streams its
+    # existing config (UBX NAV-PVT from BBR, or NMEA), so _gps_alive accepts both.
     gps_set_baud(board.gps_uart, config.GPS_BAUD_HIGH)
     board.gps_reopen(config.GPS_BAUD_HIGH)
-    gps_configure(board.gps_uart, config.GPS_NAV_RATE_HZ)
-    if not _gps_alive(board.gps_uart):       # baud switch didn't take - revert
+    rate = config.GPS_NAV_RATE_HZ
+    if not _gps_alive(board.gps_uart):       # high baud didn't take - revert
         board.gps_reopen(config.GPS_BAUD)
-        gps_configure(board.gps_uart, 5)
-        print("GPS: high baud failed, fell back to %d/5 Hz" % config.GPS_BAUD)
+        rate = min(rate, 5)                  # 9600 can't carry the high nav rate
+        print("GPS: high baud not confirmed, using %d/%d Hz"
+              % (config.GPS_BAUD, rate))
+    gps_configure(board.gps_uart, rate)      # configure at the confirmed baud
     _assistnow_capture_identity()            # UBX identity for ZTP (before read loop)
     _assistnow_feed_stored(state)            # warm the GPS with any cached orbits
     reader = asyncio.StreamReader(board.gps_uart)
