@@ -653,32 +653,38 @@ def _gps_alive(uart, timeout_ms=1500):
     return False
 
 
-def _gps_detect_baud():
-    """Probe the module's actual baud and bring it to high baud; return the nav
-    rate to use. The M10 baud is RAM-only and only persists in BBR while the
-    backup domain stays powered - with no battery, a USB-unplug reset cold-starts
-    the module at 9600 every time. Try high FIRST (the warm/BBR case), and only
-    send the raise-baud command once the module is actually found at 9600 -
-    sending it at the wrong baud (host@9600 to module@115200) injects line noise
-    that breaks the next detection. _gps_alive accepts UBX or NMEA. Reused on a
-    read-stall (see gps_task) to self-heal a boot race where the module was not
-    streaming yet when first probed, or a baud revert."""
+async def _gps_detect_baud():
+    """Probe the module's actual baud, bring it to high baud, and return the nav
+    rate. PATIENT: right after power-up the module isn't streaming yet (and with
+    no battery a USB-unplug reset cold-starts it at 9600 every time), so the
+    probe is retried while it boots - awaiting between tries so the rest of the
+    app keeps running. Try high FIRST (the warm/BBR case); only send the raise
+    command once the module is actually found at 9600 (sending it at the wrong
+    baud injects line noise that breaks the next detection). After a raise the
+    next pass re-probes high, so a switched-but-not-yet-confirmed module is still
+    caught. _gps_alive accepts UBX or NMEA. Reused by gps_task on a read-stall."""
     rate = config.GPS_NAV_RATE_HZ
-    board.gps_reopen(config.GPS_BAUD_HIGH)
-    if not _gps_alive(board.gps_uart):               # not already at high baud
-        board.gps_reopen(config.GPS_BAUD)            # try the 9600 cold default
-        if _gps_alive(board.gps_uart):               # found at 9600 -> raise it
+    for _ in range(12):                              # retry while the GPS powers up
+        board.gps_reopen(config.GPS_BAUD_HIGH)
+        if _gps_alive(board.gps_uart, 600):
+            return rate                              # already at high baud
+        board.gps_reopen(config.GPS_BAUD)
+        if _gps_alive(board.gps_uart, 600):          # found at 9600 -> raise it
             gps_set_baud(board.gps_uart, config.GPS_BAUD_HIGH)
+            await asyncio.sleep_ms(400)              # let the baud switch settle
             board.gps_reopen(config.GPS_BAUD_HIGH)
-            if not _gps_alive(board.gps_uart):        # raise didn't confirm -> stay
-                board.gps_reopen(config.GPS_BAUD)
-                rate = min(rate, 5)                  # 9600 can't carry high rate
+            if _gps_alive(board.gps_uart, 900):
+                return rate                          # raised + confirmed
+            # not confirmed yet -> loop; the next pass probes high first
+        await asyncio.sleep_ms(500)                  # GPS not responding yet -> wait
+    board.gps_reopen(config.GPS_BAUD_HIGH)           # gave up -> assume high baud
+    print("GPS: baud probe gave up; assuming %d" % config.GPS_BAUD_HIGH)
     return rate
 
 
 async def gps_task(state):
     global _pps_rtc
-    rate = _gps_detect_baud()
+    rate = await _gps_detect_baud()
     gps_configure(board.gps_uart, rate)              # configure at the live baud
     _assistnow_capture_identity()            # UBX identity for ZTP (before read loop)
     _assistnow_feed_stored(state)            # warm the GPS with any cached orbits
@@ -695,7 +701,7 @@ async def gps_task(state):
             # first probed (boot race), or its baud reverted (BBR lost on a
             # no-battery USB-unplug reset). Re-detect, reconfigure, carry on.
             print("GPS: no data for 8s, re-detecting baud")
-            rate = _gps_detect_baud()
+            rate = await _gps_detect_baud()
             gps_configure(board.gps_uart, rate)
             reader = asyncio.StreamReader(board.gps_uart)
             continue
