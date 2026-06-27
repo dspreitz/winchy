@@ -201,11 +201,14 @@ def test_configure_clamps_fast_rate():
     assert items[gps._CFG_RATE_MEAS] == (50).to_bytes(2, "little")
 
 
-def test_set_baud_message():
+def test_set_baud_persisted_to_bbr():
+    # The baud must be written to RAM | BBR (0x03) so it survives power cycles
+    # (the MAX-M10S has no config flash). RAM-only (0x01) was the bug that made
+    # the module revert to 9600 on every cold start.
     u = RecUart()
     gps.set_baud(u, 115200)
     layers, items = decode_valset(u.writes[0])
-    assert layers == 0x01                              # RAM only
+    assert layers == 0x03                              # RAM | BBR
     assert items[0x40520001] == (115200).to_bytes(4, "little")
 
 

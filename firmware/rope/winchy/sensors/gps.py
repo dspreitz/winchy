@@ -55,13 +55,18 @@ def _ubx(cls, msg_id, payload=b""):
 
 
 def set_baud(uart, baud):
-    """Set the module's UART1 baud (UBX-CFG-VALSET, RAM layer). Sent at the
+    """Set the module's UART1 baud (UBX-CFG-VALSET, RAM + BBR layers). Sent at the
     port's current baud; the caller must then reopen the host UART at `baud`.
-    A power cycle resets the module to 9600, so this is part of the boot
-    config and is re-sent every boot.
+
+    Written to BBR as well as RAM (layers 0x03) so the baud PERSISTS across power
+    cycles - retained by the AXP2101 backup-domain charge (board.py), the same
+    rail that keeps the ephemeris/almanac alive. The MAX-M10S has NO config flash
+    (a Flash-layer write is NAKed - verified on-device), so BBR is the only
+    non-volatile option. gps_task probes the actual baud at boot, so a lost BBR
+    (full de-power) just falls back to 9600 and re-raises + re-persists here.
     """
     key = 0x40520001  # CFG-UART1-BAUDRATE (U4)
-    payload = (b"\x00\x01\x00\x00"            # version 0, layers=RAM, reserved
+    payload = (b"\x00\x03\x00\x00"            # version 0, layers=RAM|BBR, reserved
                + key.to_bytes(4, "little") + baud.to_bytes(4, "little"))
     uart.write(_ubx(0x06, 0x8A, payload))
     time.sleep_ms(150)
@@ -106,8 +111,8 @@ def configure(uart, rate_hz=5):
     Written to RAM + BBR (layers 0x03): RAM applies it now; BBR persists it
     across power cycles WITHOUT flash wear, retained by the AXP2101 backup-domain
     charge (board.py) - the same rail that keeps the receiver's ephemeris/almanac
-    alive for a warm start. Baud stays RAM-only (see set_baud), so the tested
-    9600 -> high-baud boot bring-up is unchanged. Volume is ~150 B/epoch, so the
+    alive for a warm start. The baud is persisted to BBR too now (set_baud), and
+    gps_task probes the live baud at boot. Volume is ~150 B/epoch, so the
     baud must support rate_hz * 150 B/s (10 Hz needs the raised baud, not 9600).
     """
     meas = max(50, min(1000, 1000 // rate_hz))

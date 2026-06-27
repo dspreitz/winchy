@@ -655,22 +655,28 @@ def _gps_alive(uart, timeout_ms=1500):
 
 async def gps_task(state):
     global _pps_rtc
-    # Raise the module baud (sent at the boot baud; ignored if already raised),
-    # reopen the host UART to match, then CONFIRM the module is talking at high
-    # baud BEFORE (re)configuring it. Order matters: a CFG-VALSET can briefly
-    # restart the GNSS engine and stall the stream, so a check placed *after*
-    # configure missed the data and wrongly fell back to 9600 (host@9600 vs
-    # module@115200 -> garbage, no fix). At this point the module streams its
-    # existing config (UBX NAV-PVT from BBR, or NMEA), so _gps_alive accepts both.
-    gps_set_baud(board.gps_uart, config.GPS_BAUD_HIGH)
-    board.gps_reopen(config.GPS_BAUD_HIGH)
+    # PROBE the module's baud rather than assume it. The M10 UART baud is
+    # RAM-only: it survives a warm reset (stays high) but reverts to the 9600
+    # default on a cold start, and we can't tell which. So try high baud FIRST
+    # (the common warm case) and only send the raise-baud command once we've
+    # actually found the module at 9600 - sending it at the wrong baud (host@9600
+    # to a module@115200) just injects line noise that was breaking the very next
+    # detection and dropping us back to 9600 while the module stayed at 115200.
+    # _gps_alive accepts UBX or NMEA (whatever the current config emits).
     rate = config.GPS_NAV_RATE_HZ
-    if not _gps_alive(board.gps_uart):       # high baud didn't take - revert
-        board.gps_reopen(config.GPS_BAUD)
-        rate = min(rate, 5)                  # 9600 can't carry the high nav rate
-        print("GPS: high baud not confirmed, using %d/%d Hz"
-              % (config.GPS_BAUD, rate))
-    gps_configure(board.gps_uart, rate)      # configure at the confirmed baud
+    board.gps_reopen(config.GPS_BAUD_HIGH)
+    if not _gps_alive(board.gps_uart):               # not already at high baud
+        board.gps_reopen(config.GPS_BAUD)            # try the 9600 cold default
+        if _gps_alive(board.gps_uart):               # found at 9600 -> raise it
+            gps_set_baud(board.gps_uart, config.GPS_BAUD_HIGH)
+            board.gps_reopen(config.GPS_BAUD_HIGH)
+            if not _gps_alive(board.gps_uart):        # raise didn't take -> stay
+                board.gps_reopen(config.GPS_BAUD)
+                rate = min(rate, 5)                  # 9600 can't carry high rate
+                print("GPS: kept at %d/%d Hz" % (config.GPS_BAUD, rate))
+        else:
+            print("GPS: no UBX/NMEA at 115200 or 9600 (antenna/power?)")
+    gps_configure(board.gps_uart, rate)              # configure at the live baud
     _assistnow_capture_identity()            # UBX identity for ZTP (before read loop)
     _assistnow_feed_stored(state)            # warm the GPS with any cached orbits
     reader = asyncio.StreamReader(board.gps_uart)
