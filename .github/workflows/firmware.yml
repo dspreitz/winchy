@@ -1,0 +1,96 @@
+name: firmware
+
+# Build + test on every push and PR. Publish binaries:
+#   - push to main  -> refresh the rolling "latest" prerelease
+#   - push of a v*   tag -> a versioned release
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  # ---- Host unit tests (pure Python, no hardware) -------------------------
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install test deps
+        run: python -m pip install --quiet pytest
+      - name: Run host unit tests
+        run: python -m pytest tests/ -v
+
+  # ---- Firmware build, one image per role --------------------------------
+  # The build freezes the app + compiles every module, so it doubles as the
+  # compile smoke-test. Runs in the Espressif IDF image via docker (keeps
+  # actions/checkout on the host runner, which the IDF image can't run).
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        role: [rope, winch]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build winchy-${{ matrix.role }}
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/repo" \
+            -e WINCHY_REPO=/repo \
+            espressif/idf:v5.5.1 \
+            bash /repo/firmware/fwbuild/build.sh ${{ matrix.role }}
+      - name: Fix artifact permissions
+        run: sudo chown -R "$(id -u):$(id -g)" _fwbuild
+      - uses: actions/upload-artifact@v4
+        with:
+          name: winchy-${{ matrix.role }}
+          path: _fwbuild/out/winchy-${{ matrix.role }}-*.bin
+          if-no-files-found: error
+
+  # ---- Rolling "latest" prerelease on main -------------------------------
+  release-latest:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Publish rolling 'latest' prerelease
+        run: |
+          find dist -name '*.bin' -exec cp {} . \;
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest winchy-*.bin \
+            --prerelease \
+            --title "latest (main)" \
+            --notes "Rolling build of main @ ${{ github.sha }}. Flash winchy-rope-*.bin onto the rope and winchy-winch-*.bin onto the winch."
+
+  # ---- Versioned release on a v* tag -------------------------------------
+  release-tag:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Publish ${{ github.ref_name }} release
+        run: |
+          find dist -name '*.bin' -exec cp {} . \;
+          gh release create "${{ github.ref_name }}" winchy-*.bin \
+            --title "${{ github.ref_name }}" \
+            --generate-notes

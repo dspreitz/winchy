@@ -16,6 +16,9 @@
 # from the shared State; mirrors the winch dashboard in firmware/winch/main.py.
 # app.py sets `state` before starting the HTTP server.
 
+import asyncio
+import binascii
+import hashlib
 import json
 
 state = None   # the shared State object, set by app.py's dashboard task
@@ -70,12 +73,11 @@ td.l{color:#8ac;width:46%}
 <button id=ulbtn onclick=ul() style="font-size:5vw;padding:12px;margin:8px 2px;width:97%;background:#235;color:#eee;border:1px solid #8ac;border-radius:6px">Upload log to GitHub</button>
 <div id=ulmsg style="font-size:4vw;color:#8ac;padding:2px 6px">&nbsp;</div>
 <script>
-var last=Date.now();var wasup=false;
+var last=Date.now();var wasup=false;var ws;
 function ul(){wasup=true;ulmsg.textContent='uploading...';
  fetch('/upload',{method:'POST'}).catch(function(e){ulmsg.textContent='upload error';});}
 function f(x,n){return (x==null)?'--':x.toFixed(n);}
-function tick(){
- fetch('/data').then(function(r){return r.json()}).then(function(d){
+function render(d){
   last=Date.now();document.body.className='';
   gps.innerHTML=(d.fix?'<span class=g>FIX</span>':'<span class=r>no fix</span>')+' '+d.sats+' sat'+(d.hacc<100?'  ±'+f(d.hacc,1)+'m':'');
   ll.textContent=f(d.lat,6)+', '+f(d.lon,6);
@@ -94,30 +96,85 @@ function tick(){
   rec.textContent=(d.rec?'recording':'idle')+(d.tsync?'':'  (no time)');
   if(d.upreq){ulmsg.textContent='uploading...';wasup=true;}
   else if(wasup){ulmsg.textContent='upload done';wasup=false;}
- }).catch(function(e){});
- if(Date.now()-last>3000) document.body.className='stale';
 }
-setInterval(tick,1000);tick();
+function connect(){
+ ws=new WebSocket('ws://'+location.host+'/ws');
+ ws.onmessage=function(ev){try{render(JSON.parse(ev.data));}catch(e){}};
+ ws.onclose=function(){setTimeout(connect,1000);};   // auto-reconnect
+ ws.onerror=function(){try{ws.close();}catch(e){}};
+}
+connect();
+setInterval(function(){if(Date.now()-last>3000) document.body.className='stale';},1000);
 </script></body></html>"""
+
+
+# --- WebSocket push --------------------------------------------------------
+# The dashboard opens a WebSocket to /ws and the rope PUSHES the latest status
+# (JSON) every WS_PUSH_MS instead of the browser polling /data. SHA1 for the
+# handshake is available because the build has SSL (HASHLIB_SHA1 = PY_SSL).
+WS_PUSH_MS = 500
+_WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"   # RFC 6455 magic
+
+
+def _ws_accept(key):
+    return binascii.b2a_base64(hashlib.sha1(key + _WS_GUID).digest()).strip()
+
+
+def _ws_text_frame(payload):
+    # Server->client text frame: FIN + opcode 0x1, unmasked.
+    n = len(payload)
+    if n < 126:
+        hdr = bytes((0x81, n))
+    elif n < 65536:
+        hdr = bytes((0x81, 126, n >> 8, n & 0xFF))
+    else:
+        hdr = bytes((0x81, 127)) + n.to_bytes(8, "big")
+    return hdr + payload
+
+
+async def _ws_push(writer, key):
+    # Finish the handshake, then push status until the client leaves (a write to
+    # a closed socket raises -> we stop quietly).
+    writer.write(b"HTTP/1.1 101 Switching Protocols\r\n"
+                 b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                 b"Sec-WebSocket-Accept: " + _ws_accept(key) + b"\r\n\r\n")
+    await writer.drain()
+    try:
+        while True:
+            writer.write(_ws_text_frame(json.dumps(_data(state)).encode()))
+            await writer.drain()
+            await asyncio.sleep_ms(WS_PUSH_MS)
+    except Exception:
+        pass                          # client disconnected
 
 
 async def handle(reader, writer):
     try:
         req = await reader.readline()
-        while True:                       # drain request headers
+        headers = {}
+        while True:                       # read request headers
             h = await reader.readline()
             if not h or h == b"\r\n":
                 break
+            i = h.find(b":")
+            if i > 0:
+                headers[h[:i].strip().lower()] = h[i + 1:].strip()
         path = req.split(b" ")[1] if b" " in req else b"/"
-        if path.startswith(b"/data"):
+        if (path == b"/ws"
+                and headers.get(b"upgrade", b"").lower() == b"websocket"
+                and headers.get(b"sec-websocket-key")):
+            await _ws_push(writer, headers[b"sec-websocket-key"])
+        elif path.startswith(b"/data"):   # kept for curl/debug; the UI uses /ws
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
                          b"Connection: close\r\n\r\n")
             writer.write(json.dumps(_data(state)).encode())
+            await writer.drain()
         elif path.startswith(b"/upload"):  # manual log upload (picked up by app)
             if state is not None:
                 state.upload_request = True
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
                          b"Connection: close\r\n\r\nupload queued")
+            await writer.drain()
         elif path.startswith(b"/raw"):    # download the raw log
             try:
                 body = open("raw.csv", "rb").read()
@@ -126,11 +183,12 @@ async def handle(reader, writer):
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/csv\r\n"
                          b"Connection: close\r\n\r\n")
             writer.write(body)
+            await writer.drain()
         else:
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n"
                          b"Connection: close\r\n\r\n")
             writer.write(PAGE.encode())
-        await writer.drain()
+            await writer.drain()
     except Exception as e:
         print("rope http err:", e)
     try:

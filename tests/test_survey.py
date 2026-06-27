@@ -65,13 +65,33 @@ def test_single_outlier_ignored():
     assert s.n == n_before
 
 
-def test_reposition_reseeds_after_sustained_move():
+def test_far_fixes_rejected_after_convergence():
+    # Once converged, the parked winch does not move within a session, so a
+    # burst of far fixes is receiver noise (the u-blox 7 can jump hundreds of
+    # metres). They must be rejected and the locked position kept; a genuine
+    # relocation is handled by the power-cycle re-survey, not mid-session.
     s = SurveyIn(reset_dist_m=15.0, reset_hits=5)
     for _ in range(40):
         s.add(48.0, 11.0, 0.0)
     assert s.converged
-    new_lat, new_lon = 48.01, 11.0      # winch towed ~1.1 km
-    for _ in range(5):
+    lat_before, lon_before, n_before = s.lat, s.lon, s.n
+    for _ in range(10):                 # sustained far "fixes" (noise)
+        assert s.add(48.01, 11.0, 0.0) is False   # ~1.1 km away, all rejected
+    assert s.lat == lat_before          # position not disturbed
+    assert s.lon == lon_before
+    assert s.n == n_before              # average not discarded
+    assert s.converged                  # stays locked on the good fix
+
+
+def test_reposition_reseeds_before_convergence():
+    # A bad initial seed (before convergence) IS corrected: sustained far fixes
+    # re-seed the average at the new spot.
+    s = SurveyIn(reset_dist_m=15.0, reset_hits=5, min_samples=30)
+    for _ in range(3):
+        s.add(48.0, 11.0, 0.0)          # only 3 samples -> not converged
+    assert not s.converged
+    new_lat, new_lon = 48.01, 11.0
+    for _ in range(5):                  # reset_hits consecutive far fixes
         s.add(new_lat, new_lon, 0.0)
     assert s.n == 1                     # average discarded, re-seeded here
     assert s.lat == new_lat
