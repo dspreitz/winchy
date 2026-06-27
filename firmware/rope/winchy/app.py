@@ -653,16 +653,16 @@ def _gps_alive(uart, timeout_ms=1500):
     return False
 
 
-async def gps_task(state):
-    global _pps_rtc
-    # PROBE the module's baud rather than assume it. The M10 UART baud is
-    # RAM-only: it survives a warm reset (stays high) but reverts to the 9600
-    # default on a cold start, and we can't tell which. So try high baud FIRST
-    # (the common warm case) and only send the raise-baud command once we've
-    # actually found the module at 9600 - sending it at the wrong baud (host@9600
-    # to a module@115200) just injects line noise that was breaking the very next
-    # detection and dropping us back to 9600 while the module stayed at 115200.
-    # _gps_alive accepts UBX or NMEA (whatever the current config emits).
+def _gps_detect_baud():
+    """Probe the module's actual baud and bring it to high baud; return the nav
+    rate to use. The M10 baud is RAM-only and only persists in BBR while the
+    backup domain stays powered - with no battery, a USB-unplug reset cold-starts
+    the module at 9600 every time. Try high FIRST (the warm/BBR case), and only
+    send the raise-baud command once the module is actually found at 9600 -
+    sending it at the wrong baud (host@9600 to module@115200) injects line noise
+    that breaks the next detection. _gps_alive accepts UBX or NMEA. Reused on a
+    read-stall (see gps_task) to self-heal a boot race where the module was not
+    streaming yet when first probed, or a baud revert."""
     rate = config.GPS_NAV_RATE_HZ
     board.gps_reopen(config.GPS_BAUD_HIGH)
     if not _gps_alive(board.gps_uart):               # not already at high baud
@@ -670,12 +670,15 @@ async def gps_task(state):
         if _gps_alive(board.gps_uart):               # found at 9600 -> raise it
             gps_set_baud(board.gps_uart, config.GPS_BAUD_HIGH)
             board.gps_reopen(config.GPS_BAUD_HIGH)
-            if not _gps_alive(board.gps_uart):        # raise didn't take -> stay
+            if not _gps_alive(board.gps_uart):        # raise didn't confirm -> stay
                 board.gps_reopen(config.GPS_BAUD)
                 rate = min(rate, 5)                  # 9600 can't carry high rate
-                print("GPS: kept at %d/%d Hz" % (config.GPS_BAUD, rate))
-        else:
-            print("GPS: no UBX/NMEA at 115200 or 9600 (antenna/power?)")
+    return rate
+
+
+async def gps_task(state):
+    global _pps_rtc
+    rate = _gps_detect_baud()
     gps_configure(board.gps_uart, rate)              # configure at the live baud
     _assistnow_capture_identity()            # UBX identity for ZTP (before read loop)
     _assistnow_feed_stored(state)            # warm the GPS with any cached orbits
@@ -685,7 +688,17 @@ async def gps_task(state):
     Pin(config.GPS_PPS, Pin.IN).irq(trigger=Pin.IRQ_RISING, handler=_on_pps)
     last_fix_save = None
     while True:
-        cls, mid, payload = await read_ubx(reader)
+        try:
+            cls, mid, payload = await asyncio.wait_for(read_ubx(reader), 8)
+        except asyncio.TimeoutError:
+            # No UBX for 8 s: the module may not have been streaming yet when
+            # first probed (boot race), or its baud reverted (BBR lost on a
+            # no-battery USB-unplug reset). Re-detect, reconfigure, carry on.
+            print("GPS: no data for 8s, re-detecting baud")
+            rate = _gps_detect_baud()
+            gps_configure(board.gps_uart, rate)
+            reader = asyncio.StreamReader(board.gps_uart)
+            continue
         if cls != 0x01 or mid != 0x07:        # only UBX-NAV-PVT
             continue
         update = parse_nav_pvt(payload)
