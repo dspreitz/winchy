@@ -205,6 +205,9 @@ uploading = False   # True while a blocking GitHub round-trip runs: the OLED
                     # suppressed, so the notice stays put through the freeze and
                     # the operator knows the pause is expected (not a crash).
 _upload_request = False   # dashboard "Upload log" button -> picked up by _serve
+# Upload progress for the dashboard, set by _serve's offload step:
+# "" idle | "uploading" | "ok" (verified) | "unverified" | "fail".
+_upload_status = ""
 
 
 def _begin_upload(what):
@@ -564,6 +567,16 @@ def _stamp():
     return "%04d%02d%02d-%02d%02d" % (t[0], t[1], t[2], t[3], t[4])
 
 
+def _upload_suffix():
+    # Per-upload unique tag so each offloaded chunk is a DISTINCT asset (never
+    # overwriting an earlier one). Seconds-resolution UTC when the clock is set
+    # (uploads are always >1 s apart); a ticks-based tag otherwise.
+    if clock_set:
+        t = time.localtime()
+        return "%02d%02d%02d" % (t[3], t[4], t[5])
+    return "x%06x" % (time.ticks_ms() & 0xFFFFFF)
+
+
 def _gzip_file(path):
     # Return (data, ext, content_type). Gzip the file if this build's deflate
     # supports compression; otherwise upload the raw CSV. This ESP32-S3
@@ -591,20 +604,23 @@ def _gzip_file(path):
 
 
 def _github_upload():
-    # Replace the rolling log asset on the 'logs' release: look up the release,
-    # delete any existing asset of the same name, then upload the current log
-    # (gzip-compressed). Blocks the asyncio loop for the round-trips (~secs); RX
-    # stays IRQ-driven. Returns the UNCOMPRESSED byte count offloaded (0 on
-    # failure) so _reset_log's grew-during-upload check stays correct.
+    # Upload the current log to a (now unique-named) asset on the 'logs' release,
+    # gzip-compressed, then VERIFY by reading the asset back from the server and
+    # comparing its stored size to the bytes we sent (server-vs-device check).
+    # Blocks the asyncio loop for the round-trips (~secs); RX stays IRQ-driven.
+    # Returns (uploaded, verified): uploaded = UNCOMPRESSED bytes offloaded on
+    # HTTP 2xx (0 on failure, so _reset_log's grew-during-upload check stays
+    # correct); verified = the server's stored asset size equals the bytes sent.
     if not GITHUB_TOKEN:
-        return 0
+        return 0, False
     import urequests
     import gc
     uploaded = 0
-    # Prepend the session start (first synced time) so each session is a
-    # distinct, dated file on the release.
-    stamp = log_start or _stamp()
-    asset = (stamp + "_" if stamp else "") + GITHUB_ASSET
+    verified = False
+    # Group by session start (first synced time) + a unique per-upload suffix so
+    # each offloaded chunk is a distinct file and none is ever overwritten.
+    stamp = log_start or _stamp() or "nogps"
+    asset = stamp + "_" + _upload_suffix() + "_" + GITHUB_ASSET
     hdr = {"Authorization": "Bearer " + GITHUB_TOKEN, "User-Agent": "winchy",
            "Accept": "application/vnd.github+json"}
     try:
@@ -619,8 +635,9 @@ def _github_upload():
         except OSError:
             orig_size = 0
         body, ext, ctype = _gzip_file(LOG_PATH)
+        sent = len(body)
         name = asset + ext
-        for a in rel.get("assets", ()):
+        for a in rel.get("assets", ()):    # unique names, but clear a stale retry
             if a.get("name") == name:
                 urequests.delete(
                     "https://api.github.com/repos/%s/releases/assets/%d"
@@ -631,14 +648,28 @@ def _github_upload():
         u = urequests.post(
             "https://uploads.github.com/repos/%s/releases/%d/assets?name=%s"
             % (GITHUB_REPO, rid, name), data=body, headers=h2)
-        print("GitHub upload %s: HTTP %d (%d B)" % (name, u.status_code, len(body)))
-        if 200 <= u.status_code < 300:
-            uploaded = orig_size           # uncompressed size for the reset check
+        ok = 200 <= u.status_code < 300
+        print("GitHub upload %s: HTTP %d (%d B)" % (name, u.status_code, sent))
         u.close()
+        gc.collect()
+        if ok:
+            uploaded = orig_size           # uncompressed size for the reset check
+            # Read the asset back from the release and compare its stored size to
+            # what we sent - the server-vs-device verification.
+            r2 = urequests.get("https://api.github.com/repos/%s/releases/tags/%s"
+                               % (GITHUB_REPO, GITHUB_RELEASE_TAG), headers=hdr)
+            rel2 = r2.json()
+            r2.close()
+            for a in rel2.get("assets", ()):
+                if a.get("name") == name:
+                    verified = (a.get("size", -1) == sent)
+                    break
+            print("GitHub verify %s: %s (server vs %d B sent)"
+                  % (name, "OK" if verified else "MISMATCH", sent))
     except Exception as e:
         print("GitHub upload failed:", e)
     gc.collect()
-    return uploaded
+    return uploaded, verified
 
 
 def _github_announce_ip(ip, ssid):
@@ -797,9 +828,10 @@ body{font-family:sans-serif;background:#111;color:#eee;margin:0;text-align:cente
 <button id=ulbtn onclick=ul() style="font-size:5vw;padding:12px;margin:8px 2px;width:96%;background:#235;color:#eee;border:1px solid #8ac;border-radius:6px">Upload log to GitHub</button>
 <div id=ulmsg class=lbl>&nbsp;</div>
 <script>
-var last=Date.now();var wasup=false;var ws;
-function ul(){wasup=true;ulmsg.textContent='uploading...';
- fetch('/upload',{method:'POST'}).catch(function(e){ulmsg.textContent='upload error';});}
+var last=Date.now();var ws;
+var UPLBL={uploading:'uploading…',ok:'✓ upload verified',unverified:'⚠ uploaded, NOT verified',fail:'✗ upload failed'};
+function ul(){ulmsg.textContent='uploading…';
+ fetch('/upload',{method:'POST'}).catch(function(e){ulmsg.textContent='✗ upload error';});}
 function render(d){
  last=Date.now();document.body.className='';
  phase.textContent=d.phase;
@@ -815,8 +847,7 @@ function render(d){
  gpsdot.style.background=d.gps?'#1c1':'#c33';
  tdot.style.background=d.tsync?'#1c1':'#c33';
  clock.textContent=d.time+' UTC';
- if(d.upreq){ulmsg.textContent='uploading...';wasup=true;}
- else if(wasup){ulmsg.textContent='upload done';wasup=false;}
+ if(d.upstatus){ulmsg.textContent=UPLBL[d.upstatus]||d.upstatus;}
 }
 function connect(){
  ws=new WebSocket('ws://'+location.host+'/ws');
@@ -867,7 +898,7 @@ async def _ws_push(writer, key):
     try:
         while True:
             d = dict(latest)
-            d["upreq"] = _upload_request
+            d["upstatus"] = _upload_status
             writer.write(_ws_text_frame(json.dumps(d).encode()))
             await writer.drain()
             await asyncio.sleep_ms(WS_PUSH_MS)
@@ -894,7 +925,7 @@ async def handle(reader, writer):
             await _ws_push(writer, headers[b"sec-websocket-key"])
         elif path.startswith(b"/data"):   # kept for curl/debug; the UI uses /ws
             d = dict(latest)
-            d["upreq"] = _upload_request
+            d["upstatus"] = _upload_status
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
                          b"Connection: close\r\n\r\n")
             writer.write(json.dumps(d).encode())
@@ -971,7 +1002,7 @@ async def _serve():
         wlan.active(True)
     else:
         print("WiFi: disabled or no secrets.py; dashboard off")
-    global log_start, online, _upload_request
+    global log_start, online, _upload_request, _upload_status
     n = 0
     while True:                           # keep-alive + WiFi upkeep + flush
         _flush_log()
@@ -1028,10 +1059,17 @@ async def _serve():
             except OSError:
                 has_data = False
             if has_data:
+                _upload_status = "uploading"
                 _begin_upload("log upload")
-                up = _github_upload()     # interim periodic; later: per launch
-                if up:
-                    _reset_log(up)        # reclaim flash after a good upload
+                await asyncio.sleep_ms(600)   # let the dashboard push "uploading"
+                up, verified = _github_upload()   # interim periodic; later per launch
+                if up and verified:
+                    _reset_log(up)            # reclaim flash after a VERIFIED upload
+                    _upload_status = "ok"
+                elif up:
+                    _upload_status = "unverified"  # uploaded but server size mismatch
+                else:
+                    _upload_status = "fail"
                 _end_upload()
             _upload_request = False       # clear the manual request once handled
         n += 1
