@@ -37,37 +37,51 @@ if [ ! -d "$SRC/.git" ]; then
         https://github.com/micropython/micropython.git "$SRC"
 fi
 cd "$SRC"
-# Reset the two files we patch to pristine, so per-role edits never accumulate
-# when both roles are built from the same clone.
-git checkout -- ports/esp32/mpconfigport.h \
-    "ports/esp32/boards/$BOARD/mpconfigboard.h" 2>/dev/null || true
+
+# Clean vs incremental. A role switch (or CLEAN=1, or no warm build dir) forces a
+# clean build so per-role frozen content + config never mix. Rebuilding the SAME
+# role keeps the warm build dir AND the config patches, so only the changed app
+# re-freezes (~30-60 s) instead of the whole tree. CI always starts from a fresh
+# checkout (no _fwbuild / no .last_role), so CI stays a clean build - unchanged.
+LAST_ROLE_FILE="$WORK/.last_role"
+LAST_ROLE="$(cat "$LAST_ROLE_FILE" 2>/dev/null || echo '')"
+INCREMENTAL=0
+if [ "${CLEAN:-0}" != "1" ] && [ "$LAST_ROLE" = "$ROLE" ] \
+        && [ -d "ports/esp32/build-$BOARD" ]; then
+    INCREMENTAL=1
+fi
 
 echo ">> building mpy-cross"
 make -C mpy-cross >/dev/null
 
 cd ports/esp32
-# Clean the board build dir so each role builds its own frozen content from
-# scratch (the standard single-build layout; isolates rope vs winch in one
-# clone). A non-default BUILD= dir breaks the frozen mpy-cross link step.
-echo ">> clean build dir"
-rm -rf "build-$BOARD"
-echo ">> fetching esp32 submodules"
-make BOARD="$BOARD" submodules >/dev/null
-
-echo ">> applying Winchy config (deflate + USB name=winchy-$ROLE)"
-BOARD_H="boards/$BOARD/mpconfigboard.h"
-if ! grep -q "MICROPY_PY_DEFLATE_COMPRESS" "$BOARD_H"; then
-    cat >> "$BOARD_H" <<'EOF'
+if [ "$INCREMENTAL" = "1" ]; then
+    echo ">> INCREMENTAL build (same role '$ROLE'): keeping build-$BOARD + config"
+else
+    echo ">> CLEAN build (role='$ROLE' last='$LAST_ROLE' CLEAN=${CLEAN:-0})"
+    # Reset the two patched files to pristine so per-role edits never accumulate;
+    # a non-default BUILD= dir breaks the frozen mpy-cross link, so use the
+    # standard single-build layout and wipe it.
+    git checkout -- mpconfigport.h "boards/$BOARD/mpconfigboard.h" 2>/dev/null || true
+    rm -rf "build-$BOARD"
+    echo ">> fetching esp32 submodules"
+    make BOARD="$BOARD" submodules >/dev/null
+    echo ">> applying Winchy config (deflate + USB name=winchy-$ROLE)"
+    BOARD_H="boards/$BOARD/mpconfigboard.h"
+    if ! grep -q "MICROPY_PY_DEFLATE_COMPRESS" "$BOARD_H"; then
+        cat >> "$BOARD_H" <<'EOF'
 
 // --- Winchy custom build: enable deflate (gzip/zlib) compression ---
 #define MICROPY_PY_DEFLATE_COMPRESS (1)
 EOF
+    fi
+    sed -i "s/\"Espressif Device\"/\"winchy-$ROLE\"/g" mpconfigport.h
+    sed -i 's/"Espressif Systems"/"Winchy"/g' mpconfigport.h
 fi
-sed -i "s/\"Espressif Device\"/\"winchy-$ROLE\"/g" mpconfigport.h
-sed -i 's/"Espressif Systems"/"Winchy"/g' mpconfigport.h
 
 echo ">> building firmware (frozen manifest: $(basename "$MANIFEST"))"
 make BOARD="$BOARD" FROZEN_MANIFEST="$MANIFEST"
+echo "$ROLE" > "$LAST_ROLE_FILE"   # record role for the next incremental decision
 
 DEST="$OUT/winchy-$ROLE-$MPY_REF.bin"
 cp "build-$BOARD/firmware.bin" "$DEST"
