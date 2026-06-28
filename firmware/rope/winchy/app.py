@@ -157,6 +157,8 @@ WIFI_PERIOD_S = 600         # try to offload this often while idle (10 min)
 GITHUB_REPO = "dspreitz/winchy-logs"
 GITHUB_RELEASE_TAG = "logs"
 GITHUB_ASSET = "rope_rawlog.csv"
+GITHUB_TIMEOUT_S = 30   # socket timeout on the (blocking) upload round-trips, so
+                        # a stalled connection can't freeze the asyncio loop
 try:
     from secrets import GITHUB_TOKEN
 except ImportError:
@@ -1043,7 +1045,7 @@ def _github_upload_raw(asset):
     verified = False
     try:
         r = urequests.get("https://api.github.com/repos/%s/releases/tags/%s"
-                          % (GITHUB_REPO, GITHUB_RELEASE_TAG), headers=hdr)
+                          % (GITHUB_REPO, GITHUB_RELEASE_TAG), headers=hdr, timeout=GITHUB_TIMEOUT_S)
         rel = r.json()
         r.close()
         rid = rel["id"]
@@ -1055,13 +1057,14 @@ def _github_upload_raw(asset):
             if a.get("name") == name:
                 urequests.delete(
                     "https://api.github.com/repos/%s/releases/assets/%d"
-                    % (GITHUB_REPO, a["id"]), headers=hdr).close()
+                    % (GITHUB_REPO, a["id"]), headers=hdr, timeout=GITHUB_TIMEOUT_S).close()
         gc.collect()
         h2 = dict(hdr)
         h2["Content-Type"] = ctype
         u = urequests.post(
             "https://uploads.github.com/repos/%s/releases/%d/assets?name=%s"
-            % (GITHUB_REPO, rid, name), data=body, headers=h2)
+            % (GITHUB_REPO, rid, name), data=body, headers=h2,
+            timeout=GITHUB_TIMEOUT_S)
         ok = 200 <= u.status_code < 300
         print("GitHub upload %s: HTTP %d (%d B)" % (name, u.status_code, sent))
         u.close()
@@ -1070,7 +1073,7 @@ def _github_upload_raw(asset):
             # Read the asset back from the release and compare its stored size to
             # what we sent - the server-vs-device verification.
             r2 = urequests.get("https://api.github.com/repos/%s/releases/tags/%s"
-                               % (GITHUB_REPO, GITHUB_RELEASE_TAG), headers=hdr)
+                               % (GITHUB_REPO, GITHUB_RELEASE_TAG), headers=hdr, timeout=GITHUB_TIMEOUT_S)
             rel2 = r2.json()
             r2.close()
             for a in rel2.get("assets", ()):
@@ -1089,24 +1092,31 @@ async def _run_upload(state):
     # Drive one raw.csv upload + the dashboard status. Each upload goes to a
     # UNIQUE asset (so chunks are never overwritten), and the device flash is
     # only reclaimed (raw_uploaded_bytes) once the server copy is verified.
+    if state.uploading:                    # one already in flight -> ignore
+        return
     try:
         size = os.stat(RAW_LOG_PATH)[6]
     except OSError:
         size = 0
     if size <= len(RAW_LOG_HEADER):        # header only - nothing to offload
+        state.upload_status = "nodata"
         return
+    state.uploading = True
     state.upload_status = "uploading"
-    await asyncio.sleep_ms(600)            # let the dashboard push "uploading"
-    stamp = state.log_start or _log_stamp() or "nogps"
-    asset = stamp + "_" + _upload_suffix() + "_" + GITHUB_ASSET
-    ok, verified = _github_upload_raw(asset)
-    if ok and verified:
-        state.raw_uploaded_bytes = size    # writer may now reclaim the flash
-        state.upload_status = "ok"
-    elif ok:
-        state.upload_status = "unverified"
-    else:
-        state.upload_status = "fail"
+    try:
+        await asyncio.sleep_ms(600)        # let the dashboard push "uploading"
+        stamp = state.log_start or _log_stamp() or "nogps"
+        asset = stamp + "_" + _upload_suffix() + "_" + GITHUB_ASSET
+        ok, verified = _github_upload_raw(asset)
+        if ok and verified:
+            state.raw_uploaded_bytes = size  # writer may now reclaim the flash
+            state.upload_status = "ok"
+        elif ok:
+            state.upload_status = "unverified"
+        else:
+            state.upload_status = "fail"
+    finally:
+        state.uploading = False
 
 
 def _github_announce_ip(ip, ssid, tag="rope"):
@@ -1124,7 +1134,7 @@ def _github_announce_ip(ip, ssid, tag="rope"):
     ok = False
     try:
         r = urequests.get("https://api.github.com/repos/%s/releases/tags/%s"
-                          % (GITHUB_REPO, GITHUB_RELEASE_TAG), headers=hdr)
+                          % (GITHUB_REPO, GITHUB_RELEASE_TAG), headers=hdr, timeout=GITHUB_TIMEOUT_S)
         rel = r.json()
         r.close()
         rid = rel["id"]
@@ -1136,7 +1146,7 @@ def _github_announce_ip(ip, ssid, tag="rope"):
         u = urequests.request(
             "PATCH", "https://api.github.com/repos/%s/releases/%d"
             % (GITHUB_REPO, rid),
-            data=_json.dumps({"body": "\n".join(sorted(keep))}), headers=hdr)
+            data=_json.dumps({"body": "\n".join(sorted(keep))}), headers=hdr, timeout=GITHUB_TIMEOUT_S)
         ok = 200 <= u.status_code < 300
         print("IP announce %s (%s): HTTP %d" % (ip, ssid, u.status_code))
         u.close()

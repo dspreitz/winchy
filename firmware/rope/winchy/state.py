@@ -62,8 +62,10 @@ class State:
         self.raw_recording = False   # imu_task is mid-episode (gates the reset)
         self.upload_request = False  # dashboard "Upload log" button -> wifi task
         # Upload progress for the dashboard, set by the upload task:
-        # "" idle | "uploading" | "ok" (verified) | "unverified" | "fail".
+        # "" idle | "uploading" | "ok" (verified) | "unverified" | "fail" |
+        # "nodata".
         self.upload_status = ""
+        self.uploading = False   # an upload round-trip is in flight (guards re-entry)
         # Radio cross-upload: a WebGUI "Upload log" click also asks the WINCH to
         # upload (protocol.UPLOAD_CMD, retried until UPLOAD_ACK). telemetry_task
         # owns the TX; on_radio sets the RX-side fields. nonce = idempotency id.

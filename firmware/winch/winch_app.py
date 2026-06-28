@@ -161,6 +161,8 @@ except ImportError:
 GITHUB_REPO = "dspreitz/winchy-logs"
 GITHUB_RELEASE_TAG = "logs"
 GITHUB_ASSET = "winch_rxlog.csv"
+GITHUB_TIMEOUT_S = 30   # socket timeout on the (blocking) upload round-trips, so
+                        # a stalled connection can't freeze the asyncio loop
 UPLOAD_PERIOD_S = 600       # interim: re-upload every 10 min while on WiFi
                             # (later: trigger once per launch via phase detection)
 # Blocking GitHub round-trips (log upload, IP announce) stall the single-thread
@@ -689,7 +691,7 @@ def _github_upload():
            "Accept": "application/vnd.github+json"}
     try:
         r = urequests.get("https://api.github.com/repos/%s/releases/tags/%s"
-                          % (GITHUB_REPO, GITHUB_RELEASE_TAG), headers=hdr)
+                          % (GITHUB_REPO, GITHUB_RELEASE_TAG), headers=hdr, timeout=GITHUB_TIMEOUT_S)
         rel = r.json()
         r.close()
         rid = rel["id"]
@@ -705,13 +707,14 @@ def _github_upload():
             if a.get("name") == name:
                 urequests.delete(
                     "https://api.github.com/repos/%s/releases/assets/%d"
-                    % (GITHUB_REPO, a["id"]), headers=hdr).close()
+                    % (GITHUB_REPO, a["id"]), headers=hdr, timeout=GITHUB_TIMEOUT_S).close()
         gc.collect()
         h2 = dict(hdr)
         h2["Content-Type"] = ctype
         u = urequests.post(
             "https://uploads.github.com/repos/%s/releases/%d/assets?name=%s"
-            % (GITHUB_REPO, rid, name), data=body, headers=h2)
+            % (GITHUB_REPO, rid, name), data=body, headers=h2,
+            timeout=GITHUB_TIMEOUT_S)
         ok = 200 <= u.status_code < 300
         print("GitHub upload %s: HTTP %d (%d B)" % (name, u.status_code, sent))
         u.close()
@@ -721,7 +724,7 @@ def _github_upload():
             # Read the asset back from the release and compare its stored size to
             # what we sent - the server-vs-device verification.
             r2 = urequests.get("https://api.github.com/repos/%s/releases/tags/%s"
-                               % (GITHUB_REPO, GITHUB_RELEASE_TAG), headers=hdr)
+                               % (GITHUB_REPO, GITHUB_RELEASE_TAG), headers=hdr, timeout=GITHUB_TIMEOUT_S)
             rel2 = r2.json()
             r2.close()
             for a in rel2.get("assets", ()):
@@ -753,7 +756,7 @@ def _github_announce_ip(ip, ssid):
     ok = False
     try:
         r = urequests.get("https://api.github.com/repos/%s/releases/tags/%s"
-                          % (GITHUB_REPO, GITHUB_RELEASE_TAG), headers=hdr)
+                          % (GITHUB_REPO, GITHUB_RELEASE_TAG), headers=hdr, timeout=GITHUB_TIMEOUT_S)
         rel = r.json()
         r.close()
         rid = rel["id"]
@@ -765,7 +768,7 @@ def _github_announce_ip(ip, ssid):
         u = urequests.request(
             "PATCH", "https://api.github.com/repos/%s/releases/%d"
             % (GITHUB_REPO, rid),
-            data=json.dumps({"body": "\n".join(sorted(keep))}), headers=hdr)
+            data=json.dumps({"body": "\n".join(sorted(keep))}), headers=hdr, timeout=GITHUB_TIMEOUT_S)
         ok = 200 <= u.status_code < 300
         print("IP announce %s (%s): HTTP %d" % (ip, ssid, u.status_code))
         u.close()
@@ -908,7 +911,7 @@ body{font-family:sans-serif;background:#111;color:#eee;margin:0;text-align:cente
 <div id=ulmsg class=lbl>&nbsp;</div>
 <script>
 var last=Date.now();var ws;
-var UPLBL={uploading:'uploading…',ok:'✓ upload verified',unverified:'⚠ uploaded, NOT verified',fail:'✗ upload failed'};
+var UPLBL={uploading:'uploading…',ok:'✓ upload verified',unverified:'⚠ uploaded, NOT verified',fail:'✗ upload failed',nodata:'nothing new to upload'};
 function ul(){ulmsg.textContent='uploading…';
  fetch('/upload',{method:'POST'}).catch(function(e){ulmsg.textContent='✗ upload error';});}
 function render(d){
@@ -1019,13 +1022,14 @@ async def handle(reader, writer):
             writer.write(json.dumps(d).encode())
             await writer.drain()
         elif path.startswith(b"/upload"):  # manual log upload (picked up by _serve)
-            _upload_request = True
-            # Also ask the rope to upload, over the radio (cross-upload).
-            # _cross_send (in on_receive) sends UPLOAD_CMD up to 5x until ACKed.
-            cross_nonce_ctr = (cross_nonce_ctr + 1) & 0xFF
-            cross_cmd_nonce = cross_nonce_ctr
-            cross_cmd_tries = 5
-            cross_cmd_ts = 0               # send on the next opportunity
+            if not uploading:              # ignore the click while an upload runs
+                _upload_request = True
+                # Also ask the rope to upload, over the radio (cross-upload).
+                # _cross_send (in on_receive) sends UPLOAD_CMD up to 5x until ACKed.
+                cross_nonce_ctr = (cross_nonce_ctr + 1) & 0xFF
+                cross_cmd_nonce = cross_nonce_ctr
+                cross_cmd_tries = 5
+                cross_cmd_ts = 0           # send on the next opportunity
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
                          b"Connection: close\r\n\r\nupload queued")
             await writer.drain()
@@ -1165,6 +1169,8 @@ async def _serve():
                 else:
                     _upload_status = "fail"
                 _end_upload()
+            else:
+                _upload_status = "nodata"     # nothing new to offload (feedback)
             _upload_request = False       # clear the manual request once handled
         n += 1
         await asyncio.sleep_ms(1000)

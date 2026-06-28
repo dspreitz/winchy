@@ -82,7 +82,7 @@ td.l{color:#8ac;width:46%}
 <div id=ulmsg style="font-size:4vw;color:#8ac;padding:2px 6px">&nbsp;</div>
 <script>
 var last=Date.now();var ws;
-var UPLBL={uploading:'uploading…',ok:'✓ upload verified',unverified:'⚠ uploaded, NOT verified',fail:'✗ upload failed'};
+var UPLBL={uploading:'uploading…',ok:'✓ upload verified',unverified:'⚠ uploaded, NOT verified',fail:'✗ upload failed',nodata:'nothing new to upload'};
 function ul(){ulmsg.textContent='uploading…';
  fetch('/upload',{method:'POST'}).catch(function(e){ulmsg.textContent='✗ upload error';});}
 function f(x,n){return (x==null)?'--':x.toFixed(n);}
@@ -179,7 +179,7 @@ async def handle(reader, writer):
             writer.write(json.dumps(_data(state)).encode())
             await writer.drain()
         elif path.startswith(b"/upload"):  # manual log upload (picked up by app)
-            if state is not None:
+            if state is not None and not state.uploading:   # ignore while busy
                 state.upload_request = True
                 # Also ask the winch to upload, over the radio (cross-upload).
                 # telemetry_task sends UPLOAD_CMD(nonce) up to 5x until ACKed.
