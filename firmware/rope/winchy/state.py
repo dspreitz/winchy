@@ -54,6 +54,7 @@ class State:
         self.gps_ts = 0
         self.time_synced = False        # RTC set (by GPS+PPS or, as fallback, NTP)
         self.time_source = None         # None | "ntp" | "gps"; GPS always wins
+        self.gps_time_cand = None       # pending GPS-time consistency candidate
         self.log_start = None    # "yyyymmdd-hhmm" session start (first GPS time)
         self.raw_uploaded_bytes = 0  # >0 = raw.csv offloaded; writer resets it
         self.raw_q = []          # pending raw-log lines; drained by raw_writer_task

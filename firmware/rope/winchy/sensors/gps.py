@@ -253,6 +253,7 @@ def parse_nav_pvt(pl):
     if len(pl) < 92:
         return None
     year, month, day, hour, mn, sec, valid = struct.unpack_from("<HBBBBBB", pl, 4)
+    t_acc = struct.unpack_from("<I", pl, 12)[0]   # time accuracy estimate, ns
     fix_type, flags, _f2, num_sv = struct.unpack_from("<BBBB", pl, 20)
     lon, lat, _h, hmsl = struct.unpack_from("<iiii", pl, 24)
     hacc, vacc = struct.unpack_from("<II", pl, 40)
@@ -272,6 +273,7 @@ def parse_nav_pvt(pl):
         "sacc_ms": sacc / 1000.0,
         "datetime": ((year, month, day, hour, mn, sec)
                      if (valid & 0x04) else None),    # bit2 = fullyResolved
+        "t_acc_ns": t_acc,                            # time accuracy estimate, ns
     }
 
 

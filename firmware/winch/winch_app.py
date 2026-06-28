@@ -36,6 +36,7 @@ from _sx126x import ERR_NONE
 import protocol
 import nmea
 import wifi
+import gpstime
 from survey import SurveyIn
 
 # Radio parameters: SF/BW/CR/sync/freq must match firmware/rope/config.py.
@@ -196,6 +197,7 @@ def _survey_fields():
 # UTC second boundary) and overrides an earlier NTP set once it locks.
 clock_set = False           # is the winch RTC set (from any source)?
 gps_synced = False          # has GPS+PPS set the RTC? (preferred; gates NTP)
+_gps_time_cand = None       # pending GPS-time consistency candidate (gpstime)
 log_start = None            # "yyyymmdd-hhmm" session start, latched once synced
 online = False              # winchy-logs (GitHub) currently reachable? -> OLED "I"
 
@@ -460,7 +462,7 @@ async def _gps_task():
     # OLED when the rope link is idle. RX/TX of the LoRa link is unaffected
     # (it is IRQ-driven); this only shares the radio for the low-rate send.
     global gps_sats, gps_has_fix, _gps_buf, _pps_rtc, clock_set, gps_synced
-    global _aided_time, _aid_save_ms
+    global _aided_time, _aid_save_ms, _gps_time_cand
     _pps_rtc = RTC()
     Pin(GPS_PPS_PIN, Pin.IN).irq(trigger=Pin.IRQ_RISING, handler=_on_pps)
     _gps_configure()                          # fixed-base GPS config (stable fix)
@@ -488,13 +490,30 @@ async def _gps_task():
                         survey.add(m["lat"], m["lon"], m["alt_m"] or 0.0)
                 elif m["type"] == "RMC" and m["datetime"]:
                     y, mo, d, h, mi, s = m["datetime"]
-                    if not gps_synced:   # GPS overrides any earlier NTP set;
+                    # DEFENSIVE (gpstime.time_fix_decision): like the rope, don't
+                    # trust a single RMC time blindly - cross-check vs an NTP-set
+                    # clock, require a consistent 2nd frame with no reference, and
+                    # re-sync on drift instead of latching a bad first value. RMC
+                    # carries no accuracy estimate, so tAcc is 0 (gate skipped).
+                    gps_epoch = time.mktime((y, mo, d, h, mi, s, 0, 0))
+                    src = "gps" if gps_synced else ("ntp" if clock_set else None)
+                    action, _gps_time_cand = gpstime.time_fix_decision(
+                        src, gps_epoch, time.time(), 0, _gps_time_cand)
+                    if action == "set":
                         RTC().datetime((y, mo, d, 0, h, mi, s, 0))  # PPS refines
+                        if not gps_synced:
+                            print("RTC set from GPS (preferred); PPS disciplining "
+                                  "on GPIO %d" % GPS_PPS_PIN)
+                        else:
+                            print("RTC re-synced from GPS (drift corrected)")
                         clock_set = True
                         gps_synced = True
-                        print("RTC set from GPS (preferred); PPS disciplining "
-                              "on GPIO %d" % GPS_PPS_PIN)
-                    _pps_arm_next(y, mo, d, h, mi, s)
+                        _pps_arm_next(y, mo, d, h, mi, s)
+                    elif action == "arm":
+                        _pps_arm_next(y, mo, d, h, mi, s)
+                    elif action == "reject" and clock_set and not gps_synced:
+                        print("GPS time ignored: %+ds vs NTP (bogus fix time)"
+                              % (gps_epoch - time.time()))
         now = time.ticks_ms()
         if (survey.lat is not None
                 and time.ticks_diff(now, last_send) >= WINCH_POS_PERIOD_S * 1000):

@@ -30,8 +30,11 @@ if not hasattr(time, "sleep_ms"):                 # MicroPython time shims
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "firmware",
                                 "rope"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "firmware",
+                                "shared"))
 
 from winchy.sensors import gps
+import gpstime
 
 
 # --- helpers ---------------------------------------------------------------
@@ -39,7 +42,7 @@ from winchy.sensors import gps
 def make_navpvt(fix_type=3, gnss_ok=True, num_sv=12, lon_deg=11.5, lat_deg=48.5,
                 hmsl_mm=512345, hacc_mm=1500, vacc_mm=2500, veld_mm=-300,
                 gspeed_mm=28400, sacc_mm=500, pdop=123,
-                dt=(2026, 6, 27, 16, 45, 10), resolved=True):
+                dt=(2026, 6, 27, 16, 45, 10), resolved=True, tacc_ns=25):
     """Build a 92-byte UBX-NAV-PVT payload with known fields (see the u-blox M10
     interface description for the offsets)."""
     pl = bytearray(92)
@@ -47,6 +50,7 @@ def make_navpvt(fix_type=3, gnss_ok=True, num_sv=12, lon_deg=11.5, lat_deg=48.5,
     y, mo, d, h, mi, s = dt
     struct.pack_into("<HBBBBB", pl, 4, y, mo, d, h, mi, s)
     pl[11] = 0x01 | 0x02 | (0x04 if resolved else 0x00)   # validDate|Time|Resolved
+    struct.pack_into("<I", pl, 12, tacc_ns)               # tAcc (ns)
     pl[20] = fix_type
     pl[21] = 0x01 if gnss_ok else 0x00                     # flags: gnssFixOK
     pl[23] = num_sv
@@ -291,3 +295,59 @@ def test_parse_nmea_rmc_datetime_and_speed():
 def test_parse_nmea_ignores_other_sentences():
     assert gps.parse_nmea("$GNVTG,,T,,M,0.0,N,0.0,K,A*23") is None
     assert gps.parse_nmea("not a sentence") is None
+
+
+# --- NAV-PVT time accuracy (tAcc) ------------------------------------------
+
+def test_navpvt_reports_tacc_ns():
+    assert gps.parse_nav_pvt(make_navpvt(tacc_ns=42))["t_acc_ns"] == 42
+
+
+# --- defensive GPS-time acceptance (firmware/shared/gpstime.py) -------------
+# Stops a glitched "fullyResolved" NAV-PVT (seen ~37 min off, then latched for
+# the whole session, overriding correct NTP) from corrupting the clock.
+
+def test_time_decision_no_clock_needs_two_consistent_frames():
+    act, cand = gpstime.time_fix_decision(None, 1000, 0, 25, None)
+    assert act == "wait" and cand == 1000
+    act, cand = gpstime.time_fix_decision(None, 1001, 0, 25, cand)
+    assert act == "set" and cand is None
+
+
+def test_time_decision_single_glitch_never_sets_without_reference():
+    # A lone outlier (e.g. 37 min = 2220 s off) seeds the candidate but never
+    # sets; the next real frame disagrees with the glitch, so it only reseeds.
+    _, cand = gpstime.time_fix_decision(None, 1000, 0, 25, None)
+    act, cand = gpstime.time_fix_decision(None, 1000 + 2220, 0, 25, cand)
+    assert act == "wait" and cand == 1000 + 2220
+
+
+def test_time_decision_rejects_gps_disagreeing_with_ntp():
+    # THE bug: NTP set the clock (rtc=1000); GPS reports 37 min earlier -> reject
+    # and keep NTP. A bogus GPS time must not override a good NTP clock.
+    act, _ = gpstime.time_fix_decision("ntp", 1000 - 2220, 1000, 25, None)
+    assert act == "reject"
+
+
+def test_time_decision_adopts_gps_agreeing_with_ntp():
+    act, _ = gpstime.time_fix_decision("ntp", 1003, 1000, 25, None)
+    assert act == "set"                              # within skew -> PPS-precise GPS
+
+
+def test_time_decision_rejects_low_confidence_tacc():
+    act, _ = gpstime.time_fix_decision(None, 1000, 0, 5000000000, None)
+    assert act == "reject"                           # tAcc 5 s -> not trusted
+
+
+def test_time_decision_arms_pps_when_gps_agrees():
+    act, cand = gpstime.time_fix_decision("gps", 1001, 1000, 25, None)
+    assert act == "arm" and cand is None
+
+
+def test_time_decision_self_heals_bad_latched_time():
+    # A bad GPS time was latched (rtc=1000); the module now consistently reports
+    # the true time ~37 min later. One frame waits, a 2nd consistent one re-syncs
+    # - the latch self-heals instead of being stuck forever.
+    _, cand = gpstime.time_fix_decision("gps", 1000 + 2220, 1000, 25, None)
+    act, cand = gpstime.time_fix_decision("gps", 1000 + 2221, 1000, 25, cand)
+    assert act == "set" and cand is None

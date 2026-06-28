@@ -31,6 +31,7 @@ from sx1262 import SX1262
 import config
 import protocol
 import wifi
+import gpstime
 from winchy import board, dashboard
 from winchy.fusion import altitude
 from winchy.fusion.attitude import rope_angle_above_ground
@@ -742,18 +743,30 @@ async def gps_task(state):
                     time.ticks_ms(), last_fix_save) >= LAST_FIX_SAVE_S * 1000)):
             _save_last_fix(state.lat, state.lon, state.alt_m)
             last_fix_save = time.ticks_ms()
-        # RTC: rough set at once (so we have time), PPS refines the second edge.
+        # RTC from GPS, but DEFENSIVELY (gpstime.time_fix_decision): a glitched
+        # "fullyResolved" NAV-PVT can be minutes wrong (seen: ~37 min off, then
+        # latched for the session, overriding correct NTP). So cross-check vs an
+        # NTP-set clock, gate on tAcc + a consistent 2nd frame, and re-sync on
+        # drift instead of trusting the first value forever. PPS refines the edge.
         if update["datetime"]:
             y, mo, d, h, mi, s = update["datetime"]
-            # GPS time wins over an earlier NTP fallback (more accurate, and
-            # PPS-disciplined below). Set the RTC unless GPS already owns it.
-            if state.time_source != "gps":
+            gps_epoch = time.mktime((y, mo, d, h, mi, s, 0, 0))
+            action, state.gps_time_cand = gpstime.time_fix_decision(
+                state.time_source, gps_epoch, time.time(),
+                update.get("t_acc_ns", 0), state.gps_time_cand)
+            if action == "set":
                 rtc.datetime((y, mo, d, 0, h, mi, s, 0))
+                print("RTC %s from GPS: %04d-%02d-%02d %02d:%02d:%02dZ"
+                      % ("re-synced" if state.time_source == "gps" else "synced",
+                         y, mo, d, h, mi, s))
                 state.time_synced = True
                 state.time_source = "gps"
-                print("RTC synced from GPS: %04d-%02d-%02d %02d:%02d:%02dZ"
-                      % (y, mo, d, h, mi, s))
-            _pps_arm_next(y, mo, d, h, mi, s)
+                _pps_arm_next(y, mo, d, h, mi, s)
+            elif action == "arm":
+                _pps_arm_next(y, mo, d, h, mi, s)   # agrees -> keep PPS disciplined
+            elif action == "reject" and state.time_source == "ntp":
+                print("GPS time ignored: %+ds vs NTP (bogus fix time)"
+                      % (gps_epoch - time.time()))
 
 
 def _ntp_time_aid(state):
