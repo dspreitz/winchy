@@ -314,3 +314,55 @@ async def read_ubx(reader):
         data = await reader.read(128)
         if data:
             _ubx_buf += data
+
+
+def has_gps_frame(buf):
+    """True if `buf` holds at least one CHECKSUM-VALID UBX frame OR NMEA
+    sentence - i.e. real GPS framing, not a chance 2-byte sync match in line
+    noise. A bare "b5 62" / "$G" substring turns up ~10% of the time in the
+    garbage you read at the WRONG baud, which made the old liveness check
+    false-positive and leave the app/GPS baud mismatched (no sats). Requiring a
+    valid checksum drops the false-positive rate to ~1/65536 (UBX) / ~1/256
+    (NMEA). Used by the baud detector (_gps_alive)."""
+    return _buf_has_ubx(buf) or _buf_has_nmea(buf)
+
+
+def _buf_has_ubx(buf):
+    n = len(buf)
+    i = 0
+    while True:
+        j = buf.find(b"\xb5\x62", i)
+        if j < 0:
+            return False
+        i = j + 2
+        if j + 8 > n:                       # sync+class+id+len(2)+cksum(2) min
+            continue
+        ln = buf[j + 4] | (buf[j + 5] << 8)
+        if ln > 512 or j + 6 + ln + 2 > n:  # implausible or incomplete -> skip
+            continue
+        ca = cb = 0
+        for x in buf[j + 2:j + 6 + ln]:     # Fletcher over class..payload
+            ca = (ca + x) & 0xFF
+            cb = (cb + ca) & 0xFF
+        if ca == buf[j + 6 + ln] and cb == buf[j + 7 + ln]:
+            return True
+
+
+def _buf_has_nmea(buf):
+    for seg in buf.replace(b"\r", b"\n").split(b"\n"):
+        d = seg.find(b"$")
+        if d < 0:
+            continue
+        star = seg.find(b"*", d)
+        if star < 0 or star + 3 > len(seg) or star == d + 1:
+            continue
+        try:
+            given = int(seg[star + 1:star + 3], 16)
+        except ValueError:
+            continue
+        cs = 0
+        for c in seg[d + 1:star]:           # XOR of chars between $ and *
+            cs ^= c
+        if cs == given:
+            return True
+    return False

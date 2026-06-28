@@ -40,7 +40,7 @@ from winchy.fusion.kalman import GravityKalman, VerticalKalman
 from winchy.fusion.speed import glider_speed
 from winchy.sensors.ads1232 import ADS1232
 from winchy.sensors.barometer import Barometer
-from winchy.sensors.gps import (GPS, parse_nav_pvt, read_ubx,
+from winchy.sensors.gps import (GPS, parse_nav_pvt, read_ubx, has_gps_frame,
                                  configure as gps_configure,
                                  set_baud as gps_set_baud,
                                  feed_mga as gps_feed_mga,
@@ -639,20 +639,23 @@ def _pps_arm_next(y, mo, d, h, mi, s):
 
 
 def _gps_alive(uart, timeout_ms=1500):
-    """True if recognisable GPS framing is arriving at the current baud - used to
-    confirm the high-baud switch took. Checked BEFORE (re)configuring, when the
-    module is streaming its existing config, so accept EITHER UBX (b5 62, the
-    NAV-PVT we set, retained in BBR) OR NMEA ($G, the factory default) - whichever
-    the module currently emits. (Checking only NMEA broke once NMEA was turned
-    off; checking only UBX broke right after a CFG change briefly stalled the UBX
-    stream - hence the check now runs before configure, see gps_task.)"""
+    """True if recognisable, CHECKSUM-VALID GPS framing is arriving at the
+    current baud - used to confirm a baud before configuring. Accepts EITHER a
+    valid UBX frame (the NAV-PVT we set, retained in BBR) OR a valid NMEA
+    sentence (the factory default) - whichever the module currently emits.
+    A bare 2-byte sync match is NOT enough: it turns up ~10% of the time in the
+    garbage read at the WRONG baud, which used to false-positive the high-baud
+    probe and leave the app/module baud mismatched (no sats). See
+    gps.has_gps_frame; the check runs BEFORE configure (see gps_task)."""
     t0 = time.ticks_ms()
     buf = b""
     while time.ticks_diff(time.ticks_ms(), t0) < timeout_ms:
         n = uart.any()
         if n:
             buf += uart.read(n)
-            if b"\xb5\x62" in buf or b"$G" in buf:
+            if len(buf) > 600:
+                buf = buf[-600:]            # bound the scan; a frame is <=~100 B
+            if has_gps_frame(buf):
                 return True
         time.sleep_ms(10)
     return False

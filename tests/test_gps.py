@@ -351,3 +351,48 @@ def test_time_decision_self_heals_bad_latched_time():
     _, cand = gpstime.time_fix_decision("gps", 1000 + 2220, 1000, 25, None)
     act, cand = gpstime.time_fix_decision("gps", 1000 + 2221, 1000, 25, cand)
     assert act == "set" and cand is None
+
+
+# --- baud liveness: require a CHECKSUM-VALID frame, not a 2-byte sync match ----
+# (gps.has_gps_frame) - the loose 2-byte check false-positived in the garbage
+# read at the wrong baud, leaving the app/module baud mismatched (no sats).
+
+def mknmea(body):
+    cs = 0
+    for c in body.encode():
+        cs ^= c
+    return ("$%s*%02X" % (body, cs)).encode()
+
+
+def test_has_gps_frame_accepts_valid_ubx():
+    frame = gps._ubx(0x01, 0x07, make_navpvt())
+    assert gps.has_gps_frame(b"noise\x00\x11" + frame + b"tail")
+
+
+def test_has_gps_frame_accepts_valid_nmea():
+    s = mknmea("GNRMC,081836,A,4807.038,N,01131.000,E,10.0,084.4,260606,,,A")
+    assert gps.has_gps_frame(b"\x00\x01" + s + b"\r\n")
+
+
+def test_has_gps_frame_rejects_bare_ubx_sync_in_noise():
+    # the sync bytes appear but no valid frame follows -> NOT "alive"
+    assert not gps.has_gps_frame(b"junk\xb5\x62\x10\x20\x05\x00abc")
+
+
+def test_has_gps_frame_rejects_nmea_without_or_bad_checksum():
+    assert not gps.has_gps_frame(b"$GPGGA,no,checksum,field,here")   # no *XX
+    assert not gps.has_gps_frame(b"$G\x99\x88 random *ZZ")           # *ZZ not hex
+    s = mknmea("GNGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,")
+    assert not gps.has_gps_frame(s.replace(b"123519", b"999999"))    # body changed
+
+
+def test_has_gps_frame_rejects_bad_ubx_checksum():
+    bad = bytearray(gps._ubx(0x01, 0x07, make_navpvt()))
+    bad[-1] ^= 0xFF
+    assert not gps.has_gps_frame(bytes(bad))
+
+
+def test_has_gps_frame_rejects_incomplete_and_empty():
+    frame = gps._ubx(0x01, 0x07, make_navpvt())
+    assert not gps.has_gps_frame(frame[:40])     # truncated UBX frame
+    assert not gps.has_gps_frame(b"")
