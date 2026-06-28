@@ -323,6 +323,11 @@ def _send_winch_pos():
     # Send the surveyed winch position to the rope (low rate). Like the
     # LINK_REPORT, a send auto-returns the radio to RX. accuracy_m may be inf
     # (n<2) or large; the byte field saturates at 25.5 m.
+    # The radio is shared with the RX IRQ: this send can land mid-SPI relative
+    # to an incoming rope frame and raise (ERR_CHIP_NOT_FOUND). Catch it so a
+    # collision drops ONE WINCH_POS instead of killing the GPS task (same guard
+    # as on_receive). Returns True on a clean send, False if it collided so the
+    # caller can retry sooner.
     global tx_seq
     acc = survey.accuracy_m
     if acc == float("inf") or acc > 25.5:
@@ -332,11 +337,16 @@ def _send_winch_pos():
         status |= protocol.WINCH_FIX
     if survey.converged:
         status |= protocol.WINCH_SURVEY_DONE
-    lora.send(protocol.encode_winch_pos(tx_seq, survey.lat, survey.lon,
-                                        survey.alt or 0.0, acc, status))
+    try:
+        lora.send(protocol.encode_winch_pos(tx_seq, survey.lat, survey.lon,
+                                            survey.alt or 0.0, acc, status))
+    except Exception as e:
+        print("[TX] winch_pos send collided, will retry:", e)
+        return False
     tx_seq = (tx_seq + 1) & 0xFFFF
     print("[TX] winch_pos lat=%.6f lon=%.6f acc=%.1f conv=%s"
           % (survey.lat, survey.lon, acc, survey.converged))
+    return True
 
 
 def _show_survey():
@@ -517,70 +527,79 @@ async def _gps_task():
         print("GPS aiding: position injected (%.6f, %.6f, %.0f m)"
               % (pos[0], pos[1], pos[2]))
     while True:
-        if gps_uart.any():
-            _gps_buf += gps_uart.read() or b""
-            if len(_gps_buf) > 1024:           # guard a wedged/garbage stream
-                _gps_buf = _gps_buf[-256:]
-            while b"\n" in _gps_buf:
-                line, _gps_buf = _gps_buf.split(b"\n", 1)
-                m = nmea.parse_nmea(line)
-                if not m:
-                    continue
-                if m["type"] == "GGA":
-                    gps_sats = m["sats"]
-                    gps_has_fix = m["fix"] > 0
-                    if (gps_has_fix and m["lat"] is not None
-                            and m["lon"] is not None):
-                        survey.add(m["lat"], m["lon"], m["alt_m"] or 0.0)
-                elif m["type"] == "RMC" and m["datetime"]:
-                    y, mo, d, h, mi, s = m["datetime"]
-                    # DEFENSIVE (gpstime.time_fix_decision): like the rope, don't
-                    # trust a single RMC time blindly - cross-check vs an NTP-set
-                    # clock, require a consistent 2nd frame with no reference, and
-                    # re-sync on drift instead of latching a bad first value. RMC
-                    # carries no accuracy estimate, so tAcc is 0 (gate skipped).
-                    gps_epoch = time.mktime((y, mo, d, h, mi, s, 0, 0))
-                    src = "gps" if gps_synced else ("ntp" if clock_set else None)
-                    action, _gps_time_cand = gpstime.time_fix_decision(
-                        src, gps_epoch, time.time(), 0, _gps_time_cand)
-                    if action == "set":
-                        RTC().datetime((y, mo, d, 0, h, mi, s, 0))  # PPS refines
-                        if not gps_synced:
-                            print("RTC set from GPS (preferred); PPS disciplining "
-                                  "on GPIO %d" % GPS_PPS_PIN)
-                        else:
-                            print("RTC re-synced from GPS (drift corrected)")
-                        clock_set = True
-                        gps_synced = True
-                        _pps_arm_next(y, mo, d, h, mi, s)
-                    elif action == "arm":
-                        _pps_arm_next(y, mo, d, h, mi, s)
-                    elif (action == "reject" and clock_set and not gps_synced
-                            and time.ticks_diff(time.ticks_ms(),
-                                                _gps_time_warn_ms) > 30000):
-                        _gps_time_warn_ms = time.ticks_ms()   # rate-limited
-                        print("GPS time rejected: %+ds vs NTP (confident but "
-                              "disagrees)" % (gps_epoch - time.time()))
-        now = time.ticks_ms()
-        if (survey.lat is not None
-                and time.ticks_diff(now, last_send) >= WINCH_POS_PERIOD_S * 1000):
-            _send_winch_pos()
-            last_send = now
-        # Inject time aiding once the internet has given us UTC (via _serve).
-        if _aid_utc is not None and not _aided_time:
-            wk, tw = _utc_to_gps(*_aid_utc)
-            gps_uart.write(_aid_ini(week=wk, tow_ms=tw))
-            _aided_time = True
-            print("GPS aiding: time injected (GPS week %d)" % wk)
-        # Cache the converged position for the next boot's aiding (throttled,
-        # flash-wear-bounded). AIDING ONLY - WINCH_POS stays live-survey-sourced.
-        if (survey.converged and survey.lat is not None
-                and time.ticks_diff(now, _aid_save_ms) >= AID_SAVE_S * 1000):
-            _save_aid(survey.lat, survey.lon, survey.alt or 0.0)
-            _aid_save_ms = now
-        latest.update(_survey_fields())
-        if time.ticks_diff(now, last_rx_ms) > 3000:   # link idle -> show GPS
-            _show_survey()
+        # Defense in depth: one bad iteration (a radio-SPI collision, a GPS
+        # parse hiccup) must never kill this whole task - that silently stops
+        # the survey AND WINCH_POS, which is exactly how winch_dist/cable_len
+        # went stale on the rope. Drop the iteration, keep looping.
+        try:
+            if gps_uart.any():
+                _gps_buf += gps_uart.read() or b""
+                if len(_gps_buf) > 1024:           # guard a wedged/garbage stream
+                    _gps_buf = _gps_buf[-256:]
+                while b"\n" in _gps_buf:
+                    line, _gps_buf = _gps_buf.split(b"\n", 1)
+                    m = nmea.parse_nmea(line)
+                    if not m:
+                        continue
+                    if m["type"] == "GGA":
+                        gps_sats = m["sats"]
+                        gps_has_fix = m["fix"] > 0
+                        if (gps_has_fix and m["lat"] is not None
+                                and m["lon"] is not None):
+                            survey.add(m["lat"], m["lon"], m["alt_m"] or 0.0)
+                    elif m["type"] == "RMC" and m["datetime"]:
+                        y, mo, d, h, mi, s = m["datetime"]
+                        # DEFENSIVE (gpstime.time_fix_decision): like the rope, don't
+                        # trust a single RMC time blindly - cross-check vs an NTP-set
+                        # clock, require a consistent 2nd frame with no reference, and
+                        # re-sync on drift instead of latching a bad first value. RMC
+                        # carries no accuracy estimate, so tAcc is 0 (gate skipped).
+                        gps_epoch = time.mktime((y, mo, d, h, mi, s, 0, 0))
+                        src = "gps" if gps_synced else ("ntp" if clock_set else None)
+                        action, _gps_time_cand = gpstime.time_fix_decision(
+                            src, gps_epoch, time.time(), 0, _gps_time_cand)
+                        if action == "set":
+                            RTC().datetime((y, mo, d, 0, h, mi, s, 0))  # PPS refines
+                            if not gps_synced:
+                                print("RTC set from GPS (preferred); PPS disciplining "
+                                      "on GPIO %d" % GPS_PPS_PIN)
+                            else:
+                                print("RTC re-synced from GPS (drift corrected)")
+                            clock_set = True
+                            gps_synced = True
+                            _pps_arm_next(y, mo, d, h, mi, s)
+                        elif action == "arm":
+                            _pps_arm_next(y, mo, d, h, mi, s)
+                        elif (action == "reject" and clock_set and not gps_synced
+                                and time.ticks_diff(time.ticks_ms(),
+                                                    _gps_time_warn_ms) > 30000):
+                            _gps_time_warn_ms = time.ticks_ms()   # rate-limited
+                            print("GPS time rejected: %+ds vs NTP (confident but "
+                                  "disagrees)" % (gps_epoch - time.time()))
+            now = time.ticks_ms()
+            if (survey.lat is not None
+                    and time.ticks_diff(now, last_send) >= WINCH_POS_PERIOD_S * 1000):
+                if _send_winch_pos():
+                    last_send = now              # clean send -> next in 15 s
+                else:                            # radio collided -> retry in ~2 s
+                    last_send = now - (WINCH_POS_PERIOD_S - 2) * 1000
+            # Inject time aiding once the internet has given us UTC (via _serve).
+            if _aid_utc is not None and not _aided_time:
+                wk, tw = _utc_to_gps(*_aid_utc)
+                gps_uart.write(_aid_ini(week=wk, tow_ms=tw))
+                _aided_time = True
+                print("GPS aiding: time injected (GPS week %d)" % wk)
+            # Cache the converged position for the next boot's aiding (throttled,
+            # flash-wear-bounded). AIDING ONLY - WINCH_POS stays live-survey-sourced.
+            if (survey.converged and survey.lat is not None
+                    and time.ticks_diff(now, _aid_save_ms) >= AID_SAVE_S * 1000):
+                _save_aid(survey.lat, survey.lon, survey.alt or 0.0)
+                _aid_save_ms = now
+            latest.update(_survey_fields())
+            if time.ticks_diff(now, last_rx_ms) > 3000:   # link idle -> show GPS
+                _show_survey()
+        except Exception as e:
+            print("winch GPS task iteration error:", e)
         await asyncio.sleep_ms(200)
 
 
