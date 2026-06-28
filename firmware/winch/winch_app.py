@@ -228,9 +228,17 @@ def _begin_upload(what):
 
 
 def _end_upload():
-    # Normal screen behaviour resumes on the next telemetry / survey redraw.
+    # Restore the normal screen NOW (don't wait for the next telemetry/survey
+    # redraw). With no rope data that redraw can be absent/delayed, leaving the
+    # "WiFi upload" notice stuck on the OLED - which is what you saw. Redraw the
+    # idle GPS/survey screen here; if telemetry is live the next RX redraws it.
     global uploading
     uploading = False
+    if time.ticks_diff(time.ticks_ms(), last_rx_ms) > 3000:
+        try:
+            _show_survey()
+        except Exception:
+            pass
 
 
 def show_telemetry(msg):
