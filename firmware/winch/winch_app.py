@@ -198,6 +198,7 @@ def _survey_fields():
 clock_set = False           # is the winch RTC set (from any source)?
 gps_synced = False          # has GPS+PPS set the RTC? (preferred; gates NTP)
 _gps_time_cand = None       # pending GPS-time consistency candidate (gpstime)
+_gps_time_warn_ms = 0       # rate-limit the "GPS time rejected" log
 log_start = None            # "yyyymmdd-hhmm" session start, latched once synced
 online = False              # winchy-logs (GitHub) currently reachable? -> OLED "I"
 
@@ -462,7 +463,7 @@ async def _gps_task():
     # OLED when the rope link is idle. RX/TX of the LoRa link is unaffected
     # (it is IRQ-driven); this only shares the radio for the low-rate send.
     global gps_sats, gps_has_fix, _gps_buf, _pps_rtc, clock_set, gps_synced
-    global _aided_time, _aid_save_ms, _gps_time_cand
+    global _aided_time, _aid_save_ms, _gps_time_cand, _gps_time_warn_ms
     _pps_rtc = RTC()
     Pin(GPS_PPS_PIN, Pin.IN).irq(trigger=Pin.IRQ_RISING, handler=_on_pps)
     _gps_configure()                          # fixed-base GPS config (stable fix)
@@ -511,9 +512,12 @@ async def _gps_task():
                         _pps_arm_next(y, mo, d, h, mi, s)
                     elif action == "arm":
                         _pps_arm_next(y, mo, d, h, mi, s)
-                    elif action == "reject" and clock_set and not gps_synced:
-                        print("GPS time ignored: %+ds vs NTP (bogus fix time)"
-                              % (gps_epoch - time.time()))
+                    elif (action == "reject" and clock_set and not gps_synced
+                            and time.ticks_diff(time.ticks_ms(),
+                                                _gps_time_warn_ms) > 30000):
+                        _gps_time_warn_ms = time.ticks_ms()   # rate-limited
+                        print("GPS time rejected: %+ds vs NTP (confident but "
+                              "disagrees)" % (gps_epoch - time.time()))
         now = time.ticks_ms()
         if (survey.lat is not None
                 and time.ticks_diff(now, last_send) >= WINCH_POS_PERIOD_S * 1000):

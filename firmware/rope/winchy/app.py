@@ -257,6 +257,10 @@ BARO_QNH_DEFAULT_HPA = 1013.25
 LAST_FIX_PATH = "last_fix.json"
 LAST_FIX_SAVE_S = 120         # min seconds between saves (flash wear)
 LAST_FIX_MIN_SATS = 5         # only persist a confident 3D fix
+# GPS time is only trusted when the receiver's own accuracy estimate (NAV-PVT
+# tAcc) is under this. Before a real fix the M10 emits an AIDED time with a huge
+# tAcc; ignoring it keeps the (correct) NTP clock and avoids per-frame churn.
+GPS_TIME_MAX_TACC_NS = 1000000000   # 1 s
 # QNH GPS-calibration gating: the receiver's altitude can be hundreds of metres
 # off for a few seconds right at first lock, so don't calibrate QNH off a weak
 # or outlier fix (it would yank baro_alt and slowly fade back).
@@ -745,15 +749,16 @@ async def gps_task(state):
             last_fix_save = time.ticks_ms()
         # RTC from GPS, but DEFENSIVELY (gpstime.time_fix_decision): a glitched
         # "fullyResolved" NAV-PVT can be minutes wrong (seen: ~37 min off, then
-        # latched for the session, overriding correct NTP). So cross-check vs an
-        # NTP-set clock, gate on tAcc + a consistent 2nd frame, and re-sync on
-        # drift instead of trusting the first value forever. PPS refines the edge.
-        if update["datetime"]:
+        # latched for the session, overriding correct NTP). Only CONFIDENT times
+        # are considered (small tAcc - the M10 emits an aided time with a huge
+        # tAcc before a real fix); then cross-check vs an NTP-set clock, require a
+        # consistent 2nd frame with no clock, and re-sync on drift. PPS refines.
+        if update["datetime"] and update.get("t_acc_ns", 0) <= GPS_TIME_MAX_TACC_NS:
             y, mo, d, h, mi, s = update["datetime"]
             gps_epoch = time.mktime((y, mo, d, h, mi, s, 0, 0))
             action, state.gps_time_cand = gpstime.time_fix_decision(
-                state.time_source, gps_epoch, time.time(),
-                update.get("t_acc_ns", 0), state.gps_time_cand)
+                state.time_source, gps_epoch, time.time(), update["t_acc_ns"],
+                state.gps_time_cand, GPS_TIME_MAX_TACC_NS)
             if action == "set":
                 rtc.datetime((y, mo, d, 0, h, mi, s, 0))
                 print("RTC %s from GPS: %04d-%02d-%02d %02d:%02d:%02dZ"
@@ -764,8 +769,11 @@ async def gps_task(state):
                 _pps_arm_next(y, mo, d, h, mi, s)
             elif action == "arm":
                 _pps_arm_next(y, mo, d, h, mi, s)   # agrees -> keep PPS disciplined
-            elif action == "reject" and state.time_source == "ntp":
-                print("GPS time ignored: %+ds vs NTP (bogus fix time)"
+            elif (action == "reject" and state.time_source == "ntp"
+                    and time.ticks_diff(time.ticks_ms(),
+                                        state.gps_time_warn_ms) > 30000):
+                state.gps_time_warn_ms = time.ticks_ms()   # rate-limited: rare bug
+                print("GPS time rejected: %+ds vs NTP (confident but disagrees)"
                       % (gps_epoch - time.time()))
 
 
