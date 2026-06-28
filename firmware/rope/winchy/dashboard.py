@@ -38,7 +38,7 @@ def _data(s):
         "txdbm": s.tx_power_dbm, "rssi": s.link_rssi_dbm,
         "snr": s.link_snr_db, "loss": s.link_loss_pct,
         "tsync": s.time_synced, "rec": s.raw_recording,
-        "upreq": s.upload_request,
+        "upstatus": s.upload_status,
     }
 
 
@@ -73,9 +73,10 @@ td.l{color:#8ac;width:46%}
 <button id=ulbtn onclick=ul() style="font-size:5vw;padding:12px;margin:8px 2px;width:97%;background:#235;color:#eee;border:1px solid #8ac;border-radius:6px">Upload log to GitHub</button>
 <div id=ulmsg style="font-size:4vw;color:#8ac;padding:2px 6px">&nbsp;</div>
 <script>
-var last=Date.now();var wasup=false;var ws;
-function ul(){wasup=true;ulmsg.textContent='uploading...';
- fetch('/upload',{method:'POST'}).catch(function(e){ulmsg.textContent='upload error';});}
+var last=Date.now();var ws;
+var UPLBL={uploading:'uploading…',ok:'✓ upload verified',unverified:'⚠ uploaded, NOT verified',fail:'✗ upload failed'};
+function ul(){ulmsg.textContent='uploading…';
+ fetch('/upload',{method:'POST'}).catch(function(e){ulmsg.textContent='✗ upload error';});}
 function f(x,n){return (x==null)?'--':x.toFixed(n);}
 function render(d){
   last=Date.now();document.body.className='';
@@ -94,8 +95,7 @@ function render(d){
   tx.textContent=d.txdbm+' dBm';
   link.textContent=d.rssi+' dBm  snr '+d.snr+'  loss '+d.loss+'%';
   rec.textContent=(d.rec?'recording':'idle')+(d.tsync?'':'  (no time)');
-  if(d.upreq){ulmsg.textContent='uploading...';wasup=true;}
-  else if(wasup){ulmsg.textContent='upload done';wasup=false;}
+  if(d.upstatus){ulmsg.textContent=UPLBL[d.upstatus]||d.upstatus;}
 }
 function connect(){
  ws=new WebSocket('ws://'+location.host+'/ws');

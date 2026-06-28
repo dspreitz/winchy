@@ -942,6 +942,16 @@ def _log_stamp():
     return "%04d%02d%02d-%02d%02d" % (t[0], t[1], t[2], t[3], t[4])
 
 
+def _upload_suffix():
+    # Per-upload unique tag so each offloaded chunk becomes a DISTINCT asset
+    # (never overwriting an earlier one). Seconds-resolution wall time when the
+    # clock is set (uploads are always >1 s apart); a ticks-based tag otherwise.
+    t = time.localtime()
+    if t[0] >= 2024:
+        return "%02d%02d%02d" % (t[3], t[4], t[5])
+    return "x%06x" % (time.ticks_ms() & 0xFFFFFF)
+
+
 def _gzip_file(path):
     # Return (data, ext, content_type). Gzip the file if this build's deflate
     # supports compression; otherwise upload the raw CSV. This ESP32-S3
@@ -970,14 +980,18 @@ def _gzip_file(path):
 
 
 def _github_upload_raw(asset):
-    # Replace the rolling rope-log asset on the 'logs' release: look up the
-    # release, delete any existing asset of the same name, then upload the log
-    # (gzip-compressed). Blocks the asyncio loop for the round-trips (~secs) -
-    # only called while IDLE, so the launch path is never affected.
+    # Upload the rope log to a (now unique-named) asset on the 'logs' release,
+    # gzip-compressed, then VERIFY by reading the asset back from the server and
+    # comparing its stored size to the bytes we sent (server-vs-device check).
+    # Blocks the asyncio loop for the round-trips (~secs) - only called while
+    # IDLE, so the launch path is never affected.
+    # Returns (ok, verified): ok = upload HTTP 2xx; verified = the server's
+    # stored asset size equals the uploaded byte count.
     import urequests
     hdr = {"Authorization": "Bearer " + GITHUB_TOKEN, "User-Agent": "winchy",
            "Accept": "application/vnd.github+json"}
     ok = False
+    verified = False
     try:
         r = urequests.get("https://api.github.com/repos/%s/releases/tags/%s"
                           % (GITHUB_REPO, GITHUB_RELEASE_TAG), headers=hdr)
@@ -986,8 +1000,9 @@ def _github_upload_raw(asset):
         rid = rel["id"]
         gc.collect()
         body, ext, ctype = _gzip_file(RAW_LOG_PATH)
+        sent = len(body)
         name = asset + ext
-        for a in rel.get("assets", ()):
+        for a in rel.get("assets", ()):    # unique names, but clear a stale retry
             if a.get("name") == name:
                 urequests.delete(
                     "https://api.github.com/repos/%s/releases/assets/%d"
@@ -999,12 +1014,50 @@ def _github_upload_raw(asset):
             "https://uploads.github.com/repos/%s/releases/%d/assets?name=%s"
             % (GITHUB_REPO, rid, name), data=body, headers=h2)
         ok = 200 <= u.status_code < 300
-        print("GitHub upload %s: HTTP %d (%d B)" % (name, u.status_code, len(body)))
+        print("GitHub upload %s: HTTP %d (%d B)" % (name, u.status_code, sent))
         u.close()
+        gc.collect()
+        if ok:
+            # Read the asset back from the release and compare its stored size to
+            # what we sent - the server-vs-device verification.
+            r2 = urequests.get("https://api.github.com/repos/%s/releases/tags/%s"
+                               % (GITHUB_REPO, GITHUB_RELEASE_TAG), headers=hdr)
+            rel2 = r2.json()
+            r2.close()
+            for a in rel2.get("assets", ()):
+                if a.get("name") == name:
+                    verified = (a.get("size", -1) == sent)
+                    break
+            print("GitHub verify %s: %s (server vs %d B sent)"
+                  % (name, "OK" if verified else "MISMATCH", sent))
     except Exception as e:
         print("GitHub upload failed:", e)
     gc.collect()
-    return ok
+    return ok, verified
+
+
+async def _run_upload(state):
+    # Drive one raw.csv upload + the dashboard status. Each upload goes to a
+    # UNIQUE asset (so chunks are never overwritten), and the device flash is
+    # only reclaimed (raw_uploaded_bytes) once the server copy is verified.
+    try:
+        size = os.stat(RAW_LOG_PATH)[6]
+    except OSError:
+        size = 0
+    if size <= len(RAW_LOG_HEADER):        # header only - nothing to offload
+        return
+    state.upload_status = "uploading"
+    await asyncio.sleep_ms(600)            # let the dashboard push "uploading"
+    stamp = state.log_start or _log_stamp() or "nogps"
+    asset = stamp + "_" + _upload_suffix() + "_" + GITHUB_ASSET
+    ok, verified = _github_upload_raw(asset)
+    if ok and verified:
+        state.raw_uploaded_bytes = size    # writer may now reclaim the flash
+        state.upload_status = "ok"
+    elif ok:
+        state.upload_status = "unverified"
+    else:
+        state.upload_status = "fail"
 
 
 def _github_announce_ip(ip, ssid, tag="rope"):
@@ -1243,15 +1296,9 @@ async def wifi_task(state):
             if joined:
                 if state.time_source is None:   # NTP fallback + GPS time-aiding
                     _ntp_time_aid(state)
-                # Prepend the session start (first GPS time) to the asset so
-                # each session is a distinct, dated file on the release.
-                stamp = state.log_start or _log_stamp()
-                asset = (stamp + "_" if stamp else "") + GITHUB_ASSET
-                print("WiFi '%s' joined (%s); uploading %s"
-                      % (joined, wlan.ifconfig()[0], asset))
-                if _github_upload_raw(asset):
-                    # Tell imu_task (the file owner) it may reclaim the flash.
-                    state.raw_uploaded_bytes = size
+                print("WiFi '%s' joined (%s); uploading"
+                      % (joined, wlan.ifconfig()[0]))
+                await _run_upload(state)
             else:
                 print("WiFi: no known network in range")
         except Exception as e:
@@ -1324,15 +1371,7 @@ async def dashboard_task(state):
         if (GITHUB_TOKEN and wlan.isconnected()
                 and state.phase == protocol.PHASE_IDLE
                 and (state.upload_request or (n and n % WIFI_PERIOD_S == 0))):
-            try:
-                size = os.stat(RAW_LOG_PATH)[6]
-            except OSError:
-                size = 0
-            if size > len(RAW_LOG_HEADER):
-                stamp = state.log_start or _log_stamp()
-                asset = (stamp + "_" if stamp else "") + GITHUB_ASSET
-                if _github_upload_raw(asset):
-                    state.raw_uploaded_bytes = size
+            await _run_upload(state)
             state.upload_request = False   # clear the manual request once handled
         n += 1
         await asyncio.sleep_ms(1000)

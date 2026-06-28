@@ -59,6 +59,9 @@ class State:
         self.raw_q = []          # pending raw-log lines; drained by raw_writer_task
         self.raw_recording = False   # imu_task is mid-episode (gates the reset)
         self.upload_request = False  # dashboard "Upload log" button -> wifi task
+        # Upload progress for the dashboard, set by the upload task:
+        # "" idle | "uploading" | "ok" (verified) | "unverified" | "fail".
+        self.upload_status = ""
         # Power
         self.system_mv = 0
         self.batt_mv = 0
