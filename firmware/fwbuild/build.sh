@@ -63,7 +63,21 @@ else
     # a non-default BUILD= dir breaks the frozen mpy-cross link, so use the
     # standard single-build layout and wipe it.
     git checkout -- mpconfigport.h "boards/$BOARD/mpconfigboard.h" 2>/dev/null || true
-    rm -rf "build-$BOARD"
+    # Wipe the board build dir. On Docker Desktop's Windows bind mount, rm -rf
+    # intermittently fails with "Directory not empty" (grpcfuse sync lag), so
+    # retry a few times before giving up (a dirty dir would mix rope/winch).
+    n=0
+    until rm -rf "build-$BOARD"; do
+        n=$((n + 1))
+        if [ "$n" -ge 5 ]; then
+            echo ">> ERROR: cannot remove build-$BOARD after $n tries (Docker/Windows"
+            echo ">>   bind-mount flake). Remove it from the host and re-run:"
+            echo ">>   Remove-Item -Recurse -Force _fwbuild/micropython/ports/esp32/build-$BOARD"
+            exit 1
+        fi
+        echo ">> rm build-$BOARD failed (try $n); retrying in 1s..."
+        sleep 1
+    done
     echo ">> fetching esp32 submodules"
     make BOARD="$BOARD" submodules >/dev/null
     echo ">> applying Winchy config (deflate + USB name=winchy-$ROLE)"
