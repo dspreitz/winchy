@@ -483,7 +483,7 @@ def _aid_fetch_time():
         import urequests
         try:
             r = urequests.get("https://api.github.com",
-                              headers={"User-Agent": "winchy"})
+                              headers={"User-Agent": "winchy"}, timeout=10)
             d = r.headers.get("Date") if getattr(r, "headers", None) else None
             r.close()
             t = _parse_http_date(d)

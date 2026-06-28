@@ -188,6 +188,8 @@ ASSISTNOW_ZTP_URL = "https://api.thingstream.io/ztp/assistnow/credentials"
 ASSISTNOW_GNSS = "gps"             # add ',gal,glo,bds' for more (bigger blob)
 ASSISTNOW_DATA = "uporb_7,ualm"    # 7-day predicted orbits + almanac (per plan's allowedData)
 ASSISTNOW_MAX_AGE_S = 3 * 86400    # re-download when the cache is older than this
+ASSISTNOW_TIMEOUT_S = 20    # socket timeout on the (blocking) AssistNow round-trips,
+                            # so a stalled server can't freeze the asyncio loop
 ASSISTNOW_PATH = "mga_offline.ubx"      # cached MGA blob
 ASSISTNOW_TS_PATH = "mga_offline.ts"    # blob download time (s, 2000-epoch)
 ASSISTNOW_CHIP_PATH = "mga_chip.json"   # cached ZTP chipcode + data serviceUrl
@@ -1245,7 +1247,8 @@ def _assistnow_register():
     try:
         gc.collect()
         r = urequests.post(ASSISTNOW_ZTP_URL, data=body,
-                           headers={"Content-Type": "application/json"})
+                           headers={"Content-Type": "application/json"},
+                           timeout=ASSISTNOW_TIMEOUT_S)
         code = r.status_code
         d = r.json() if 200 <= code < 300 else None
         r.close()
@@ -1284,7 +1287,7 @@ def _assistnow_download(state):
     ok = False
     try:
         gc.collect()
-        r = urequests.get(url)
+        r = urequests.get(url, timeout=ASSISTNOW_TIMEOUT_S)
         if r.status_code == 200:
             blob = r.content
             hdrs = getattr(r, "headers", None)            # server "Date" = trusted now
