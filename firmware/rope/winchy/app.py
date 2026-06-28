@@ -809,6 +809,26 @@ def _ntp_time_aid(state):
         print("GPS time-aid failed:", e)
 
 
+def _cross_tx_frame(state, seq):
+    # One cross-upload radio frame to send INSTEAD of telemetry this cycle (rare;
+    # one TX/cycle keeps the half-duplex sequence clean, a dropped telemetry
+    # frame is harmless). Priority: ACK a received UPLOAD_CMD first, else (re)send
+    # our own UPLOAD_CMD ~1 s apart while tries remain. Returns a frame or None.
+    if state.cross_ack_nonce is not None:
+        nonce = state.cross_ack_nonce
+        state.cross_ack_nonce = None
+        return protocol.encode_upload_ack(seq, nonce)
+    if (state.cross_cmd_nonce is not None and state.cross_cmd_tries > 0
+            and time.ticks_diff(time.ticks_ms(), state.cross_cmd_ts) >= 1000):
+        state.cross_cmd_ts = time.ticks_ms()
+        state.cross_cmd_tries -= 1
+        nonce = state.cross_cmd_nonce
+        if state.cross_cmd_tries <= 0:
+            state.cross_cmd_nonce = None       # gave up after this final send
+        return protocol.encode_upload_cmd(seq, nonce)
+    return None
+
+
 async def telemetry_task(sx, state):
     seq = 0
     frame_count = 0
@@ -866,6 +886,11 @@ async def telemetry_task(sx, state):
                     state.tx_power_dbm = new_power
                 except Exception as e:
                     print("ADR power change deferred:", e)
+        # Cross-upload: a pending UPLOAD_ACK / retry UPLOAD_CMD preempts this
+        # telemetry frame (one TX per cycle; a dropped telemetry frame is fine).
+        cross = _cross_tx_frame(state, seq)
+        if cross is not None:
+            frame = cross
         # Driver auto-returns to RX after this TX (non-blocking mode), so the
         # winch's reply is caught by on_radio with no explicit listen window;
         # we just dwell longer on report cycles so it isn't clobbered.
@@ -1508,6 +1533,20 @@ def run():
                     state.winch_pos_ts = time.ticks_ms()
                     print("Winch pos: %.6f %.6f acc=%.1f m status=%d" % (
                         msg["lat"], msg["lon"], msg["hacc_m"], msg["status"]))
+                elif msg and msg["type"] == protocol.UPLOAD_CMD:
+                    # Winch asked us to upload too. ACK every copy (telemetry_task
+                    # sends it); trigger our upload only once per new nonce.
+                    if msg["nonce"] != state.cross_last_cmd:
+                        state.cross_last_cmd = msg["nonce"]
+                        state.upload_request = True
+                        print("Cross-upload requested by winch (nonce %d)"
+                              % msg["nonce"])
+                    state.cross_ack_nonce = msg["nonce"]
+                elif msg and msg["type"] == protocol.UPLOAD_ACK:
+                    if msg["nonce"] == state.cross_cmd_nonce:
+                        state.cross_cmd_nonce = None      # winch got it; stop retry
+                        print("Cross-upload ACKed by winch (nonce %d)"
+                              % msg["nonce"])
                 else:
                     print("Receive: {}, {}".format(frame, SX1262.STATUS[err]))
             elif events & SX1262.TX_DONE:

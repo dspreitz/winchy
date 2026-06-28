@@ -181,6 +181,12 @@ async def handle(reader, writer):
         elif path.startswith(b"/upload"):  # manual log upload (picked up by app)
             if state is not None:
                 state.upload_request = True
+                # Also ask the winch to upload, over the radio (cross-upload).
+                # telemetry_task sends UPLOAD_CMD(nonce) up to 5x until ACKed.
+                state.cross_nonce_ctr = (state.cross_nonce_ctr + 1) & 0xFF
+                state.cross_cmd_nonce = state.cross_nonce_ctr
+                state.cross_cmd_tries = 5
+                state.cross_cmd_ts = 0          # send on the next telemetry cycle
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
                          b"Connection: close\r\n\r\nupload queued")
             await writer.drain()

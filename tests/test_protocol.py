@@ -119,3 +119,30 @@ def test_rejects_truncated_and_garbage():
     assert protocol.decode(b"") is None
     assert protocol.decode(None) is None
     assert protocol.decode(b"\xff\xfe\x85\x97&G\t") is None  # old 7-byte format
+
+
+def test_upload_cmd_roundtrip():
+    msg = protocol.decode(protocol.encode_upload_cmd(seq=12, nonce=200))
+    assert msg["type"] == protocol.UPLOAD_CMD
+    assert msg["seq"] == 12
+    assert msg["nonce"] == 200
+
+
+def test_upload_ack_roundtrip():
+    msg = protocol.decode(protocol.encode_upload_ack(seq=13, nonce=200))
+    assert msg["type"] == protocol.UPLOAD_ACK
+    assert msg["nonce"] == 200
+
+
+def test_upload_nonce_wraps():
+    assert protocol.decode(
+        protocol.encode_upload_cmd(0, 300))["nonce"] == 300 & 0xFF
+
+
+def test_upload_cmd_and_ack_distinct_5_byte_frames():
+    cmd = protocol.encode_upload_cmd(1, 1)
+    ack = protocol.encode_upload_ack(1, 1)
+    assert len(cmd) == 5 and len(ack) == 5      # tiny, negligible duty cycle
+    assert cmd != ack                           # different type byte
+    assert protocol.decode(cmd)["type"] == protocol.UPLOAD_CMD
+    assert protocol.decode(ack)["type"] == protocol.UPLOAD_ACK

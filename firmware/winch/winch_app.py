@@ -211,6 +211,15 @@ _upload_request = False   # dashboard "Upload log" button -> picked up by _serve
 # Upload progress for the dashboard, set by _serve's offload step:
 # "" idle | "uploading" | "ok" (verified) | "unverified" | "fail".
 _upload_status = ""
+# Radio cross-upload: a WebGUI "Upload log" click also asks the ROPE to upload
+# (protocol.UPLOAD_CMD, retried until UPLOAD_ACK). Sent opportunistically from
+# on_receive on TELEMETRY cycles that don't already send a LINK_REPORT.
+cross_cmd_nonce = None    # active outgoing request nonce, or None
+cross_cmd_tries = 0       # remaining UPLOAD_CMD sends
+cross_cmd_ts = 0          # ticks_ms of the last CMD send (~1 s gap)
+cross_nonce_ctr = 0       # per-request id counter
+cross_ack_nonce = None    # an incoming UPLOAD_CMD nonce to ACK
+cross_last_cmd = None     # last CMD nonce acted on (dedup resends)
 
 
 def _begin_upload(what):
@@ -282,6 +291,30 @@ def send_link_report():
     lost_window = 0
     print("[TX] link report rssi={} snr={} loss={}%".format(
         last_rssi, last_snr, loss_pct))
+
+
+def _cross_send():
+    # Send ONE pending cross-upload frame (ACK first, else a retry CMD ~1 s
+    # apart). Called from on_receive only on TELEMETRY cycles that do NOT send a
+    # LINK_REPORT, so we never TX twice in one RX callback (half-duplex).
+    global tx_seq, cross_ack_nonce, cross_cmd_nonce, cross_cmd_tries, cross_cmd_ts
+    frame = None
+    if cross_ack_nonce is not None:
+        frame = protocol.encode_upload_ack(tx_seq, cross_ack_nonce)
+        cross_ack_nonce = None
+    elif (cross_cmd_nonce is not None and cross_cmd_tries > 0
+            and time.ticks_diff(time.ticks_ms(), cross_cmd_ts) >= 1000):
+        cross_cmd_ts = time.ticks_ms()
+        cross_cmd_tries -= 1
+        frame = protocol.encode_upload_cmd(tx_seq, cross_cmd_nonce)
+        if cross_cmd_tries <= 0:
+            cross_cmd_nonce = None              # gave up after this final send
+    if frame is not None:
+        tx_seq = (tx_seq + 1) & 0xFFFF
+        try:
+            lora.send(frame)               # cross-frame is best-effort; a SPI
+        except Exception as e:             # collision just drops it (re-armed by
+            print("cross-upload TX deferred:", e)   # the next RX), no crash
 
 
 def _send_winch_pos():
@@ -768,6 +801,7 @@ def _reset_log(uploaded):
 def on_receive(events):
     global last_seq, received, lost, last_rssi, last_snr
     global recv_window, lost_window, latest, clock_set, last_rx_ms
+    global cross_ack_nonce, cross_last_cmd, cross_cmd_nonce, _upload_request
     if not (events & SX1262.RX_DONE):
         return
     frame, err = lora.recv()
@@ -829,6 +863,20 @@ def on_receive(events):
             show_telemetry(msg)
         if msg["flags"] & protocol.FLAG_REQUEST_REPORT:
             send_link_report()
+        else:
+            _cross_send()           # opportunistic cross-upload TX (non-report)
+    elif msg["type"] == protocol.UPLOAD_CMD:
+        # Rope asked us to upload too. ACK every copy (sent by _cross_send);
+        # trigger our upload only once per new nonce.
+        if msg["nonce"] != cross_last_cmd:
+            cross_last_cmd = msg["nonce"]
+            _upload_request = True
+            print("Cross-upload requested by rope (nonce %d)" % msg["nonce"])
+        cross_ack_nonce = msg["nonce"]
+    elif msg["type"] == protocol.UPLOAD_ACK:
+        if msg["nonce"] == cross_cmd_nonce:
+            cross_cmd_nonce = None              # rope got it; stop retrying
+            print("Cross-upload ACKed by rope (nonce %d)" % msg["nonce"])
     else:
         print("[RX]", msg)
 
@@ -943,6 +991,7 @@ async def _ws_push(writer, key):
 
 async def handle(reader, writer):
     global _upload_request
+    global cross_nonce_ctr, cross_cmd_nonce, cross_cmd_tries, cross_cmd_ts
     try:
         req = await reader.readline()
         headers = {}
@@ -971,6 +1020,12 @@ async def handle(reader, writer):
             await writer.drain()
         elif path.startswith(b"/upload"):  # manual log upload (picked up by _serve)
             _upload_request = True
+            # Also ask the rope to upload, over the radio (cross-upload).
+            # _cross_send (in on_receive) sends UPLOAD_CMD up to 5x until ACKed.
+            cross_nonce_ctr = (cross_nonce_ctr + 1) & 0xFF
+            cross_cmd_nonce = cross_nonce_ctr
+            cross_cmd_tries = 5
+            cross_cmd_ts = 0               # send on the next opportunity
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
                          b"Connection: close\r\n\r\nupload queued")
             await writer.drain()

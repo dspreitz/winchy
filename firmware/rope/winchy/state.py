@@ -64,6 +64,15 @@ class State:
         # Upload progress for the dashboard, set by the upload task:
         # "" idle | "uploading" | "ok" (verified) | "unverified" | "fail".
         self.upload_status = ""
+        # Radio cross-upload: a WebGUI "Upload log" click also asks the WINCH to
+        # upload (protocol.UPLOAD_CMD, retried until UPLOAD_ACK). telemetry_task
+        # owns the TX; on_radio sets the RX-side fields. nonce = idempotency id.
+        self.cross_cmd_nonce = None    # active outgoing request nonce, or None
+        self.cross_cmd_tries = 0       # remaining UPLOAD_CMD sends
+        self.cross_cmd_ts = 0          # ticks_ms of the last CMD send (~1 s gap)
+        self.cross_nonce_ctr = 0       # per-request id counter
+        self.cross_ack_nonce = None    # an incoming UPLOAD_CMD nonce to ACK
+        self.cross_last_cmd = None     # last CMD nonce acted on (dedup resends)
         # Power
         self.system_mv = 0
         self.batt_mv = 0

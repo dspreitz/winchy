@@ -36,6 +36,9 @@ MASS = 3
 SUMMARY = 4
 LINK_REPORT = 5  # winch -> rope: downlink quality as seen by the receiver
 WINCH_POS = 6    # winch -> rope: surveyed (averaged) winch position, low rate
+UPLOAD_CMD = 7   # either -> other: a WebGUI "Upload log" click asks the other
+                 # unit to upload its log too (manual cross-upload trigger)
+UPLOAD_ACK = 8   # other -> initiator: acks an UPLOAD_CMD (stops the retries)
 
 # Tow phases (TELEMETRY.phase) - see docs/winch_launch_physics.md
 PHASE_IDLE = 0
@@ -84,6 +87,9 @@ _LINK_REPORT_FMT = "<BBHhbB"
 # version:B type:B seq:H | lat:i(1e-7 deg) lon:i(1e-7 deg)
 # altitude:H(1 m, AMSL) hacc:B(0.1 m, saturates at 25.5) status:B
 _WINCH_POS_FMT = "<BBHiiHBB"
+# version:B type:B seq:H | nonce:B - per-request id so a resend is idempotent
+_UPLOAD_CMD_FMT = "<BBHB"
+_UPLOAD_ACK_FMT = "<BBHB"
 
 
 def encode_telemetry(seq, phase, force, angle_deg, altitude_m, batt_mv,
@@ -128,6 +134,16 @@ def encode_winch_pos(seq, lat_deg, lon_deg, altitude_m, hacc_m=25.5, status=0):
                        lat, lon, alt, hacc, status & 0xFF)
 
 
+def encode_upload_cmd(seq, nonce):
+    return struct.pack(_UPLOAD_CMD_FMT, VERSION, UPLOAD_CMD, seq & 0xFFFF,
+                       nonce & 0xFF)
+
+
+def encode_upload_ack(seq, nonce):
+    return struct.pack(_UPLOAD_ACK_FMT, VERSION, UPLOAD_ACK, seq & 0xFFFF,
+                       nonce & 0xFF)
+
+
 def decode(frame):
     """Decode any frame into a dict with a 'type' key (one of the frame
     type constants). Returns None for unknown version/type/length."""
@@ -167,5 +183,13 @@ def decode(frame):
         return {"type": WINCH_POS, "seq": seq, "lat": lat / 1e7,
                 "lon": lon / 1e7, "altitude_m": alt, "hacc_m": hacc / 10,
                 "status": status}
+
+    if ftype == UPLOAD_CMD and len(frame) == struct.calcsize(_UPLOAD_CMD_FMT):
+        _, _, seq, nonce = struct.unpack(_UPLOAD_CMD_FMT, frame)
+        return {"type": UPLOAD_CMD, "seq": seq, "nonce": nonce}
+
+    if ftype == UPLOAD_ACK and len(frame) == struct.calcsize(_UPLOAD_ACK_FMT):
+        _, _, seq, nonce = struct.unpack(_UPLOAD_ACK_FMT, frame)
+        return {"type": UPLOAD_ACK, "seq": seq, "nonce": nonce}
 
     return None
