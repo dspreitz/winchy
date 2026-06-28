@@ -20,8 +20,14 @@ import asyncio
 import binascii
 import hashlib
 import json
+import time
 
 state = None   # the shared State object, set by app.py's dashboard task
+
+
+def _hms():
+    t = time.localtime()            # RTC is UTC (GPS+PPS, or NTP fallback)
+    return "%02d:%02d:%02d" % (t[3], t[4], t[5])
 
 
 def _data(s):
@@ -39,6 +45,7 @@ def _data(s):
         "snr": s.link_snr_db, "loss": s.link_loss_pct,
         "tsync": s.time_synced, "rec": s.raw_recording,
         "upstatus": s.upload_status,
+        "time": _hms() if s.time_synced else "--:--:--",
     }
 
 
@@ -54,6 +61,7 @@ td.l{color:#8ac;width:46%}
 </style></head><body>
 <h1>Winchy rope</h1>
 <table>
+<tr><td class=l>Time</td><td id=clock>--</td></tr>
 <tr><td class=l>GPS</td><td id=gps>--</td></tr>
 <tr><td class=l>Lat/Lon</td><td id=ll>--</td></tr>
 <tr><td class=l>Baro alt / climb</td><td id=alt>--</td></tr>
@@ -80,6 +88,7 @@ function ul(){ulmsg.textContent='uploading…';
 function f(x,n){return (x==null)?'--':x.toFixed(n);}
 function render(d){
   last=Date.now();document.body.className='';
+  clock.textContent=d.time+' UTC';
   gps.innerHTML=(d.fix?'<span class=g>FIX</span>':'<span class=r>no fix</span>')+' '+d.sats+' sat'+(d.hacc<100?'  ±'+f(d.hacc,1)+'m':'');
   ll.textContent=f(d.lat,6)+', '+f(d.lon,6);
   alt.textContent=f(d.baro_alt,1)+' m   '+f(d.climb,2)+' m/s';

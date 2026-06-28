@@ -922,6 +922,10 @@ async def _ws_push(writer, key):
         while True:
             d = dict(latest)
             d["upstatus"] = _upload_status
+            _tm = time.localtime()        # live RTC clock (not telemetry-bound)
+            d["time"] = ("%02d:%02d:%02d" % (_tm[3], _tm[4], _tm[5])
+                         if clock_set else "--:--:--")
+            d["tsync"] = clock_set
             writer.write(_ws_text_frame(json.dumps(d).encode()))
             await writer.drain()
             await asyncio.sleep_ms(WS_PUSH_MS)
@@ -949,6 +953,10 @@ async def handle(reader, writer):
         elif path.startswith(b"/data"):   # kept for curl/debug; the UI uses /ws
             d = dict(latest)
             d["upstatus"] = _upload_status
+            _tm = time.localtime()        # live RTC clock (not telemetry-bound)
+            d["time"] = ("%02d:%02d:%02d" % (_tm[3], _tm[4], _tm[5])
+                         if clock_set else "--:--:--")
+            d["tsync"] = clock_set
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
                          b"Connection: close\r\n\r\n")
             writer.write(json.dumps(d).encode())
