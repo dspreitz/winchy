@@ -28,7 +28,9 @@ from machine import Pin, RTC
 import sh1106
 from sx1262 import SX1262
 
+import adr
 import config
+import crossupload
 import protocol
 import wifi
 import gpstime
@@ -158,7 +160,10 @@ GITHUB_REPO = "dspreitz/winchy-logs"
 GITHUB_RELEASE_TAG = "logs"
 GITHUB_ASSET = "rope_rawlog.csv"
 GITHUB_TIMEOUT_S = 30   # socket timeout on the (blocking) upload round-trips, so
-                        # a stalled connection can't freeze the asyncio loop
+                        # a stalled connection can't freeze the asyncio loop.
+                        # NOTE: does NOT cover DNS - getaddrinfo runs before the
+                        # socket exists. A dead DNS still stalls the loop, but
+                        # lwIP bounds it (~14 s with retries), so no forever-hang.
 try:
     from secrets import GITHUB_TOKEN
 except ImportError:
@@ -232,20 +237,17 @@ ADR_REPORT_TIMEOUT_MS = 4000  # no fresh report this long -> jump to max
 
 
 def _adr_next_power(state):
-    """Next TX power (dBm), clamped. Fail loud (jump to max) on stale/lossy
-    feedback so the link recovers at once; otherwise keep the winch-reported
-    RSSI in a comfortable window - raise fast, trim slow."""
-    power = state.tx_power_dbm
+    """Next TX power (dBm). The decision itself lives in shared/adr.py (pure,
+    host-tested - a regression here means a dead link at range); this wrapper
+    just supplies the report freshness and the tuning constants."""
     fresh = (state.link_report_ts != 0 and time.ticks_diff(
         time.ticks_ms(), state.link_report_ts) <= ADR_REPORT_TIMEOUT_MS)
-    if (not fresh) or state.link_loss_pct >= ADR_LOSS_HIGH_PCT:
-        return ADR_TX_POWER_MAX_DBM
-    rssi = state.link_rssi_dbm
-    if rssi < ADR_RSSI_LOW_DBM:
-        return min(ADR_TX_POWER_MAX_DBM, power + ADR_STEP_UP_DB)
-    if rssi > ADR_RSSI_HIGH_DBM:
-        return max(ADR_TX_POWER_MIN_DBM, power - ADR_STEP_DOWN_DB)
-    return power  # within the window: hold
+    return adr.next_tx_power(
+        state.tx_power_dbm, fresh, state.link_loss_pct, state.link_rssi_dbm,
+        power_min=ADR_TX_POWER_MIN_DBM, power_max=ADR_TX_POWER_MAX_DBM,
+        rssi_low=ADR_RSSI_LOW_DBM, rssi_high=ADR_RSSI_HIGH_DBM,
+        step_up=ADR_STEP_UP_DB, step_down=ADR_STEP_DOWN_DB,
+        loss_high_pct=ADR_LOSS_HIGH_PCT)
 
 # Barometric altitude calibration against GPS, only while IDLE (during a
 # launch the unit climbs and GPS/baro lag differently, so the reference is
@@ -277,26 +279,35 @@ QNH_CAL_FAR_HITS = 10         # ... unless it persists (the unit really moved)
 
 async def force_task(adc, state):
     # Free-running at the ADC conversion rate (10 SPS at gain 128).
+    # Defense in depth (all sensor tasks): one bad iteration must never kill
+    # the task - under asyncio.gather a dead task takes the WHOLE app down
+    # (crash-guard reboot), which mid-launch means ~30 s of telemetry loss.
+    # Drop the iteration, keep sampling.
     last_recal = time.ticks_ms()
     while True:
         try:
-            state.force_raw = await adc.aread_raw(FORCE_TIMEOUT_MS)
-            state.force_ts = time.ticks_ms()
-        except asyncio.TimeoutError:
-            state.force_errors += 1
-        # Periodically re-run the ADC's on-chip offset calibration to shed
-        # thermal offset drift. Gated to IDLE + near-zero tared load so it never
-        # interrupts a launch; load-independent + no re-tare needed (see driver).
-        if (state.phase == protocol.PHASE_IDLE
-                and time.ticks_diff(time.ticks_ms(), last_recal)
-                    > ADC_RECAL_PERIOD_S * 1000
-                and abs(state.force_raw - state.force_offset)
-                    < ADC_RECAL_QUIET_COUNTS):
             try:
-                adc.calibrate_offset()
-            except OSError:
+                state.force_raw = await adc.aread_raw(FORCE_TIMEOUT_MS)
+                state.force_ts = time.ticks_ms()
+            except asyncio.TimeoutError:
                 state.force_errors += 1
-            last_recal = time.ticks_ms()
+            # Periodically re-run the ADC's on-chip offset calibration to shed
+            # thermal offset drift. Gated to IDLE + near-zero tared load so it never
+            # interrupts a launch; load-independent + no re-tare needed (see driver).
+            if (state.phase == protocol.PHASE_IDLE
+                    and time.ticks_diff(time.ticks_ms(), last_recal)
+                        > ADC_RECAL_PERIOD_S * 1000
+                    and abs(state.force_raw - state.force_offset)
+                        < ADC_RECAL_QUIET_COUNTS):
+                try:
+                    adc.calibrate_offset()
+                except OSError:
+                    state.force_errors += 1
+                last_recal = time.ticks_ms()
+        except Exception as e:
+            state.force_errors += 1
+            print("force task iteration error:", e)
+            await asyncio.sleep_ms(100)
 
 
 async def mag_task(mag, state):
@@ -320,95 +331,100 @@ async def imu_task(imu, state, filt, gyro_bias):
     last_motion_ts = 0
     prev_angle = None      # for the rope-angle rate (glider speed)
     while True:
-        accel = imu.read_accel()
-        gyro = imu.read_gyro()
-        now = time.ticks_ms()
-        dt = time.ticks_diff(now, last) / 1000.0
-        last = now
+        # Defense in depth: an SPI hiccup in one read must not kill the task
+        # (under asyncio.gather that reboots the whole app - see force_task).
+        try:
+            accel = imu.read_accel()
+            gyro = imu.read_gyro()
+            now = time.ticks_ms()
+            dt = time.ticks_diff(now, last) / 1000.0
+            last = now
 
-        norm = math.sqrt(accel[0] ** 2 + accel[1] ** 2 + accel[2] ** 2)
-        if (state.phase == protocol.PHASE_IDLE
-                and abs(norm - 1.0) < GYRO_STILL_TOLERANCE_G):
-            for i in range(3):
-                bias[i] += GYRO_BIAS_ALPHA * (gyro[i] - bias[i])
-        corrected = (gyro[0] - bias[0], gyro[1] - bias[1],
-                     gyro[2] - bias[2])
+            norm = math.sqrt(accel[0] ** 2 + accel[1] ** 2 + accel[2] ** 2)
+            if (state.phase == protocol.PHASE_IDLE
+                    and abs(norm - 1.0) < GYRO_STILL_TOLERANCE_G):
+                for i in range(3):
+                    bias[i] += GYRO_BIAS_ALPHA * (gyro[i] - bias[i])
+            corrected = (gyro[0] - bias[0], gyro[1] - bias[1],
+                         gyro[2] - bias[2])
 
-        filt.predict(corrected, dt)
-        filt.update(accel)
-        state.accel = accel
-        state.gyro_dps = corrected
-        state.angle_deg = rope_angle_above_ground(*filt.gravity)
-        state.accel_ts = now
+            filt.predict(corrected, dt)
+            filt.update(accel)
+            state.accel = accel
+            state.gyro_dps = corrected
+            state.angle_deg = rope_angle_above_ground(*filt.gravity)
+            state.accel_ts = now
 
-        # Rope-angle rate (EMA + clamp) and glider (CG-hook) speed estimate.
-        if prev_angle is not None and dt > 0:
-            rate = (state.angle_deg - prev_angle) / dt
-            if rate > ANGLE_RATE_MAX_DPS:
-                rate = ANGLE_RATE_MAX_DPS
-            elif rate < -ANGLE_RATE_MAX_DPS:
-                rate = -ANGLE_RATE_MAX_DPS
-            state.angle_rate_dps += ANGLE_RATE_ALPHA * (rate - state.angle_rate_dps)
-        prev_angle = state.angle_deg
-        vh = state.ground_speed_ms
-        vv = state.climb_rate_ms
-        state.rope_speed_ms = math.sqrt(vh * vh + vv * vv)
-        if GLIDER_SPEED_5M_CORRECTION:
-            state.glider_speed_ms = glider_speed(
-                vh, vv, state.angle_deg, state.angle_rate_dps,
-                GLIDER_HOOK_DIST_M)
-        else:                              # segment 3-D speed; rotation-immune
-            state.glider_speed_ms = state.rope_speed_ms
+            # Rope-angle rate (EMA + clamp) and glider (CG-hook) speed estimate.
+            if prev_angle is not None and dt > 0:
+                rate = (state.angle_deg - prev_angle) / dt
+                if rate > ANGLE_RATE_MAX_DPS:
+                    rate = ANGLE_RATE_MAX_DPS
+                elif rate < -ANGLE_RATE_MAX_DPS:
+                    rate = -ANGLE_RATE_MAX_DPS
+                state.angle_rate_dps += ANGLE_RATE_ALPHA * (rate - state.angle_rate_dps)
+            prev_angle = state.angle_deg
+            vh = state.ground_speed_ms
+            vv = state.climb_rate_ms
+            state.rope_speed_ms = math.sqrt(vh * vh + vv * vv)
+            if GLIDER_SPEED_5M_CORRECTION:
+                state.glider_speed_ms = glider_speed(
+                    vh, vv, state.angle_deg, state.angle_rate_dps,
+                    GLIDER_HOOK_DIST_M)
+            else:                          # segment 3-D speed; rotation-immune
+                state.glider_speed_ms = state.rope_speed_ms
 
-        # Raw log: filter inputs (raw accel/gyro/mag, pressure, force, GPS alt)
-        # + on-device outputs (baro alt/climb, angle) for offline replay. gyro
-        # is logged RAW (un-bias-corrected) so the bias estimation replays too.
-        # No file I/O here - lines are queued for raw_writer_task so the slow
-        # flash writes never stall this 50 Hz loop.
-        if RAW_LOG and len(state.raw_q) < RAW_Q_MAX:
-            mx, my, mz = state.mag   # held; mag_task refreshes it at ~20 Hz
-            utc_ms = time.time_ns() // 1000000 + 946684800000  # unix epoch ms
-            row = ("%d,%d,%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f,%d,"
-                   "%.2f,%.1f,%.2f,%.1f,%.7f,%.7f,%d,%d,%.2f,%.1f,%.2f,"
-                   "%.1f,%.1f,%.1f,%.1f,%.2f\n" % (
-                       now, utc_ms, accel[0], accel[1], accel[2], gyro[0], gyro[1],
-                       gyro[2], mx, my, mz, state.force_raw, state.pressure_hpa,
-                       state.baro_alt_m, state.climb_rate_ms, state.alt_m,
-                       state.lat, state.lon, state.gps_fix, state.gps_sats,
-                       state.ground_speed_ms, state.angle_deg,
-                       state.glider_speed_ms, state.cable_length_m,
-                       state.winch_dist_m, state.elevation_deg,
-                       state.gps_hacc_m, state.gps_climb_ms))
+            # Raw log: filter inputs (raw accel/gyro/mag, pressure, force, GPS alt)
+            # + on-device outputs (baro alt/climb, angle) for offline replay. gyro
+            # is logged RAW (un-bias-corrected) so the bias estimation replays too.
+            # No file I/O here - lines are queued for raw_writer_task so the slow
+            # flash writes never stall this 50 Hz loop.
+            if RAW_LOG and len(state.raw_q) < RAW_Q_MAX:
+                mx, my, mz = state.mag   # held; mag_task refreshes it at ~20 Hz
+                utc_ms = time.time_ns() // 1000000 + 946684800000  # unix epoch ms
+                row = ("%d,%d,%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f,%d,"
+                       "%.2f,%.1f,%.2f,%.1f,%.7f,%.7f,%d,%d,%.2f,%.1f,%.2f,"
+                       "%.1f,%.1f,%.1f,%.1f,%.2f\n" % (
+                           now, utc_ms, accel[0], accel[1], accel[2], gyro[0], gyro[1],
+                           gyro[2], mx, my, mz, state.force_raw, state.pressure_hpa,
+                           state.baro_alt_m, state.climb_rate_ms, state.alt_m,
+                           state.lat, state.lon, state.gps_fix, state.gps_sats,
+                           state.ground_speed_ms, state.angle_deg,
+                           state.glider_speed_ms, state.cable_length_m,
+                           state.winch_dist_m, state.elevation_deg,
+                           state.gps_hacc_m, state.gps_climb_ms))
 
-            # Motion gate. Rest baselines (motion-test): accel_dev <= 0.04 g,
-            # gyro_mag < 1 dps. A flat spin keeps |a| ~ 1 g, so the gyro term is
-            # what catches it - both terms are needed.
-            moving = (not RAW_LOG_MOTION_GATED) or (
-                abs(norm - 1.0) > MOTION_ACCEL_DEV_G
-                or max(abs(corrected[0]), abs(corrected[1]),
-                       abs(corrected[2])) > MOTION_GYRO_DPS)
+                # Motion gate. Rest baselines (motion-test): accel_dev <= 0.04 g,
+                # gyro_mag < 1 dps. A flat spin keeps |a| ~ 1 g, so the gyro term is
+                # what catches it - both terms are needed.
+                moving = (not RAW_LOG_MOTION_GATED) or (
+                    abs(norm - 1.0) > MOTION_ACCEL_DEV_G
+                    or max(abs(corrected[0]), abs(corrected[1]),
+                           abs(corrected[2])) > MOTION_GYRO_DPS)
 
-            if not recording:
-                ring.append((now, row))
-                # trim the rolling pre-roll to the last RAW_LOG_PREROLL_S
-                while time.ticks_diff(now, ring[0][0]) > RAW_LOG_PREROLL_S * 1000:
-                    ring.pop(0)
-                if moving:
-                    state.raw_q.append("# motion-start t=%d\n" % now)
-                    for _, r in ring:
-                        state.raw_q.append(r)
-                    ring = []
-                    recording = True
-                    state.raw_recording = True
-                    last_motion_ts = now
-            else:
-                state.raw_q.append(row)
-                if moving:
-                    last_motion_ts = now
-                if time.ticks_diff(now, last_motion_ts) >= RAW_LOG_REST_HOLD_S * 1000:
-                    state.raw_q.append("# rest t=%d\n" % now)
-                    recording = False
-                    state.raw_recording = False
+                if not recording:
+                    ring.append((now, row))
+                    # trim the rolling pre-roll to the last RAW_LOG_PREROLL_S
+                    while time.ticks_diff(now, ring[0][0]) > RAW_LOG_PREROLL_S * 1000:
+                        ring.pop(0)
+                    if moving:
+                        state.raw_q.append("# motion-start t=%d\n" % now)
+                        for _, r in ring:
+                            state.raw_q.append(r)
+                        ring = []
+                        recording = True
+                        state.raw_recording = True
+                        last_motion_ts = now
+                else:
+                    state.raw_q.append(row)
+                    if moving:
+                        last_motion_ts = now
+                    if time.ticks_diff(now, last_motion_ts) >= RAW_LOG_REST_HOLD_S * 1000:
+                        state.raw_q.append("# rest t=%d\n" % now)
+                        recording = False
+                        state.raw_recording = False
+        except Exception as e:
+            print("imu task iteration error:", e)
         await asyncio.sleep_ms(IMU_PERIOD_MS)
 
 
@@ -459,67 +475,81 @@ async def raw_writer_task(state):
     # Also performs the offload-reset (it is now the file's only writer).
     if not RAW_LOG:
         return
-    rawf = open(RAW_LOG_PATH, "a")
+    # A failed open/header write (flash full of OTHER files - the 4 MB cap only
+    # bounds raw.csv itself) must disable raw logging, not kill the whole app
+    # (under asyncio.gather a dead task = crash-guard reboot LOOP, since every
+    # boot would retry the same failing write).
     try:
-        raw_bytes = os.stat(RAW_LOG_PATH)[6]   # cap across reboots (append)
-    except OSError:
-        raw_bytes = 0
-    rawf.write(RAW_LOG_HEADER)
-    rawf.write(_fw_line("rope", "winchy/app.py"))   # one-time fw fingerprint
-    rawf.flush()
+        rawf = open(RAW_LOG_PATH, "a")
+        try:
+            raw_bytes = os.stat(RAW_LOG_PATH)[6]   # cap across reboots (append)
+        except OSError:
+            raw_bytes = 0
+        rawf.write(RAW_LOG_HEADER)
+        rawf.write(_fw_line("rope", "winchy/app.py"))   # one-time fw fingerprint
+        rawf.flush()
+    except OSError as e:
+        print("raw log DISABLED (open/header failed):", e)
+        return
     unflushed = 0
     flushes = 0
     while True:
-        # Offload-reset: wifi_task sets raw_uploaded_bytes after a good upload.
-        # Reclaim the flash, but only between episodes, with the queue drained,
-        # and only if nothing new is on disk since the upload.
-        if (state.raw_uploaded_bytes and not state.raw_recording
-                and not state.raw_q):
-            try:
-                cur = os.stat(RAW_LOG_PATH)[6]
-            except OSError:
-                cur = 0
-            if cur <= state.raw_uploaded_bytes:
-                rawf = _reset_raw_file(rawf)
-                raw_bytes = len(RAW_LOG_HEADER)
-                print("raw.csv offloaded; reset")
-            state.raw_uploaded_bytes = 0
+        # Same defense in depth as the sensor tasks: a flash-write error drops
+        # the chunk (data loss) instead of killing the writer (reboot loop).
+        try:
+            # Offload-reset: wifi_task sets raw_uploaded_bytes after a good upload.
+            # Reclaim the flash, but only between episodes, with the queue drained,
+            # and only if nothing new is on disk since the upload.
+            if (state.raw_uploaded_bytes and not state.raw_recording
+                    and not state.raw_q):
+                try:
+                    cur = os.stat(RAW_LOG_PATH)[6]
+                except OSError:
+                    cur = 0
+                if cur <= state.raw_uploaded_bytes:
+                    rawf = _reset_raw_file(rawf)
+                    raw_bytes = len(RAW_LOG_HEADER)
+                    print("raw.csv offloaded; reset")
+                state.raw_uploaded_bytes = 0
 
-        # In motion-gated mode, defer all flash writes while an episode is
-        # recording so the launch is sampled at full rate with no write stalls.
-        # The buffered lines (RAM is plentiful - PSRAM) drain below once idle.
-        # In continuous mode there is no idle, so drain as we go instead.
-        if RAW_LOG_MOTION_GATED and state.raw_recording:
-            await asyncio.sleep_ms(RAW_WRITE_IDLE_MS)
-            continue
+            # In motion-gated mode, defer all flash writes while an episode is
+            # recording so the launch is sampled at full rate with no write stalls.
+            # The buffered lines (RAM is plentiful - PSRAM) drain below once idle.
+            # In continuous mode there is no idle, so drain as we go instead.
+            if RAW_LOG_MOTION_GATED and state.raw_recording:
+                await asyncio.sleep_ms(RAW_WRITE_IDLE_MS)
+                continue
 
-        q = state.raw_q
-        if not q:
-            if unflushed:
+            q = state.raw_q
+            if not q:
+                if unflushed:
+                    rawf.flush()
+                    unflushed = 0
+                await asyncio.sleep_ms(RAW_WRITE_IDLE_MS)
+                continue
+            chunk = q[:RAW_WRITE_CHUNK]    # atomic slice+del (no await between)
+            del q[:RAW_WRITE_CHUNK]
+            for r in chunk:
+                if raw_bytes >= RAW_LOG_MAX_BYTES:
+                    # Rolling cap: rotate (drop the oldest) instead of halting, so a
+                    # stuck/failed upload can never silently stop recording. Keeps
+                    # the most recent ~RAW_LOG_MAX_BYTES.
+                    rawf = _reset_raw_file(rawf)
+                    raw_bytes = len(RAW_LOG_HEADER)
+                    unflushed = 0
+                    print("raw.csv hit cap; rotated (keeping recent data)")
+                rawf.write(r)
+                raw_bytes += len(r)
+                unflushed += 1
+            if unflushed >= RAW_LOG_FLUSH_EVERY:
                 rawf.flush()
                 unflushed = 0
-            await asyncio.sleep_ms(RAW_WRITE_IDLE_MS)
-            continue
-        chunk = q[:RAW_WRITE_CHUNK]    # atomic slice+del (no await between)
-        del q[:RAW_WRITE_CHUNK]
-        for r in chunk:
-            if raw_bytes >= RAW_LOG_MAX_BYTES:
-                # Rolling cap: rotate (drop the oldest) instead of halting, so a
-                # stuck/failed upload can never silently stop recording. Keeps
-                # the most recent ~RAW_LOG_MAX_BYTES.
-                rawf = _reset_raw_file(rawf)
-                raw_bytes = len(RAW_LOG_HEADER)
-                unflushed = 0
-                print("raw.csv hit cap; rotated (keeping recent data)")
-            rawf.write(r)
-            raw_bytes += len(r)
-            unflushed += 1
-        if unflushed >= RAW_LOG_FLUSH_EVERY:
-            rawf.flush()
-            unflushed = 0
-            flushes += 1
-            if flushes % RAW_GC_EVERY == 0:
-                gc.collect()
+                flushes += 1
+                if flushes % RAW_GC_EVERY == 0:
+                    gc.collect()
+        except Exception as e:
+            print("raw writer iteration error:", e)
+            await asyncio.sleep_ms(1000)
         await asyncio.sleep_ms(0)      # yield so imu_task samples between chunks
 
 
@@ -545,62 +575,67 @@ async def baro_task(baro, state, vertical):
     seeded = False
     qnh_far = 0          # consecutive GPS fixes whose alt is far from baro alt
     while True:
-        pressure = await baro.apressure_hpa()
-        now = time.ticks_ms()
-        state.pressure_hpa = pressure
-        state.baro_ts = now
+        # Defense in depth: the BMP280 status reads inside apressure_hpa are
+        # raw I2C - one bus hiccup must not kill the task (see force_task).
+        try:
+            pressure = await baro.apressure_hpa()
+            now = time.ticks_ms()
+            state.pressure_hpa = pressure
+            state.baro_ts = now
 
-        # One-time boot seed: with no GPS fix yet, derive QNH from the last known
-        # field elevation (persisted to flash) + today's pressure, so the
-        # absolute altitude is right immediately and weather-aware (no sea-level
-        # assumption). Only falls back to standard pressure if there is no stored
-        # fix (first boot ever). A real GPS fix below replaces it.
-        if state.qnh_hpa == 0 and not seeded:
-            seed_alt = _load_last_fix_alt()
-            if seed_alt is not None:
-                state.qnh_hpa = altitude.sea_level_pressure_hpa(pressure, seed_alt)
-                print("Baro QNH seeded from last fix %.1f m -> %.1f hPa"
-                      % (seed_alt, state.qnh_hpa))
-            seeded = True
+            # One-time boot seed: with no GPS fix yet, derive QNH from the last known
+            # field elevation (persisted to flash) + today's pressure, so the
+            # absolute altitude is right immediately and weather-aware (no sea-level
+            # assumption). Only falls back to standard pressure if there is no stored
+            # fix (first boot ever). A real GPS fix below replaces it.
+            if state.qnh_hpa == 0 and not seeded:
+                seed_alt = _load_last_fix_alt()
+                if seed_alt is not None:
+                    state.qnh_hpa = altitude.sea_level_pressure_hpa(pressure, seed_alt)
+                    print("Baro QNH seeded from last fix %.1f m -> %.1f hPa"
+                          % (seed_alt, state.qnh_hpa))
+                seeded = True
 
-        gps_fresh = (state.gps_fix and time.ticks_diff(
-            time.ticks_ms(), state.gps_ts) < BARO_CAL_GPS_MAX_AGE_MS)
-        if (state.phase == protocol.PHASE_IDLE and gps_fresh
-                and state.gps_sats >= QNH_CAL_MIN_SATS
-                and state.gps_hacc_m <= QNH_CAL_MAX_HACC_M):
-            ref = altitude.sea_level_pressure_hpa(pressure, state.alt_m)
-            # Reject a transient bad fix: a GPS altitude far off the current
-            # (seeded/calibrated) baro altitude is the large vertical error seen
-            # right at first lock. Accept anyway only if it persists, which means
-            # the unit really moved to a new field.
-            if (abs(state.alt_m - state.baro_alt_m) > QNH_CAL_MAX_JUMP_M
-                    and qnh_far < QNH_CAL_FAR_HITS):
-                qnh_far += 1
-            else:
-                qnh_far = 0
-                if not state.qnh_gps_cal:
-                    # First good fix: snap QNH to truth (replaces seed/default)
-                    # and re-seed the filter so the jump isn't read as a climb.
-                    state.qnh_hpa = ref
-                    state.qnh_gps_cal = True
-                    vertical.alt = None
-                    vertical.vrate = 0.0
-                    print("Baro QNH from GPS: %.1f hPa (alt %.1f m, %d sat)"
-                          % (ref, state.alt_m, state.gps_sats))
+            gps_fresh = (state.gps_fix and time.ticks_diff(
+                time.ticks_ms(), state.gps_ts) < BARO_CAL_GPS_MAX_AGE_MS)
+            if (state.phase == protocol.PHASE_IDLE and gps_fresh
+                    and state.gps_sats >= QNH_CAL_MIN_SATS
+                    and state.gps_hacc_m <= QNH_CAL_MAX_HACC_M):
+                ref = altitude.sea_level_pressure_hpa(pressure, state.alt_m)
+                # Reject a transient bad fix: a GPS altitude far off the current
+                # (seeded/calibrated) baro altitude is the large vertical error seen
+                # right at first lock. Accept anyway only if it persists, which means
+                # the unit really moved to a new field.
+                if (abs(state.alt_m - state.baro_alt_m) > QNH_CAL_MAX_JUMP_M
+                        and qnh_far < QNH_CAL_FAR_HITS):
+                    qnh_far += 1
                 else:
-                    state.qnh_hpa += BARO_CAL_ALPHA * (ref - state.qnh_hpa)
-        # Until a fix calibrates QNH, use the seed; absent any stored fix, fall
-        # back to standard pressure so baro/climb still work.
-        qnh = state.qnh_hpa or BARO_QNH_DEFAULT_HPA
-        raw_alt = altitude.pressure_to_altitude_m(pressure, qnh)
-        vertical.predict(time.ticks_diff(now, last) / 1000.0)
-        vertical.update(raw_alt)
-        # Publish the Kalman-filtered altitude, not the noisy per-sample ISA
-        # value: removes sensor jitter while still tracking a real climb.
-        # raw.csv still logs raw pressure_hpa for offline replay.
-        state.baro_alt_m = vertical.alt
-        state.climb_rate_ms = vertical.vrate
-        last = now
+                    qnh_far = 0
+                    if not state.qnh_gps_cal:
+                        # First good fix: snap QNH to truth (replaces seed/default)
+                        # and re-seed the filter so the jump isn't read as a climb.
+                        state.qnh_hpa = ref
+                        state.qnh_gps_cal = True
+                        vertical.alt = None
+                        vertical.vrate = 0.0
+                        print("Baro QNH from GPS: %.1f hPa (alt %.1f m, %d sat)"
+                              % (ref, state.alt_m, state.gps_sats))
+                    else:
+                        state.qnh_hpa += BARO_CAL_ALPHA * (ref - state.qnh_hpa)
+            # Until a fix calibrates QNH, use the seed; absent any stored fix, fall
+            # back to standard pressure so baro/climb still work.
+            qnh = state.qnh_hpa or BARO_QNH_DEFAULT_HPA
+            raw_alt = altitude.pressure_to_altitude_m(pressure, qnh)
+            vertical.predict(time.ticks_diff(now, last) / 1000.0)
+            vertical.update(raw_alt)
+            # Publish the Kalman-filtered altitude, not the noisy per-sample ISA
+            # value: removes sensor jitter while still tracking a real climb.
+            # raw.csv still logs raw pressure_hpa for offline replay.
+            state.baro_alt_m = vertical.alt
+            state.climb_rate_ms = vertical.vrate
+            last = now
+        except Exception as e:
+            print("baro task iteration error:", e)
         await asyncio.sleep_ms(BARO_PERIOD_MS)
 
 
@@ -624,7 +659,10 @@ def _pps_apply(_):
 def _on_pps(pin):
     global _pps_count
     _pps_count += 1
-    micropython.schedule(_pps_apply, 0)
+    try:
+        micropython.schedule(_pps_apply, 0)
+    except RuntimeError:
+        pass          # schedule queue full - skip this edge (PPS retries at 1 Hz)
 
 
 def _pps_arm_next(y, mo, d, h, mi, s):
@@ -642,7 +680,7 @@ def _pps_arm_next(y, mo, d, h, mi, s):
     _pps_armed = (nxt[0], nxt[1], nxt[2], nxt[6], nxt[3], nxt[4], nxt[5], 0)
 
 
-def _gps_alive(uart, timeout_ms=1500):
+async def _gps_alive(uart, timeout_ms=1500):
     """True if recognisable, CHECKSUM-VALID GPS framing is arriving at the
     current baud - used to confirm a baud before configuring. Accepts EITHER a
     valid UBX frame (the NAV-PVT we set, retained in BBR) OR a valid NMEA
@@ -650,7 +688,9 @@ def _gps_alive(uart, timeout_ms=1500):
     A bare 2-byte sync match is NOT enough: it turns up ~10% of the time in the
     garbage read at the WRONG baud, which used to false-positive the high-baud
     probe and leave the app/module baud mismatched (no sats). See
-    gps.has_gps_frame; the check runs BEFORE configure (see gps_task)."""
+    gps.has_gps_frame; the check runs BEFORE configure (see gps_task).
+    ASYNC (was time.sleep_ms): the re-detect runs mid-flight after a read
+    stall, and a blocking 0.6-1.5 s probe froze telemetry + dashboard."""
     t0 = time.ticks_ms()
     buf = b""
     while time.ticks_diff(time.ticks_ms(), t0) < timeout_ms:
@@ -661,7 +701,7 @@ def _gps_alive(uart, timeout_ms=1500):
                 buf = buf[-600:]            # bound the scan; a frame is <=~100 B
             if has_gps_frame(buf):
                 return True
-        time.sleep_ms(10)
+        await asyncio.sleep_ms(10)
     return False
 
 
@@ -678,14 +718,14 @@ async def _gps_detect_baud():
     rate = config.GPS_NAV_RATE_HZ
     for _ in range(12):                              # retry while the GPS powers up
         board.gps_reopen(config.GPS_BAUD_HIGH)
-        if _gps_alive(board.gps_uart, 600):
+        if await _gps_alive(board.gps_uart, 600):
             return rate                              # already at high baud
         board.gps_reopen(config.GPS_BAUD)
-        if _gps_alive(board.gps_uart, 600):          # found at 9600 -> raise it
+        if await _gps_alive(board.gps_uart, 600):    # found at 9600 -> raise it
             gps_set_baud(board.gps_uart, config.GPS_BAUD_HIGH)
             await asyncio.sleep_ms(400)              # let the baud switch settle
             board.gps_reopen(config.GPS_BAUD_HIGH)
-            if _gps_alive(board.gps_uart, 900):
+            if await _gps_alive(board.gps_uart, 900):
                 return rate                          # raised + confirmed
             # not confirmed yet -> loop; the next pass probes high first
         await asyncio.sleep_ms(500)                  # GPS not responding yet -> wait
@@ -706,82 +746,89 @@ async def gps_task(state):
     Pin(config.GPS_PPS, Pin.IN).irq(trigger=Pin.IRQ_RISING, handler=_on_pps)
     last_fix_save = None
     while True:
+        # Defense in depth: only read_ubx's timeout was guarded before; an
+        # unexpected exception anywhere else (parse, QNH save, geometry, time)
+        # killed the task and rebooted the whole app (see force_task).
         try:
-            cls, mid, payload = await asyncio.wait_for(read_ubx(reader), 8)
-        except asyncio.TimeoutError:
-            # No UBX for 8 s: the module may not have been streaming yet when
-            # first probed (boot race), or its baud reverted (BBR lost on a
-            # no-battery USB-unplug reset). Re-detect, reconfigure, carry on.
-            print("GPS: no data for 8s, re-detecting baud")
-            rate = await _gps_detect_baud()
-            gps_configure(board.gps_uart, rate)
-            reader = asyncio.StreamReader(board.gps_uart)
-            continue
-        if cls != 0x01 or mid != 0x07:        # only UBX-NAV-PVT
-            continue
-        update = parse_nav_pvt(payload)
-        if not update:
-            continue
-        state.gps_fix = update["fix"]
-        state.gps_sats = update["sats"]
-        state.gps_hdop = update["pdop"]       # pDOP, kept for reference/logging
-        state.gps_hacc_m = update["hacc_m"]   # gate + dashboard use this now
-        if state.gps_fix:
-            state.lat = update["lat"]
-            state.lon = update["lon"]
-            state.alt_m = update["alt_m"]
-            state.ground_speed_ms = update["gspeed_ms"]
-            state.gps_climb_ms = update["climb_ms"]
-        else:
-            state.ground_speed_ms = 0.0       # no fix -> no speed (don't latch)
-        state.gps_ts = time.ticks_ms()
-        # Winch-relative geometry, once the winch has sent its position and we
-        # have our own fix. Updates at the GPS rate (cheap trig); the 50 Hz
-        # imu_task just logs the latest values. Reel-in rate is the offline
-        # derivative of winch_dist_m, so it needs nothing here.
-        if state.winch_pos_ts and state.gps_fix:
-            rel = winch_relative(
-                state.winch_lat, state.winch_lon, state.winch_alt_m,
-                state.lat, state.lon, state.alt_m, GLIDER_HOOK_DIST_M)
-            state.cable_length_m = rel["cable_length_m"]
-            state.winch_dist_m = rel["slant_m"]
-            state.elevation_deg = rel["elevation_deg"]
-        # Persist the field position/elevation (throttled, IDLE, confident 3D
-        # fix) so the next boot can seed QNH from the known elevation.
-        if (state.phase == protocol.PHASE_IDLE and state.gps_fix
-                and state.gps_sats >= LAST_FIX_MIN_SATS
-                and (last_fix_save is None or time.ticks_diff(
-                    time.ticks_ms(), last_fix_save) >= LAST_FIX_SAVE_S * 1000)):
-            _save_last_fix(state.lat, state.lon, state.alt_m)
-            last_fix_save = time.ticks_ms()
-        # RTC from GPS, but DEFENSIVELY (gpstime.time_fix_decision): a glitched
-        # "fullyResolved" NAV-PVT can be minutes wrong (seen: ~37 min off, then
-        # latched for the session, overriding correct NTP). Only CONFIDENT times
-        # are considered (small tAcc - the M10 emits an aided time with a huge
-        # tAcc before a real fix); then cross-check vs an NTP-set clock, require a
-        # consistent 2nd frame with no clock, and re-sync on drift. PPS refines.
-        if update["datetime"] and update.get("t_acc_ns", 0) <= GPS_TIME_MAX_TACC_NS:
-            y, mo, d, h, mi, s = update["datetime"]
-            gps_epoch = time.mktime((y, mo, d, h, mi, s, 0, 0))
-            action, state.gps_time_cand = gpstime.time_fix_decision(
-                state.time_source, gps_epoch, time.time(), update["t_acc_ns"],
-                state.gps_time_cand, GPS_TIME_MAX_TACC_NS)
-            if action == "set":
-                rtc.datetime((y, mo, d, 0, h, mi, s, 0))
-                print("RTC %s from GPS: %04d-%02d-%02d %02d:%02d:%02dZ"
-                      % ("re-synced" if state.time_source == "gps" else "synced",
-                         y, mo, d, h, mi, s))
-                state.time_synced = True
-                state.time_source = "gps"
-                _pps_arm_next(y, mo, d, h, mi, s)
-            elif action == "arm":
-                _pps_arm_next(y, mo, d, h, mi, s)   # agrees -> keep PPS disciplined
-            elif (action == "reject" and state.time_source == "ntp"
-                    and time.ticks_diff(time.ticks_ms(),
-                                        state.gps_time_warn_ms) > 30000):
-                state.gps_time_warn_ms = time.ticks_ms()   # rate-limited: rare bug
-                print("GPS time rejected: %+ds vs NTP (confident but disagrees)"
-                      % (gps_epoch - time.time()))
+            try:
+                cls, mid, payload = await asyncio.wait_for(read_ubx(reader), 8)
+            except asyncio.TimeoutError:
+                # No UBX for 8 s: the module may not have been streaming yet when
+                # first probed (boot race), or its baud reverted (BBR lost on a
+                # no-battery USB-unplug reset). Re-detect, reconfigure, carry on.
+                print("GPS: no data for 8s, re-detecting baud")
+                rate = await _gps_detect_baud()
+                gps_configure(board.gps_uart, rate)
+                reader = asyncio.StreamReader(board.gps_uart)
+                continue
+            if cls != 0x01 or mid != 0x07:        # only UBX-NAV-PVT
+                continue
+            update = parse_nav_pvt(payload)
+            if not update:
+                continue
+            state.gps_fix = update["fix"]
+            state.gps_sats = update["sats"]
+            state.gps_hdop = update["pdop"]       # pDOP, kept for reference/logging
+            state.gps_hacc_m = update["hacc_m"]   # gate + dashboard use this now
+            if state.gps_fix:
+                state.lat = update["lat"]
+                state.lon = update["lon"]
+                state.alt_m = update["alt_m"]
+                state.ground_speed_ms = update["gspeed_ms"]
+                state.gps_climb_ms = update["climb_ms"]
+            else:
+                state.ground_speed_ms = 0.0       # no fix -> no speed (don't latch)
+            state.gps_ts = time.ticks_ms()
+            # Winch-relative geometry, once the winch has sent its position and we
+            # have our own fix. Updates at the GPS rate (cheap trig); the 50 Hz
+            # imu_task just logs the latest values. Reel-in rate is the offline
+            # derivative of winch_dist_m, so it needs nothing here.
+            if state.winch_pos_ts and state.gps_fix:
+                rel = winch_relative(
+                    state.winch_lat, state.winch_lon, state.winch_alt_m,
+                    state.lat, state.lon, state.alt_m, GLIDER_HOOK_DIST_M)
+                state.cable_length_m = rel["cable_length_m"]
+                state.winch_dist_m = rel["slant_m"]
+                state.elevation_deg = rel["elevation_deg"]
+            # Persist the field position/elevation (throttled, IDLE, confident 3D
+            # fix) so the next boot can seed QNH from the known elevation.
+            if (state.phase == protocol.PHASE_IDLE and state.gps_fix
+                    and state.gps_sats >= LAST_FIX_MIN_SATS
+                    and (last_fix_save is None or time.ticks_diff(
+                        time.ticks_ms(), last_fix_save) >= LAST_FIX_SAVE_S * 1000)):
+                _save_last_fix(state.lat, state.lon, state.alt_m)
+                last_fix_save = time.ticks_ms()
+            # RTC from GPS, but DEFENSIVELY (gpstime.time_fix_decision): a glitched
+            # "fullyResolved" NAV-PVT can be minutes wrong (seen: ~37 min off, then
+            # latched for the session, overriding correct NTP). Only CONFIDENT times
+            # are considered (small tAcc - the M10 emits an aided time with a huge
+            # tAcc before a real fix); then cross-check vs an NTP-set clock, require a
+            # consistent 2nd frame with no clock, and re-sync on drift. PPS refines.
+            if update["datetime"] and update.get("t_acc_ns", 0) <= GPS_TIME_MAX_TACC_NS:
+                y, mo, d, h, mi, s = update["datetime"]
+                gps_epoch = time.mktime((y, mo, d, h, mi, s, 0, 0))
+                action, state.gps_time_cand = gpstime.time_fix_decision(
+                    state.time_source, gps_epoch, time.time(), update["t_acc_ns"],
+                    state.gps_time_cand, GPS_TIME_MAX_TACC_NS)
+                if action == "set":
+                    rtc.datetime((y, mo, d, 0, h, mi, s, 0))
+                    print("RTC %s from GPS: %04d-%02d-%02d %02d:%02d:%02dZ"
+                          % ("re-synced" if state.time_source == "gps" else "synced",
+                             y, mo, d, h, mi, s))
+                    state.time_synced = True
+                    state.time_source = "gps"
+                    _pps_arm_next(y, mo, d, h, mi, s)
+                elif action == "arm":
+                    _pps_arm_next(y, mo, d, h, mi, s)   # agrees -> PPS stays disciplined
+                elif (action == "reject" and state.time_source == "ntp"
+                        and time.ticks_diff(time.ticks_ms(),
+                                            state.gps_time_warn_ms) > 30000):
+                    state.gps_time_warn_ms = time.ticks_ms()   # rate-limited: rare
+                    print("GPS time rejected: %+ds vs NTP (confident but disagrees)"
+                          % (gps_epoch - time.time()))
+        except Exception as e:
+            print("gps task iteration error:", e)
+            await asyncio.sleep_ms(200)
 
 
 def _ntp_time_aid(state):
@@ -816,18 +863,19 @@ def _ntp_time_aid(state):
 def _cross_tx_frame(state, seq):
     # One cross-upload radio frame to send INSTEAD of telemetry this cycle (rare;
     # one TX/cycle keeps the half-duplex sequence clean, a dropped telemetry
-    # frame is harmless). Priority: ACK a received UPLOAD_CMD first, else (re)send
-    # our own UPLOAD_CMD ~1 s apart while tries remain. Returns a frame or None.
-    if state.cross_ack_nonce is not None:
-        nonce = state.cross_ack_nonce
+    # frame is harmless). The decision lives in shared/crossupload.py (pure,
+    # host-tested). Returns a frame or None.
+    now = time.ticks_ms()
+    kind, nonce, tries, done = crossupload.tx_plan(
+        state.cross_ack_nonce, state.cross_cmd_nonce, state.cross_cmd_tries,
+        time.ticks_diff(now, state.cross_cmd_ts))
+    if kind == "ack":
         state.cross_ack_nonce = None
         return protocol.encode_upload_ack(seq, nonce)
-    if (state.cross_cmd_nonce is not None and state.cross_cmd_tries > 0
-            and time.ticks_diff(time.ticks_ms(), state.cross_cmd_ts) >= 1000):
-        state.cross_cmd_ts = time.ticks_ms()
-        state.cross_cmd_tries -= 1
-        nonce = state.cross_cmd_nonce
-        if state.cross_cmd_tries <= 0:
+    if kind == "cmd":
+        state.cross_cmd_ts = now
+        state.cross_cmd_tries = tries
+        if done:
             state.cross_cmd_nonce = None       # gave up after this final send
         return protocol.encode_upload_cmd(seq, nonce)
     return None
@@ -925,36 +973,42 @@ async def telemetry_task(sx, state):
 
 async def display_task(display, state):
     while True:
-        display.fill(0)
-        display.text("F: {}".format(state.force_raw - state.force_offset), 0, 0)
-        display.text("Seilwinkel:", 0, 16)
-        display.text("{:.1f} deg".format(state.angle_deg), 0, 26)
-        display.text("{:.0f}hPa {:.0f}m".format(state.pressure_hpa,
-                                                state.baro_alt_m), 0, 42)
-        display.text("Sat:{} {}mV".format(state.gps_sats, state.system_mv),
-                     0, 54)
-        display.show()
+        try:                       # an I2C hiccup must not kill the task
+            display.fill(0)
+            display.text("F: {}".format(state.force_raw - state.force_offset), 0, 0)
+            display.text("Seilwinkel:", 0, 16)
+            display.text("{:.1f} deg".format(state.angle_deg), 0, 26)
+            display.text("{:.0f}hPa {:.0f}m".format(state.pressure_hpa,
+                                                    state.baro_alt_m), 0, 42)
+            display.text("Sat:{} {}mV".format(state.gps_sats, state.system_mv),
+                         0, 54)
+            display.show()
+        except Exception as e:
+            print("display task iteration error:", e)
         await asyncio.sleep_ms(DISPLAY_PERIOD_MS)
 
 
 async def supervisor_task(pmu, state):
     while True:
-        state.system_mv = pmu.getSystemVoltage()
-        state.batt_mv = pmu.getBattVoltage()
-        state.batt_pct = pmu.getBatteryPercent()
-        state.charging = pmu.isCharging()
-        # Recurring low-battery check - only meaningful while IDLE, and only
-        # when a cell is actually fitted (0 mV = USB-only, not "empty").
-        if state.phase == protocol.PHASE_IDLE and state.batt_mv > BATT_PRESENT_MV:
-            if state.batt_mv < BATT_LOW_MV:
-                state.batt_low = True
-            elif state.batt_mv > BATT_LOW_CLEAR_MV:
+        try:      # the AXP2101 reads are SoftI2C - guard like the sensor tasks
+            state.system_mv = pmu.getSystemVoltage()
+            state.batt_mv = pmu.getBattVoltage()
+            state.batt_pct = pmu.getBatteryPercent()
+            state.charging = pmu.isCharging()
+            # Recurring low-battery check - only meaningful while IDLE, and only
+            # when a cell is actually fitted (0 mV = USB-only, not "empty").
+            if state.phase == protocol.PHASE_IDLE and state.batt_mv > BATT_PRESENT_MV:
+                if state.batt_mv < BATT_LOW_MV:
+                    state.batt_low = True
+                elif state.batt_mv > BATT_LOW_CLEAR_MV:
+                    state.batt_low = False
+            else:
                 state.batt_low = False
-        else:
-            state.batt_low = False
-        # Latch the session start (first valid wall clock) for the log filename.
-        if state.time_synced and state.log_start is None:
-            state.log_start = _log_stamp()
+            # Latch the session start (first valid wall clock) for the log filename.
+            if state.time_synced and state.log_start is None:
+                state.log_start = _log_stamp()
+        except Exception as e:
+            print("supervisor task iteration error:", e)
         await asyncio.sleep_ms(SUPERVISOR_PERIOD_MS)
 
 
@@ -1158,22 +1212,6 @@ def _github_announce_ip(ip, ssid, tag="rope"):
     return ok
 
 
-_HTTP_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
-
-
-def _parse_http_date(s):
-    # "Mon, 22 Jun 2026 20:43:21 GMT" -> (y, mo, d, h, mi, s) UTC, or None.
-    try:
-        p = s.split()
-        d, y = int(p[1]), int(p[3])
-        mo = _HTTP_MONTHS.index(p[2]) + 1
-        hh, mm, ss = (int(x) for x in p[4].split(":"))
-        return (y, mo, d, hh, mm, ss)
-    except (ValueError, IndexError, AttributeError):
-        return None
-
-
 def _assistnow_capture_identity():
     # Read the receiver's UBX-SEC-UNIQID + UBX-MON-VER (full frames, as hex) for
     # the one-time ZTP registration. Only needed before we have a chipcode and
@@ -1291,7 +1329,7 @@ def _assistnow_download(state):
         if r.status_code == 200:
             blob = r.content
             hdrs = getattr(r, "headers", None)            # server "Date" = trusted now
-            srv = _parse_http_date(hdrs.get("Date")) if hdrs else None
+            srv = gpstime.parse_http_date(hdrs.get("Date")) if hdrs else None
             r.close()
             if blob:
                 with open(ASSISTNOW_PATH, "wb") as f:
@@ -1548,9 +1586,15 @@ def run():
                         msg["lat"], msg["lon"], msg["hacc_m"], msg["status"]))
                 elif msg and msg["type"] == protocol.UPLOAD_CMD:
                     # Winch asked us to upload too. ACK every copy (telemetry_task
-                    # sends it); trigger our upload only once per new nonce.
-                    if msg["nonce"] != state.cross_last_cmd:
+                    # sends it); trigger our upload once per nonce - the dedup
+                    # EXPIRES (crossupload.accept_cmd) so a rebooted winch's
+                    # reused nonce still triggers.
+                    now = time.ticks_ms()
+                    if crossupload.accept_cmd(
+                            msg["nonce"], state.cross_last_cmd,
+                            time.ticks_diff(now, state.cross_last_cmd_ts)):
                         state.cross_last_cmd = msg["nonce"]
+                        state.cross_last_cmd_ts = now
                         state.upload_request = True
                         print("Cross-upload requested by winch (nonce %d)"
                               % msg["nonce"])

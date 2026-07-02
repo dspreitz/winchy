@@ -18,7 +18,8 @@ include("$(PORT_DIR)/boards/manifest.py")
 freeze(R + "/firmware/rope/lib")
 
 # Shared modules
-freeze(R + "/firmware/shared", ("protocol.py", "wifi.py", "nmea.py", "gpstime.py"))
+freeze(R + "/firmware/shared", ("protocol.py", "wifi.py", "nmea.py", "gpstime.py",
+                                "adr.py", "crossupload.py"))
 
 # Rope application
 freeze(R + "/firmware/rope", "config.py")

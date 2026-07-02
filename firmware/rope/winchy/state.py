@@ -75,6 +75,9 @@ class State:
         self.cross_nonce_ctr = 0       # per-request id counter
         self.cross_ack_nonce = None    # an incoming UPLOAD_CMD nonce to ACK
         self.cross_last_cmd = None     # last CMD nonce acted on (dedup resends)
+        self.cross_last_cmd_ts = 0     # ticks_ms of that CMD; the dedup EXPIRES
+                                       # (crossupload.CMD_DEDUP_EXPIRY_MS) so a
+                                       # rebooted peer's reused nonce triggers
         # Power
         self.system_mv = 0
         self.batt_mv = 0

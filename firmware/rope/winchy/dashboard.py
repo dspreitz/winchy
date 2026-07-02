@@ -191,14 +191,21 @@ async def handle(reader, writer):
                          b"Connection: close\r\n\r\nupload queued")
             await writer.drain()
         elif path.startswith(b"/raw"):    # download the raw log
-            try:
-                body = open("raw.csv", "rb").read()
-            except OSError:
-                body = b""
+            # STREAM in chunks: raw.csv can be 4 MB, and reading it whole
+            # allocated one huge buffer that OOMed the ESP32 (MemoryError).
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/csv\r\n"
                          b"Connection: close\r\n\r\n")
-            writer.write(body)
             await writer.drain()
+            try:
+                with open("raw.csv", "rb") as f:
+                    while True:
+                        chunk = f.read(2048)
+                        if not chunk:
+                            break
+                        writer.write(chunk)
+                        await writer.drain()
+            except OSError:
+                pass
         else:
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n"
                          b"Connection: close\r\n\r\n")

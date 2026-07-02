@@ -28,6 +28,28 @@
 # caller converts the GPS time to epoch seconds and applies the action.
 
 
+_HTTP_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def parse_http_date(s):
+    """RFC 7231 date ("Mon, 22 Jun 2026 20:43:21 GMT") -> (y, mo, d, h, mi, s)
+    UTC, or None. Shared by both units (was duplicated in each app). The year
+    is RANGE-CHECKED (2024..2050): downstream this feeds time.mktime, which on
+    MicroPython overflows a 32-bit machine word past ~2068 - the same glitched-
+    date crash class already guarded in _pps_arm_next."""
+    try:
+        p = s.split()
+        d, y = int(p[1]), int(p[3])
+        mo = _HTTP_MONTHS.index(p[2]) + 1
+        hh, mm, ss = (int(x) for x in p[4].split(":"))
+        if not (2024 <= y <= 2050 and 1 <= mo <= 12 and 1 <= d <= 31):
+            return None
+        return (y, mo, d, hh, mm, ss)
+    except (ValueError, IndexError, AttributeError):
+        return None
+
+
 def time_fix_decision(source, gps_epoch, rtc_epoch, tacc_ns, cand_epoch,
                       max_tacc_ns=1000000000, ntp_skew_s=5,
                       drift_s=3, consist_s=2):

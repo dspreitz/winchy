@@ -353,6 +353,38 @@ def test_time_decision_self_heals_bad_latched_time():
     assert act == "set" and cand is None
 
 
+def test_time_decision_tacc_zero_skips_the_gate():
+    # tAcc=0 means "unknown" (the winch's NMEA RMC path carries no accuracy
+    # estimate) - the confidence gate must be SKIPPED, not treated as perfect
+    # or rejected: the NTP cross-check etc. still applies downstream.
+    act, _ = gpstime.time_fix_decision("ntp", 1003, 1000, 0, None)
+    assert act == "set"                              # within skew -> adopt
+    act, _ = gpstime.time_fix_decision("ntp", 1000 - 2220, 1000, 0, None)
+    assert act == "reject"                           # minutes off NTP -> bogus
+
+
+# --- HTTP Date parsing (shared/gpstime.py, used for time aiding) ------------
+
+def test_parse_http_date_valid():
+    assert (gpstime.parse_http_date("Mon, 22 Jun 2026 20:43:21 GMT")
+            == (2026, 6, 22, 20, 43, 21))
+
+
+def test_parse_http_date_rejects_garbage_and_none():
+    assert gpstime.parse_http_date(None) is None
+    assert gpstime.parse_http_date("") is None
+    assert gpstime.parse_http_date("not a date") is None
+    assert gpstime.parse_http_date("Mon, 22 Foo 2026 20:43:21 GMT") is None
+
+
+def test_parse_http_date_rejects_implausible_year():
+    # Downstream this feeds time.mktime, which on MicroPython overflows a
+    # 32-bit machine word past ~2068 (the crash class already seen from a
+    # glitched GPS date) - implausible years must never get that far.
+    assert gpstime.parse_http_date("Mon, 22 Jun 2070 20:43:21 GMT") is None
+    assert gpstime.parse_http_date("Mon, 22 Jun 1999 20:43:21 GMT") is None
+
+
 # --- baud liveness: require a CHECKSUM-VALID frame, not a 2-byte sync match ----
 # (gps.has_gps_frame) - the loose 2-byte check false-positived in the garbage
 # read at the wrong baud, leaving the app/module baud mismatched (no sats).

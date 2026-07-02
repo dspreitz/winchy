@@ -33,6 +33,7 @@ import ssd1306
 from sx1262 import SX1262
 from _sx126x import ERR_NONE
 
+import crossupload
 import protocol
 import nmea
 import wifi
@@ -102,6 +103,13 @@ last_rx_ms = 0      # ticks_ms of last telemetry RX; GPS owns the OLED when idle
 # avoid flash wear; clear winch_rxlog.csv before each run for a fresh log.
 LOG_TO_FLASH = True         # log every RX frame to flash; also served at /log
 LOG_PATH = "winch_rxlog.csv"
+LOG_MAX_BYTES = 4000000     # rolling cap, like the rope's raw.csv: ROTATE (reset
+                            # + keep logging) instead of growing until the flash
+                            # is full - unbounded growth ended in ENOSPC and a
+                            # crash-guard reboot LOOP when uploads couldn't run
+                            # (no WiFi in the field)
+LOG_BUF_MAX = 4000          # cap the RAM row buffer (~80 KB) so a stalled main
+                            # loop can never let the IRQ-fed buffer eat all RAM
 # Written at open and after an offload-reset; a file of exactly this size has
 # no data rows, so it isn't uploaded.
 LOG_HEADER = ("# boot\n# utc,seq,phase,force,angle_deg,alt_m,batt_v,batt_pct,"
@@ -162,7 +170,10 @@ GITHUB_REPO = "dspreitz/winchy-logs"
 GITHUB_RELEASE_TAG = "logs"
 GITHUB_ASSET = "winch_rxlog.csv"
 GITHUB_TIMEOUT_S = 30   # socket timeout on the (blocking) upload round-trips, so
-                        # a stalled connection can't freeze the asyncio loop
+                        # a stalled connection can't freeze the asyncio loop.
+                        # NOTE: does NOT cover DNS - getaddrinfo runs before the
+                        # socket exists. A dead DNS still stalls the loop, but
+                        # lwIP bounds it (~14 s with retries), so no forever-hang.
 UPLOAD_PERIOD_S = 600       # interim: re-upload every 10 min while on WiFi
                             # (later: trigger once per launch via phase detection)
 # Blocking GitHub round-trips (log upload, IP announce) stall the single-thread
@@ -222,6 +233,9 @@ cross_cmd_ts = 0          # ticks_ms of the last CMD send (~1 s gap)
 cross_nonce_ctr = 0       # per-request id counter
 cross_ack_nonce = None    # an incoming UPLOAD_CMD nonce to ACK
 cross_last_cmd = None     # last CMD nonce acted on (dedup resends)
+cross_last_cmd_ts = 0     # ticks_ms of that CMD; the dedup EXPIRES
+                          # (crossupload.CMD_DEDUP_EXPIRY_MS) so a rebooted
+                          # peer's reused nonce still triggers an upload
 
 
 def _begin_upload(what):
@@ -297,19 +311,23 @@ def send_link_report():
 
 def _cross_send():
     # Send ONE pending cross-upload frame (ACK first, else a retry CMD ~1 s
-    # apart). Called from on_receive only on TELEMETRY cycles that do NOT send a
-    # LINK_REPORT, so we never TX twice in one RX callback (half-duplex).
+    # apart; decision in shared/crossupload.py, pure + host-tested). Called
+    # from on_receive only on TELEMETRY cycles that do NOT send a LINK_REPORT,
+    # so we never TX twice in one RX callback (half-duplex).
     global tx_seq, cross_ack_nonce, cross_cmd_nonce, cross_cmd_tries, cross_cmd_ts
+    now = time.ticks_ms()
+    kind, nonce, tries, done = crossupload.tx_plan(
+        cross_ack_nonce, cross_cmd_nonce, cross_cmd_tries,
+        time.ticks_diff(now, cross_cmd_ts))
     frame = None
-    if cross_ack_nonce is not None:
-        frame = protocol.encode_upload_ack(tx_seq, cross_ack_nonce)
+    if kind == "ack":
+        frame = protocol.encode_upload_ack(tx_seq, nonce)
         cross_ack_nonce = None
-    elif (cross_cmd_nonce is not None and cross_cmd_tries > 0
-            and time.ticks_diff(time.ticks_ms(), cross_cmd_ts) >= 1000):
-        cross_cmd_ts = time.ticks_ms()
-        cross_cmd_tries -= 1
-        frame = protocol.encode_upload_cmd(tx_seq, cross_cmd_nonce)
-        if cross_cmd_tries <= 0:
+    elif kind == "cmd":
+        cross_cmd_ts = now
+        cross_cmd_tries = tries
+        frame = protocol.encode_upload_cmd(tx_seq, nonce)
+        if done:
             cross_cmd_nonce = None              # gave up after this final send
     if frame is not None:
         tx_seq = (tx_seq + 1) & 0xFFFF
@@ -380,8 +398,6 @@ AID_SAVE_S = 300              # re-cache the converged position at most this oft
 AID_POS_ACC_M = 100           # confidence the winch sits at the cached spot
 AID_TIME_ACC_MS = 5000        # coarse time (HTTP Date + latency + leap margin)
 _GPS_LEAP_S = 18              # GPS-UTC offset (18 s since 2017)
-_HTTP_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 _aid_utc = None               # (y,mo,d,h,mi,s) from the internet; set by _serve
 _aided_time = False           # time aiding already injected this boot
 _aid_save_ms = 0
@@ -463,16 +479,6 @@ def _load_aid():
         return None
 
 
-def _parse_http_date(s):
-    # "Mon, 22 Jun 2026 20:43:21 GMT" -> (y, mo, d, h, mi, s) UTC, or None.
-    try:
-        p = s.split()
-        return (int(p[3]), _HTTP_MONTHS.index(p[2]) + 1, int(p[1]),
-                int(p[4][0:2]), int(p[4][3:5]), int(p[4][6:8]))
-    except (ValueError, IndexError, AttributeError):
-        return None
-
-
 def _aid_fetch_time():
     # One-shot: UTC for GPS time aiding AND to set the winch RTC from whatever
     # clock is available first at start-up - if NTP is up before a GPS fix, use
@@ -496,7 +502,8 @@ def _aid_fetch_time():
                               headers={"User-Agent": "winchy"}, timeout=10)
             d = r.headers.get("Date") if getattr(r, "headers", None) else None
             r.close()
-            t = _parse_http_date(d)
+            t = gpstime.parse_http_date(d)   # shared; year range-checked (2024..2050)
+                                             # so a bogus Date can't reach mktime
             src = "HTTP"
         except Exception as e:
             print("HTTP date failed:", e)
@@ -626,7 +633,10 @@ def _pps_apply(_):
 def _on_pps(pin):
     global _pps_count
     _pps_count += 1
-    micropython.schedule(_pps_apply, 0)
+    try:
+        micropython.schedule(_pps_apply, 0)
+    except RuntimeError:
+        pass          # schedule queue full - skip this edge (PPS retries at 1 Hz)
 
 
 def _pps_arm_next(y, mo, d, h, mi, s):
@@ -821,9 +831,26 @@ def _reset_log(uploaded):
 
 
 def on_receive(events):
+    # Runs from the DIO1 IRQ (scheduled) and can land mid-SPI relative to a
+    # task-side lora.send (WINCH_POS / link report); a corrupted command
+    # raises ERR_CHIP_NOT_FOUND. Guard the WHOLE handler and re-arm RX - the
+    # same protection the rope's on_radio has had all along; without it an
+    # exception left the radio NOT re-armed (deaf until the next TX, <=15 s).
+    try:
+        _on_receive(events)
+    except Exception as e:
+        print("radio cb error:", e)
+        try:
+            lora.startReceive()
+        except Exception:
+            pass
+
+
+def _on_receive(events):
     global last_seq, received, lost, last_rssi, last_snr
     global recv_window, lost_window, latest, clock_set, last_rx_ms
-    global cross_ack_nonce, cross_last_cmd, cross_cmd_nonce, _upload_request
+    global cross_ack_nonce, cross_last_cmd, cross_last_cmd_ts
+    global cross_cmd_nonce, _upload_request
     if not (events & SX1262.RX_DONE):
         return
     frame, err = lora.recv()
@@ -849,7 +876,8 @@ def on_receive(events):
     if msg["type"] == protocol.TELEMETRY:
         last_rx_ms = time.ticks_ms()    # telemetry owns the OLED over the GPS
         tm = time.localtime()           # RTC is UTC (GPS+PPS); for the dash clock
-        if LOG_TO_FLASH:  # buffer only; the main loop does the flash write
+        if LOG_TO_FLASH and len(log_buf) < LOG_BUF_MAX:  # buffer only; the main
+            # loop does the flash write (never flash I/O in the RX callback)
             # ms-precision UTC stamp, PPS-disciplined; one ns read keeps the
             # seconds and the ms consistent (no second-boundary race).
             ns = time.time_ns()
@@ -889,9 +917,13 @@ def on_receive(events):
             _cross_send()           # opportunistic cross-upload TX (non-report)
     elif msg["type"] == protocol.UPLOAD_CMD:
         # Rope asked us to upload too. ACK every copy (sent by _cross_send);
-        # trigger our upload only once per new nonce.
-        if msg["nonce"] != cross_last_cmd:
+        # trigger our upload once per nonce - the dedup EXPIRES
+        # (crossupload.accept_cmd) so a rebooted rope's reused nonce triggers.
+        now = time.ticks_ms()
+        if crossupload.accept_cmd(msg["nonce"], cross_last_cmd,
+                                  time.ticks_diff(now, cross_last_cmd_ts)):
             cross_last_cmd = msg["nonce"]
+            cross_last_cmd_ts = now
             _upload_request = True
             print("Cross-upload requested by rope (nonce %d)" % msg["nonce"])
         cross_ack_nonce = msg["nonce"]
@@ -1053,14 +1085,21 @@ async def handle(reader, writer):
                          b"Connection: close\r\n\r\nupload queued")
             await writer.drain()
         elif path.startswith(b"/log"):   # serve the flash log for offload
-            try:
-                body = open(LOG_PATH, "rb").read()
-            except OSError:
-                body = b""
+            # STREAM in chunks: the log can reach LOG_MAX_BYTES (4 MB), and
+            # reading it whole allocated one huge buffer that OOMed the ESP32.
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/csv\r\n"
                          b"Connection: close\r\n\r\n")
-            writer.write(body)
             await writer.drain()
+            try:
+                with open(LOG_PATH, "rb") as f:
+                    while True:
+                        chunk = f.read(2048)
+                        if not chunk:
+                            break
+                        writer.write(chunk)
+                        await writer.drain()
+            except OSError:
+                pass
         else:
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n"
                          b"Connection: close\r\n\r\n")
@@ -1076,13 +1115,31 @@ async def handle(reader, writer):
 
 
 def _flush_log():
+    global logf
     if logf is None or not log_buf:
         return
     n = len(log_buf)                      # write snapshot, drop exactly those;
-    for i in range(n):                    # anything the IRQ adds meanwhile waits
-        logf.write(log_buf[i])
+    try:                                  # anything the IRQ adds meanwhile waits
+        for i in range(n):
+            logf.write(log_buf[i])
+        logf.flush()
+    except OSError as e:
+        # Flash full/faulty: drop the rows (below) rather than crash or let the
+        # buffer grow - a write error must never take the receiver down.
+        print("rxlog write failed (dropping %d rows):" % n, e)
     del log_buf[0:n]
-    logf.flush()
+    # Rolling cap (mirrors the rope's raw.csv rotation): reset + keep logging,
+    # so the log can never fill the flash into an ENOSPC crash-reboot loop.
+    try:
+        if os.stat(LOG_PATH)[6] >= LOG_MAX_BYTES:
+            logf.close()
+            os.remove(LOG_PATH)
+            logf = open(LOG_PATH, "a")
+            logf.write(LOG_HEADER)
+            logf.flush()
+            print("winch_rxlog hit cap; rotated (keeping recent data)")
+    except OSError as e:
+        print("rxlog rotate failed:", e)
 
 
 async def _internet_ok():
@@ -1122,75 +1179,82 @@ async def _serve():
     global log_start, online, _upload_request, _upload_status
     n = 0
     while True:                           # keep-alive + WiFi upkeep + flush
-        _flush_log()
-        if clock_set and log_start is None:   # latch session start once synced
-            log_start = _stamp()
-        # (Re)join WiFi while it is down: at boot (n==0) and every WIFI_RETRY_S.
-        if (wlan is not None and not wlan.isconnected()
-                and n % WIFI_RETRY_S == 0):
-            joined = await wifi.connect_any(wlan, WIFI_NETWORKS, 15)
-            if joined:
-                print("WiFi '%s' joined - http://%s/  or  http://%s.local/"
-                      % (joined, wlan.ifconfig()[0], WIFI_HOSTNAME))
-                if not server_started:    # bind once; survives later rejoins
-                    await asyncio.start_server(handle, "0.0.0.0", 80)
-                    server_started = True
-                _begin_upload("time sync")
-                _aid_fetch_time()         # one-shot UTC for GPS time aiding
-                _end_upload()
-            else:
-                print("WiFi: no known network in range; will retry")
-        # Hold off blocking GitHub round-trips while a launch is active, so the
-        # live OLED/dashboard never freezes mid-launch (roadmap #12).
-        busy = (time.ticks_diff(time.ticks_ms(), last_rx_ms) < 3000
-                and latest.get("speed", 0) >= UPLOAD_PAUSE_SPEED_MS)
-        # Announce our IP as a tappable dashboard link in the release body, so
-        # the winch is findable on any subnet. On IP change only (no API spam).
-        if (GITHUB_TOKEN and not busy
-                and wlan is not None and wlan.isconnected()):
-            cur = wlan.ifconfig()[0]
-            if cur and cur != "0.0.0.0" and cur != announced_ip:
-                try:
-                    ssid = wlan.config("essid")
-                except Exception:
-                    ssid = "?"
-                _begin_upload("IP announce")
-                if _github_announce_ip(cur, ssid):
-                    announced_ip = cur
-                _end_upload()
-        # winchy-logs reachability for the OLED "I": only when WiFi is up and a
-        # token exists, probed against GitHub every WIFI_PROBE_S (so a hotspot
-        # with no real internet shows no "I").
-        if wlan is not None and wlan.isconnected() and GITHUB_TOKEN:
-            if n % WIFI_PROBE_S == 0:
-                online = await _internet_ok()
-        else:
-            online = False
-        # GitHub offload: periodic auto + manual dashboard "Upload log" trigger.
-        # Only while connected, with data, and not mid-launch (held off if busy;
-        # a manual request stays pending until the launch ends).
-        if (GITHUB_TOKEN and not busy and wlan is not None and wlan.isconnected()
-                and (_upload_request or (n and n % UPLOAD_PERIOD_S == 0))):
-            try:                          # only if there are rows to offload
-                has_data = os.stat(LOG_PATH)[6] > len(LOG_HEADER)
-            except OSError:
-                has_data = False
-            if has_data:
-                _upload_status = "uploading"
-                _begin_upload("log upload")
-                await asyncio.sleep_ms(600)   # let the dashboard push "uploading"
-                up, verified = _github_upload()   # interim periodic; later per launch
-                if up and verified:
-                    _reset_log(up)            # reclaim flash after a VERIFIED upload
-                    _upload_status = "ok"
-                elif up:
-                    _upload_status = "unverified"  # uploaded but server size mismatch
+        # Defense in depth (like the GPS task): one bad iteration (a flash
+        # write, a wlan call, an aiding inject) must never kill this task -
+        # it owns the dashboard, the uploads AND the log flush, and its death
+        # meant a crash-guard reboot. Drop the iteration, keep serving.
+        try:
+            _flush_log()
+            if clock_set and log_start is None:   # latch session start once synced
+                log_start = _stamp()
+            # (Re)join WiFi while it is down: at boot (n==0) and every WIFI_RETRY_S.
+            if (wlan is not None and not wlan.isconnected()
+                    and n % WIFI_RETRY_S == 0):
+                joined = await wifi.connect_any(wlan, WIFI_NETWORKS, 15)
+                if joined:
+                    print("WiFi '%s' joined - http://%s/  or  http://%s.local/"
+                          % (joined, wlan.ifconfig()[0], WIFI_HOSTNAME))
+                    if not server_started:    # bind once; survives later rejoins
+                        await asyncio.start_server(handle, "0.0.0.0", 80)
+                        server_started = True
+                    _begin_upload("time sync")
+                    _aid_fetch_time()         # one-shot UTC for GPS time aiding
+                    _end_upload()
                 else:
-                    _upload_status = "fail"
-                _end_upload()
+                    print("WiFi: no known network in range; will retry")
+            # Hold off blocking GitHub round-trips while a launch is active, so the
+            # live OLED/dashboard never freezes mid-launch (roadmap #12).
+            busy = (time.ticks_diff(time.ticks_ms(), last_rx_ms) < 3000
+                    and latest.get("speed", 0) >= UPLOAD_PAUSE_SPEED_MS)
+            # Announce our IP as a tappable dashboard link in the release body, so
+            # the winch is findable on any subnet. On IP change only (no API spam).
+            if (GITHUB_TOKEN and not busy
+                    and wlan is not None and wlan.isconnected()):
+                cur = wlan.ifconfig()[0]
+                if cur and cur != "0.0.0.0" and cur != announced_ip:
+                    try:
+                        ssid = wlan.config("essid")
+                    except Exception:
+                        ssid = "?"
+                    _begin_upload("IP announce")
+                    if _github_announce_ip(cur, ssid):
+                        announced_ip = cur
+                    _end_upload()
+            # winchy-logs reachability for the OLED "I": only when WiFi is up and a
+            # token exists, probed against GitHub every WIFI_PROBE_S (so a hotspot
+            # with no real internet shows no "I").
+            if wlan is not None and wlan.isconnected() and GITHUB_TOKEN:
+                if n % WIFI_PROBE_S == 0:
+                    online = await _internet_ok()
             else:
-                _upload_status = "nodata"     # nothing new to offload (feedback)
-            _upload_request = False       # clear the manual request once handled
+                online = False
+            # GitHub offload: periodic auto + manual dashboard "Upload log" trigger.
+            # Only while connected, with data, and not mid-launch (held off if busy;
+            # a manual request stays pending until the launch ends).
+            if (GITHUB_TOKEN and not busy and wlan is not None and wlan.isconnected()
+                    and (_upload_request or (n and n % UPLOAD_PERIOD_S == 0))):
+                try:                          # only if there are rows to offload
+                    has_data = os.stat(LOG_PATH)[6] > len(LOG_HEADER)
+                except OSError:
+                    has_data = False
+                if has_data:
+                    _upload_status = "uploading"
+                    _begin_upload("log upload")
+                    await asyncio.sleep_ms(600)   # let the dashboard push "uploading"
+                    up, verified = _github_upload()   # interim periodic; later per launch
+                    if up and verified:
+                        _reset_log(up)            # reclaim flash after a VERIFIED upload
+                        _upload_status = "ok"
+                    elif up:
+                        _upload_status = "unverified"  # uploaded but size mismatch
+                    else:
+                        _upload_status = "fail"
+                    _end_upload()
+                else:
+                    _upload_status = "nodata"     # nothing new to offload (feedback)
+                _upload_request = False       # clear the manual request once handled
+        except Exception as e:
+            print("serve loop iteration error:", e)
         n += 1
         await asyncio.sleep_ms(1000)
 
