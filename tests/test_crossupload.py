@@ -64,6 +64,15 @@ def test_first_cmd_send_is_immediate():
     assert kind == "cmd"
 
 
+def test_cmd_due_when_elapsed_wrapped_negative():
+    # MicroPython ticks_diff wraps at 2^30 ms (~12.4 days) into [-2^29, 2^29):
+    # after ~6.2 days of uptime the handlers' "0 = send now" sentinel yields a
+    # NEGATIVE elapsed. Negative can only mean "ancient" -> the send is DUE;
+    # without this the upload click silently sent no radio CMD for days.
+    kind, nonce, tries, done = tx_plan(None, 1, 5, -(2 ** 28))
+    assert kind == "cmd" and nonce == 1 and tries == 4 and done is False
+
+
 # --- accept_cmd: dedup of the sender's retry burst, with expiry --------------
 
 def test_first_cmd_ever_triggers():
@@ -86,3 +95,9 @@ def test_reused_nonce_triggers_after_expiry():
     # nonce arrived minutes later - must trigger again, not be swallowed.
     assert accept_cmd(1, 1, 31000) is True
     assert accept_cmd(1, 1, 30000) is False      # still within the window
+
+
+def test_reused_nonce_triggers_when_elapsed_wrapped_negative():
+    # >6.2 days since the last CMD wraps ticks_diff negative - that is ancient,
+    # so the dedup latch must count as expired, not as "just seen".
+    assert accept_cmd(1, 1, -(2 ** 28)) is True

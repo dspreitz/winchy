@@ -40,8 +40,13 @@ def tx_plan(ack_nonce, cmd_nonce, cmd_tries, ms_since_last_cmd,
     """
     if ack_nonce is not None:
         return "ack", ack_nonce, cmd_tries, False
+    # NEGATIVE elapsed = the last send is over half a ticks period ago
+    # (MicroPython ticks_diff wraps at 2^30 ms ~ 12.4 days, results in
+    # [-2^29, 2^29)) - i.e. ancient, so the send is DUE. Without this, the
+    # "0 = send now" sentinel the /upload handlers use went negative after
+    # ~6.2 days of uptime and the CMD was silently never sent.
     if (cmd_nonce is not None and cmd_tries > 0
-            and ms_since_last_cmd >= retry_ms):
+            and (ms_since_last_cmd >= retry_ms or ms_since_last_cmd < 0)):
         tries = cmd_tries - 1
         return "cmd", cmd_nonce, tries, tries <= 0
     return None, None, cmd_tries, False
@@ -52,6 +57,7 @@ def accept_cmd(nonce, last_nonce, ms_since_last,
     """Should an incoming UPLOAD_CMD trigger an upload? Dedups the sender's
     retry burst (same nonce within expiry_ms), but a stale latch expires so a
     rebooted peer's reused nonce still triggers. The ACK is sent regardless -
-    this only gates starting the upload."""
+    this only gates starting the upload. NEGATIVE elapsed = ticks wrapped
+    (>6.2 days since the last CMD) - ancient, so the latch is expired."""
     return (last_nonce is None or nonce != last_nonce
-            or ms_since_last > expiry_ms)
+            or ms_since_last > expiry_ms or ms_since_last < 0)
