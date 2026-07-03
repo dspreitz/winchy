@@ -118,13 +118,31 @@ log_buf = []        # pending CSV rows: utc,seq,phase,force,angle_deg,alt_m,
                     # batt_v,batt_pct,flags,rssi,snr  (utc = ISO8601 Z)
 
 
+# machine.reset_cause() -> label. THE discriminator for unexplained reboots
+# (crash.log only catches Python exceptions): PWRON also covers BROWNOUT
+# (power dip), WDT covers C-level panics and hardware watchdogs, HARD is the
+# EN/RST pin, SOFT is machine.reset() (crash guard / deploy).
+import machine as _machine
+_RESET_CAUSES = {_machine.PWRON_RESET: "PWRON/BROWNOUT",
+                 _machine.HARD_RESET: "HARD(EN/RST pin)",
+                 _machine.WDT_RESET: "WDT/PANIC",
+                 _machine.DEEPSLEEP_RESET: "DEEPSLEEP",
+                 _machine.SOFT_RESET: "SOFT(machine.reset)"}
+
+
+def reset_cause_str():
+    c = _machine.reset_cause()
+    return "%s(%d)" % (_RESET_CAUSES.get(c, "?"), c)
+
+
 def _fw_line(role, app_path):
     # One-time firmware fingerprint written to the log at boot, so a later
     # debugger can tell which build produced a log: MicroPython version + build
     # date, whether this build has deflate compression (only the custom Winchy
-    # builds do), and whether the app is frozen into the image (app source is
-    # absent from the filesystem). Written only at boot, not on log rotations,
-    # so the "header-only = no data" upload check stays valid.
+    # builds do), whether the app is frozen into the image (app source is
+    # absent from the filesystem), and WHY the chip (re)booted (rst=). Written
+    # only at boot, not on log rotations, so the "header-only = no data"
+    # upload check stays valid.
     import sys
     try:
         import deflate
@@ -138,8 +156,8 @@ def _fw_line(role, app_path):
         frozen = "n"
     except OSError:
         frozen = "y"
-    return "# fw: %s | %s | deflate=%s frozen=%s\n" % (
-        role, sys.version, comp, frozen)
+    return "# fw: %s | %s | deflate=%s frozen=%s rst=%s\n" % (
+        role, sys.version, comp, frozen, reset_cause_str())
 
 # Optional WiFi dashboard: the winch joins an existing WiFi network and serves
 # a live telemetry page (HTTP poll, ~2 Hz) to any phone/laptop on that network
@@ -1264,7 +1282,7 @@ lora.setBlockingCallback(False, on_receive)
 display.fill(0)
 display.text("Waiting for data", 0, 0)
 display.show()
-print("Winch receiver ready")
+print("Winch receiver ready | Reset cause:", reset_cause_str())
 
 logf = None
 if LOG_TO_FLASH:

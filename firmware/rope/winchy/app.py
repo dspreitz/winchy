@@ -19,6 +19,7 @@
 
 import asyncio
 import gc
+import machine
 import math
 import micropython
 import os
@@ -427,13 +428,32 @@ async def imu_task(imu, state, filt, gyro_bias):
         await asyncio.sleep_ms(IMU_PERIOD_MS)
 
 
+# machine.reset_cause() -> label. THE discriminator for unexplained reboots
+# (crash.log only catches Python exceptions): PWRON also covers BROWNOUT
+# (power dip / battery contact bounce), WDT covers C-level panics ("Guru
+# Meditation") and hardware watchdogs, HARD is the EN/RST pin (button or a
+# glitched line), SOFT is machine.reset() (crash guard / deploy).
+_RESET_CAUSES = {machine.PWRON_RESET: "PWRON/BROWNOUT",
+                 machine.HARD_RESET: "HARD(EN/RST pin)",
+                 machine.WDT_RESET: "WDT/PANIC",
+                 machine.DEEPSLEEP_RESET: "DEEPSLEEP",
+                 machine.SOFT_RESET: "SOFT(machine.reset)"}
+
+
+def reset_cause_str():
+    c = machine.reset_cause()
+    return "%s(%d)" % (_RESET_CAUSES.get(c, "?"), c)
+
+
 def _fw_line(role, app_path):
     # One-time firmware fingerprint written to the log at boot, so a later
     # debugger can tell which build produced a log: MicroPython version + build
     # date, whether this build has deflate compression (only the custom Winchy
-    # builds do), and whether the app is frozen into the image (app source is
-    # absent from the filesystem). Written only at boot, not on the cap/offload
-    # rotation, so the "header-only = no episodes" checks stay valid.
+    # builds do), whether the app is frozen into the image (app source is
+    # absent from the filesystem), and WHY the chip (re)booted (rst= - tells a
+    # power dip from a panic from a pin glitch on the next field-test log).
+    # Written only at boot, not on the cap/offload rotation, so the
+    # "header-only = no episodes" checks stay valid.
     import sys
     try:
         import deflate
@@ -447,8 +467,8 @@ def _fw_line(role, app_path):
         frozen = "n"
     except OSError:
         frozen = "y"
-    return "# fw: %s | %s | deflate=%s frozen=%s\n" % (
-        role, sys.version, comp, frozen)
+    return "# fw: %s | %s | deflate=%s frozen=%s rst=%s\n" % (
+        role, sys.version, comp, frozen, reset_cause_str())
 
 
 def _reset_raw_file(rawf):
@@ -1413,9 +1433,16 @@ async def dashboard_task(state):
                 if not server_started:
                     await asyncio.start_server(dashboard.handle, "0.0.0.0", 80)
                     server_started = True
+        # HOLD OFF all blocking GitHub/NTP round-trips while the unit is MOVING
+        # (a motion episode is recording). With a phone-hotspot riding along
+        # (field tests) WiFi stays up during motion, and phase is still always
+        # IDLE - so a periodic upload / IP announce used to fire MID-RIDE and
+        # freeze the dashboard + stall the 50 Hz sampling for seconds. A manual
+        # "Upload log" click still runs immediately (explicit user intent).
+        still = not state.raw_recording
         # Announce our IP as a tappable dashboard link in the winchy-logs
         # release body, so it's findable on any subnet. On IP change only.
-        if (GITHUB_TOKEN and wlan.isconnected()
+        if (GITHUB_TOKEN and wlan.isconnected() and still
                 and state.phase == protocol.PHASE_IDLE):
             cur = wlan.ifconfig()[0]
             if cur and cur != "0.0.0.0" and cur != announced_ip:
@@ -1429,13 +1456,13 @@ async def dashboard_task(state):
         # nor NTP has set the clock yet, sync from NTP (so logs are timestamped
         # even without a GPS fix) and inject coarse time into the GPS to speed up
         # its fix. GPS overrides later (gps_task). IDLE only; retried until set.
-        if (wlan.isconnected() and state.time_source is None
+        if (wlan.isconnected() and state.time_source is None and still
                 and state.phase == protocol.PHASE_IDLE and n % 10 == 0):
             _ntp_time_aid(state)
         # Opportunistic AssistNow Predictive Orbits: while IDLE + online, fetch
         # predicted orbits and feed them to the GPS (cached for the next cold
         # start). First call also does the one-time ZTP registration.
-        if (UBLOX_ZTP_TOKEN and not _assistnow_done
+        if (UBLOX_ZTP_TOKEN and not _assistnow_done and still
                 and wlan.isconnected() and state.phase == protocol.PHASE_IDLE):
             if _assistnow_should_download(state):
                 _assistnow_download(state)
@@ -1444,10 +1471,12 @@ async def dashboard_task(state):
                 _assistnow_done = True        # cache confirmed fresh
             # else: have a cache but no time yet -> re-check on a later loop
         # GitHub upload of raw.csv (WiFi up, IDLE): the periodic auto-offload
-        # plus a manual trigger from the dashboard "Upload log" button.
+        # plus a manual trigger from the dashboard "Upload log" button. The
+        # PERIODIC trigger waits for stillness; a manual click runs regardless.
         if (GITHUB_TOKEN and wlan.isconnected()
                 and state.phase == protocol.PHASE_IDLE
-                and (state.upload_request or (n and n % WIFI_PERIOD_S == 0))):
+                and (state.upload_request
+                     or (still and n and n % WIFI_PERIOD_S == 0))):
             await _run_upload(state)
             state.upload_request = False   # clear the manual request once handled
         n += 1
@@ -1482,6 +1511,7 @@ async def _main(pmu, adc, imu, baro, sx, display, state, gyro_bias, mag):
 
 
 def run():
+    print("Reset cause:", reset_cause_str())   # first thing: why did we boot?
     pmu = board.init_power()
     state = State()
 
