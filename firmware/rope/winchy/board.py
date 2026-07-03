@@ -81,12 +81,16 @@ def init_power():
 
     pmu.setPowerKeyPressOffTime(pmu.XPOWERS_POWEROFF_6S)
     pmu.setPowerKeyPressOnTime(pmu.XPOWERS_POWERON_2S)
-    # Power-off is done in software (app.py button_task) so it can wait for the
-    # key RELEASE before shutting down - otherwise the still-held key re-triggers
-    # the 2 s press-to-power-on and the unit restarts. The AXP2101 hardware
-    # long-press auto-off has the same quirk (it powers off while the key is
-    # held), so it is DISABLED here; button_task is the sole power-off path.
-    pmu.disableLongPressShutdown()
+    # Power-off is HARDWARE again (field test 2026-07-03): the software path
+    # (button_task polling PKEY IRQs, then shutdown() on release) proved
+    # unreliable on battery-only power, leaving no way to switch the unit off.
+    # The AXP2101 long-press auto-off is authoritative and works even if the
+    # app is crashed/hung: hold the key 6 s -> PMIC powers off (LED goes dark).
+    # Known quirk: the PMIC powers off WHILE the key is held, so keep holding
+    # past ~2 s after the LED goes dark and the press-to-power-on (2 s) can
+    # restart it - RELEASE the key promptly once the LED turns off.
+    pmu.setLongPressPowerOFF()          # long press = power off (not restart)
+    pmu.enableLongPressShutdown()
 
     # No battery temperature sensor fitted; leaving TS measurement on
     # disturbs charging.
@@ -111,9 +115,8 @@ def init_power():
         pmu.XPOWERS_AXP2101_BAT_INSERT_IRQ | pmu.XPOWERS_AXP2101_BAT_REMOVE_IRQ |
         pmu.XPOWERS_AXP2101_VBUS_INSERT_IRQ | pmu.XPOWERS_AXP2101_VBUS_REMOVE_IRQ |
         pmu.XPOWERS_AXP2101_PKEY_SHORT_IRQ | pmu.XPOWERS_AXP2101_PKEY_LONG_IRQ |
-        pmu.XPOWERS_AXP2101_PKEY_POSITIVE_IRQ |  # key release: button_task defers
-        pmu.XPOWERS_AXP2101_BAT_CHG_DONE_IRQ | pmu.XPOWERS_AXP2101_BAT_CHG_START_IRQ  # power-off until release
-    )
+        pmu.XPOWERS_AXP2101_BAT_CHG_DONE_IRQ | pmu.XPOWERS_AXP2101_BAT_CHG_START_IRQ
+    )   # PKEY IRQs are informational now - power-off is the PMIC's own long-press
 
     pmu.setPrechargeCurr(pmu.XPOWERS_AXP2101_PRECHARGE_50MA)
     # 1 A ~= 0.29C for the Samsung INR18650-35E (3500 mAh); needs a >=1.3 A

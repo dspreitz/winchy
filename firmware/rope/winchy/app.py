@@ -89,7 +89,6 @@ REPORT_WINDOW_MS = 150      # extra RX dwell after a request so the winch's
                             # at SF7, incl. the winch OLED update)
 DISPLAY_PERIOD_MS = 500
 SUPERVISOR_PERIOD_MS = 5000
-BUTTON_POLL_MS = 300        # power-key long-press poll (off via long press)
 
 # Low-battery warning (rope cell terminal voltage from the AXP2101, mV).
 # Checked only while IDLE; hysteresis avoids flicker near the threshold.
@@ -1012,33 +1011,11 @@ async def supervisor_task(pmu, state):
         await asyncio.sleep_ms(SUPERVISOR_PERIOD_MS)
 
 
-async def button_task(pmu):
-    # Long-press the AXP2101 power key -> turn the rope off. Handled in software
-    # (polling the latched PKEY IRQs) so the charging LED is switched off *before*
-    # shutdown - LED on = rope on, off = rope off.
-    #
-    # Power off only AFTER the key is RELEASED. The AXP2101 powers ON whenever the
-    # key is held low for setPowerKeyPressOnTime (2 s, board.py), so calling
-    # shutdown() while the key is still held lets that press immediately re-power
-    # the system and it restarts. So on the long-press we switch the LED off
-    # (impending shutdown) and then wait for the positive (release) edge before
-    # shutting down - by then the key is high and the unit stays off.
-    while True:
-        await asyncio.sleep_ms(BUTTON_POLL_MS)
-        try:
-            pmu.getIrqStatus()              # refresh the latched IRQ flags
-            if pmu.isPekeyLongPressIrq():
-                pmu.setChargingLedMode(pmu.XPOWERS_CHG_LED_OFF)  # LED off = powering down
-                pmu.clearIrqStatus()
-                while True:                 # defer shutdown until the key is up
-                    await asyncio.sleep_ms(BUTTON_POLL_MS)
-                    pmu.getIrqStatus()
-                    if pmu.isPekeyPositiveIrq():   # key released
-                        pmu.clearIrqStatus()
-                        pmu.shutdown()      # key is high now -> stays off
-                        break
-        except Exception:
-            pass
+# NOTE: power-off is pure HARDWARE now (board.py enableLongPressShutdown):
+# hold the key 6 s -> the AXP2101 powers off, even if the app is crashed or
+# hung. The old software path (button_task: PKEY IRQ poll -> LED cue -> wait
+# for release -> shutdown()) proved unreliable on battery-only power in the
+# 2026-07-03 field test and was removed.
 
 
 def _log_stamp():
@@ -1493,7 +1470,6 @@ async def _main(pmu, adc, imu, baro, sx, display, state, gyro_bias, mag):
         gps_task(state),
         telemetry_task(sx, state),
         supervisor_task(pmu, state),
-        button_task(pmu),
     ]
     if display:
         tasks.append(display_task(display, state))
