@@ -119,11 +119,26 @@ RAW_LOG_MAX_BYTES = 4000000
 # not the 50 Hz imu_task: imu_task only appends formatted lines to state.raw_q,
 # and the writer drains them a few at a time, yielding between chunks so a burst
 # (e.g. the pre-roll dump) never stalls sampling. (Single-core cooperative, so
-# each small chunk still blocks briefly - just ~10 ms, not one ~330 ms batch.)
-RAW_WRITE_CHUNK = 8         # rows written per writer pass before it yields
+# each small chunk still blocks briefly, not one ~330 ms batch.)
+#
+# DURING a motion episode the writer STREAMS in extra-small chunks instead of
+# deferring everything to RAM: field tests 2026-07-03/04 lost entire rides
+# because the RAM-held episode died with the power (contact bounce / power-off
+# before the 5 s rest drain), and RAW_Q_MAX silently truncated episodes >80 s.
+# A 2-row pass blocks ~6 ms - under the 20 ms sample period - and the Kalman
+# filters use the real per-sample dt, so sampling quality is preserved. Set
+# RAW_STREAM_WHILE_RECORDING = False for the legacy full deferral (zero writes
+# while recording; episode is lost on power failure).
+RAW_STREAM_WHILE_RECORDING = True
+RAW_WRITE_CHUNK = 8         # rows written per writer pass before it yields (idle)
+RAW_WRITE_CHUNK_REC = 2     # rows per pass while an episode records (~6 ms block)
+RAW_FLUSH_EVERY_REC = 50    # tighter flush cadence while recording: power loss
+                            # costs <= ~1-2 s of rows instead of the episode
 RAW_WRITE_IDLE_MS = 50      # writer poll interval while idle / deferring
-RAW_GC_EVERY = 20           # gc.collect() every N flushes in the writer
-RAW_Q_MAX = 4000            # safety cap on the pending-write queue (~80 s @50 Hz)
+RAW_GC_EVERY = 20           # gc.collect() every N flushes (skipped mid-episode:
+                            # a GC pause of 10-50 ms is the biggest single stall)
+RAW_Q_MAX = 4000            # safety cap on the pending-write queue; with
+                            # streaming it is a net, not a limit (was ~80 s cap)
 # Written at file open and after an offload-reset; a file of exactly this size
 # holds no episodes, so the uploader skips it.
 # t_ms is the monotonic boot clock (for filter dt); utc_ms is unix-epoch
@@ -531,11 +546,14 @@ async def raw_writer_task(state):
                     print("raw.csv offloaded; reset")
                 state.raw_uploaded_bytes = 0
 
-            # In motion-gated mode, defer all flash writes while an episode is
-            # recording so the launch is sampled at full rate with no write stalls.
-            # The buffered lines (RAM is plentiful - PSRAM) drain below once idle.
-            # In continuous mode there is no idle, so drain as we go instead.
-            if RAW_LOG_MOTION_GATED and state.raw_recording:
+            # While a motion episode records, STREAM in extra-small chunks so
+            # the rows reach flash continuously (a mid-episode power loss used
+            # to erase the whole RAM-held episode - field tests 2026-07-03/04).
+            # The legacy full deferral (zero writes while recording) is kept
+            # behind RAW_STREAM_WHILE_RECORDING = False for launch captures
+            # that must have absolute write silence.
+            recording = RAW_LOG_MOTION_GATED and state.raw_recording
+            if recording and not RAW_STREAM_WHILE_RECORDING:
                 await asyncio.sleep_ms(RAW_WRITE_IDLE_MS)
                 continue
 
@@ -546,8 +564,9 @@ async def raw_writer_task(state):
                     unflushed = 0
                 await asyncio.sleep_ms(RAW_WRITE_IDLE_MS)
                 continue
-            chunk = q[:RAW_WRITE_CHUNK]    # atomic slice+del (no await between)
-            del q[:RAW_WRITE_CHUNK]
+            chunk_n = RAW_WRITE_CHUNK_REC if recording else RAW_WRITE_CHUNK
+            chunk = q[:chunk_n]            # atomic slice+del (no await between)
+            del q[:chunk_n]
             for r in chunk:
                 if raw_bytes >= RAW_LOG_MAX_BYTES:
                     # Rolling cap: rotate (drop the oldest) instead of halting, so a
@@ -560,11 +579,14 @@ async def raw_writer_task(state):
                 rawf.write(r)
                 raw_bytes += len(r)
                 unflushed += 1
-            if unflushed >= RAW_LOG_FLUSH_EVERY:
+            if unflushed >= (RAW_FLUSH_EVERY_REC if recording
+                             else RAW_LOG_FLUSH_EVERY):
                 rawf.flush()
                 unflushed = 0
                 flushes += 1
-                if flushes % RAW_GC_EVERY == 0:
+                # GC only while idle: its 10-50 ms pause is the biggest single
+                # stall and must not land inside a recorded episode.
+                if flushes % RAW_GC_EVERY == 0 and not recording:
                     gc.collect()
         except Exception as e:
             print("raw writer iteration error:", e)
