@@ -1467,19 +1467,40 @@ async def dashboard_task(state):
         pass
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
+    wifi.tune(wlan)          # pm=PM_NONE (server role) + driver auto-reconnect
     server_started = False
     announced_ip = None
     n = 0
+    join_fails = 0           # consecutive failed joins -> interface reset at 3
+    retry_at = None          # ticks_ms of the next join attempt; None = due now
     while True:
-        if not wlan.isconnected() and n % 30 == 0:   # (re)join when down
+        # (Re)join when down: FIRST attempt immediately, then backoff
+        # 5 s -> 10 s -> 30 s (the old fixed ~30 s gate made hotspot handovers
+        # take a minute). After 3 consecutive failures the interface is
+        # power-cycled to clear a stuck supplicant.
+        if not wlan.isconnected() and (
+                retry_at is None
+                or time.ticks_diff(time.ticks_ms(), retry_at) >= 0):
+            if join_fails >= 3:
+                print("WiFi: interface reset after repeated join failures")
+                await wifi.reset_iface(wlan)
+                join_fails = 0
             joined = await wifi.connect_any(wlan, WIFI_NETWORKS,
                                             WIFI_JOIN_TIMEOUT_S)
             if joined:
                 print("Rope dashboard WiFi '%s' joined - http://%s/"
                       % (joined, wlan.ifconfig()[0]))
+                join_fails = 0
+                retry_at = None
                 if not server_started:
                     await asyncio.start_server(dashboard.handle, "0.0.0.0", 80)
                     server_started = True
+            else:
+                join_fails += 1
+                delay_ms = (5000, 10000, 30000)[min(join_fails - 1, 2)]
+                retry_at = time.ticks_add(time.ticks_ms(), delay_ms)
+                print("WiFi: join failed (%d), retry in %d s"
+                      % (join_fails, delay_ms // 1000))
         # HOLD OFF all blocking GitHub/NTP round-trips while the unit is MOVING
         # (a motion episode is recording). With a phone-hotspot riding along
         # (field tests) WiFi stays up during motion, and phase is still always

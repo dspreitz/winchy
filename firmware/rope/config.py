@@ -48,7 +48,10 @@ GPS_NAV_RATE_HZ = 10
 # watchdog territory (proven live: closing the host's COM handle restored
 # 0.1 Hz -> 2 Hz telemetry instantly). Lesson: never leave long-held serial
 # readers attached to the rope; use WiFi/log-based observation instead.
-IMU_FAST = True
+# HOWEVER soak C (serial-free, C sampler ON) still hit ONE rst=WDT/PANIC at
+# ~32 min -> a real panic remains. Soak D bisect: False here (C sampler OFF,
+# serial-free). D crashes too -> @native suspected; D clean -> C module v2.
+IMU_FAST = False
 
 # QMI8658 IMU on SPI2
 QMI_SCK = 36

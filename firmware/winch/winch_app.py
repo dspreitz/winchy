@@ -1192,6 +1192,7 @@ async def _serve():
             pass
         wlan = network.WLAN(network.STA_IF)
         wlan.active(True)
+        wifi.tune(wlan)      # pm=PM_NONE (server role) + driver auto-reconnect
     else:
         print("WiFi: disabled or no secrets.py; dashboard off")
     global log_start, online, _upload_request, _upload_status

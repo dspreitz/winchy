@@ -20,6 +20,36 @@
 import asyncio
 
 
+def tune(wlan):
+    """Apply the server-role WiFi tuning (call after every active(True)):
+    - pm=PM_NONE: modem power-save OFF. The units SERVE HTTP/WebSocket;
+      with power-save the modem sleeps between DTIM beacons and inbound
+      packets stall or drop - the main cause of 'the dashboard is flaky'.
+    - reconnects=5: the driver heals short drops itself in ~1-2 s instead
+      of waiting for the application-level rejoin loop.
+    Both settings are best-effort (ports/builds without them just skip)."""
+    try:
+        wlan.config(pm=wlan.PM_NONE)
+    except Exception:
+        pass
+    try:
+        wlan.config(reconnects=5)
+    except Exception:
+        pass
+
+
+async def reset_iface(wlan):
+    """Power-cycle the STA interface: clears a stuck supplicant ('Wifi
+    Internal Error', endless empty scans). Re-applies tune()."""
+    try:
+        wlan.active(False)
+    except Exception:
+        pass
+    await asyncio.sleep_ms(1000)
+    wlan.active(True)
+    tune(wlan)
+
+
 async def connect_any(wlan, networks, timeout_s=15):
     """Connect to the best in-range network from `networks` (list of
     (ssid, password)). Returns the joined SSID, or None if none joined."""
@@ -40,16 +70,21 @@ async def connect_any(wlan, networks, timeout_s=15):
         pass
     await asyncio.sleep_ms(700)
 
-    # Scan once; map ssid -> best RSSI seen.
+    # Scan; an EMPTY result is a known driver glitch right after a drop, so
+    # retry once after a short settle before concluding "nothing in range".
     seen = {}
-    try:
-        for ap in wlan.scan():
-            ssid = ap[0].decode() if isinstance(ap[0], bytes) else ap[0]
-            rssi = ap[3]
-            if ssid not in seen or rssi > seen[ssid]:
-                seen[ssid] = rssi
-    except Exception as e:
-        print("WiFi scan failed:", e)
+    for attempt in range(2):
+        try:
+            for ap in wlan.scan():
+                ssid = ap[0].decode() if isinstance(ap[0], bytes) else ap[0]
+                rssi = ap[3]
+                if ssid not in seen or rssi > seen[ssid]:
+                    seen[ssid] = rssi
+        except Exception as e:
+            print("WiFi scan failed:", e)
+        if seen:
+            break
+        await asyncio.sleep_ms(500)
 
     # Configured networks that are visible, strongest first; then any unseen
     # (in case the scan missed a hidden/edge AP) as a last-ditch try.
