@@ -94,6 +94,8 @@ LOSS_EMA_ALPHA = 0.3
 blink = 0           # render counter; alternates the bottom line when warning
 WARN_BLINK_FRAMES = 4   # frames per state (~2 s at 2 Hz) when battery is low
 last_rx_ms = 0      # ticks_ms of last telemetry RX; GPS owns the OLED when idle
+ROPE_DATA_TIMEOUT_MS = 3000  # no rope telemetry for this long (6 frames at
+                             # 2 Hz) -> the dashboard ROPE light turns RED
 
 # Flash logging of received frames, for range tests when the winch is
 # untethered (so we see the downlink directly instead of inferring it from
@@ -966,7 +968,7 @@ body{font-family:sans-serif;background:#111;color:#eee;margin:0;text-align:cente
 </style></head><body>
 <div id=warn>! ROPE BATTERY LOW</div>
 <div id=phase>--</div>
-<div class=row><div class=cell><span id=gpsdot class=dot></span><span class=lbl>GPS</span></div>
+<div class=row><div class=cell><span id=ropedot class=dot></span><span class=lbl>ROPE</span></div>
 <div class=cell><span id=tdot class=dot></span><span class=lbl>TIME</span></div></div>
 <div id=clock class=lbl>--:--:--</div>
 <div class=cell><div class=lbl>SPEED km/h</div><div id=speed class=big>--</div></div>
@@ -995,7 +997,7 @@ function render(d){
  link.textContent='link '+d.rssi+' dBm   rx'+d.rx+' lost'+d.lost;
  winch.textContent='winch '+(d.wfix?'fix':'no fix')+' '+(d.wsats||0)+'sat'+(d.wacc!=null?'  '+d.wacc+'m':'')+(d.wconv?'  SURVEYED':'');
  warn.style.display=d.battlow?'block':'none';
- gpsdot.style.background=d.gps?'#1c1':'#c33';
+ ropedot.style.background=d.rope?'#1c1':'#c33';
  tdot.style.background=d.tsync?'#1c1':'#c33';
  clock.textContent=d.time+' UTC';
  if(d.upstatus){ulmsg.textContent=UPLBL[d.upstatus]||d.upstatus;}
@@ -1009,7 +1011,7 @@ function connect(){
 connect();
 setInterval(function(){   // staleness indicator if pushes stop
  if(Date.now()-last>3000){document.body.className='stale';
-  gpsdot.style.background='#555';tdot.style.background='#555';}
+  ropedot.style.background='#555';tdot.style.background='#555';}
 },1000);
 </script></body></html>"""
 
@@ -1039,6 +1041,15 @@ def _ws_text_frame(payload):
     return hdr + payload
 
 
+def _rope_alive():
+    # Rope-telemetry freshness for the dashboard ROPE light. Negative elapsed
+    # = ticks wrapped (>6 days since the last frame) = ancient, NOT alive.
+    if last_rx_ms == 0:
+        return False                 # never received anything this boot
+    dt = time.ticks_diff(time.ticks_ms(), last_rx_ms)
+    return 0 <= dt < ROPE_DATA_TIMEOUT_MS
+
+
 async def _ws_push(writer, key):
     # Finish the handshake, then push latest telemetry until the client leaves
     # (a write to a closed socket raises -> we stop quietly).
@@ -1054,6 +1065,7 @@ async def _ws_push(writer, key):
             d["time"] = ("%02d:%02d:%02d" % (_tm[3], _tm[4], _tm[5])
                          if clock_set else "--:--:--")
             d["tsync"] = clock_set
+            d["rope"] = _rope_alive()     # dashboard ROPE traffic light
             writer.write(_ws_text_frame(json.dumps(d).encode()))
             await writer.drain()
             await asyncio.sleep_ms(WS_PUSH_MS)
@@ -1086,6 +1098,7 @@ async def handle(reader, writer):
             d["time"] = ("%02d:%02d:%02d" % (_tm[3], _tm[4], _tm[5])
                          if clock_set else "--:--:--")
             d["tsync"] = clock_set
+            d["rope"] = _rope_alive()     # dashboard ROPE traffic light
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
                          b"Connection: close\r\n\r\n")
             writer.write(json.dumps(d).encode())
