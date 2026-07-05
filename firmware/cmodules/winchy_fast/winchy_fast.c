@@ -42,7 +42,12 @@
 #define QMI_WHO_AM_I_REG 0x00
 #define QMI_WHO_AM_I_VAL 0x05
 #define QMI_REG_AX_L 0x35
-#define RING_N 128            // 2.56 s of backlog at 50 Hz
+#define RING_N 256            // 5.12 s of backlog at 50 Hz - long enough to
+                              // bridge a blocking WiFi scan/join (~5 s), the
+                              // longest VM stall left (v2 dance showed a
+                              // 2.46 s timestamp gap = the old 128 ring
+                              // overrunning exactly there). 256 * 20 B = 5 KB
+                              // static RAM.
 #define SPI_WAIT_TICKS pdMS_TO_TICKS(15)
 
 typedef struct {
