@@ -18,12 +18,14 @@ import math
 # @micropython.native compiles the hot methods (called at the 50 Hz IMU rate)
 # to machine code (~2x). On CPython (host tests) the decorator is a no-op, so
 # behaviour and tests are identical on both.
-try:
-    import micropython
-    _native = micropython.native
-except (ImportError, AttributeError):      # CPython host
-    def _native(f):
-        return f
+# @micropython.native DISABLED (soak bisect 2026-07-05): with the
+# decorators active the rope hit rst=WDT/PANIC every ~30-40 min in
+# serial-free idle soaks, with the C sampler ON (soak C) and OFF
+# (soak D) alike - the native emitter is the common suspect. The
+# decorator is kept as a no-op so re-enabling is a one-line change
+# once verified against a newer MicroPython.
+def _native(f):
+    return f
 
 _DEG2RAD = math.pi / 180.0
 
