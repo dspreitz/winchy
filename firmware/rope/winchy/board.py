@@ -33,10 +33,19 @@ def gps_reopen(baud):
     """Reconfigure the GPS UART to a new baud (after the module switched)."""
     gps_uart.init(baudrate=baud, bits=8, parity=None, stop=1,
                   tx=Pin(config.GPS_TX), rx=Pin(config.GPS_RX), timeout=300)
-qmi_spi = SPI(2, baudrate=1000000, polarity=1, phase=1,
-              sck=Pin(config.QMI_SCK), mosi=Pin(config.QMI_MOSI),
-              miso=Pin(config.QMI_MISO))
-qmi_cs = Pin(config.QMI_CS, Pin.OUT, value=1)
+# IMU SPI: the winchy_fast C module (if built in) owns the bus exclusively
+# (IDF spi_master on SPI3_HOST, the same controller machine.SPI(2) maps to) -
+# creating machine.SPI(2) alongside it would double-drive the controller. Only
+# create the Python bus on builds WITHOUT the C module (legacy fallback).
+try:
+    import winchy_fast                    # noqa: F401  (probe only)
+    qmi_spi = None
+    qmi_cs = None
+except ImportError:
+    qmi_spi = SPI(2, baudrate=1000000, polarity=1, phase=1,
+                  sck=Pin(config.QMI_SCK), mosi=Pin(config.QMI_MOSI),
+                  miso=Pin(config.QMI_MISO))
+    qmi_cs = Pin(config.QMI_CS, Pin.OUT, value=1)
 
 # AXP2101 rail plan: (rail, millivolts, enable).
 # DC1 powers the ESP32-S3 itself - set but never toggled here.

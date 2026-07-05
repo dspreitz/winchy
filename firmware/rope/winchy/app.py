@@ -348,15 +348,24 @@ async def imu_task(imu, state, filt, gyro_bias):
     recording = False
     last_motion_ts = 0
     prev_angle = None      # for the rope-angle rate (glider speed)
+    budget = getattr(imu, "DRAIN", 1)   # samples processed per wake (C ring: 6)
     while True:
         # Defense in depth: an SPI hiccup in one read must not kill the task
         # (under asyncio.gather that reboots the whole app - see force_task).
+        t0 = time.ticks_ms()
         try:
-            # One 12-byte SPI burst instead of 12 single-register reads - the
-            # per-transaction Python overhead was what capped the loop at ~21 Hz.
-            accel, gyro = imu.read_accel_gyro()
-            now = time.ticks_ms()
+          # Drain up to `budget` finished samples. With the winchy_fast C
+          # sampler the timestamps come from the sampler itself, so the SAMPLE
+          # SPACING stays hardware-exact even when this task wakes up late
+          # behind other tasks' blocks; the backlog is caught up here.
+          for _ in range(budget):
+            smp = imu.next_sample()
+            if smp is None:
+                break                      # ring drained
+            now, accel, gyro = smp
             dt = time.ticks_diff(now, last) / 1000.0
+            if dt <= 0:                    # first sample / ticks quirk
+                dt = IMU_PERIOD_MS / 1000.0
             last = now
 
             norm = math.sqrt(accel[0] ** 2 + accel[1] ** 2 + accel[2] ** 2)
@@ -446,11 +455,11 @@ async def imu_task(imu, state, filt, gyro_bias):
             print("imu task iteration error:", e)
             await asyncio.sleep_ms(IMU_PERIOD_MS)
             continue
-        # Deadline cadence: sleep only the REMAINDER of the period. The fixed
-        # 20 ms sleep stacked on ~10 ms of work (Kalman + row formatting) gave a
-        # ~30 ms cadence (~33 Hz); sleeping the remainder yields the true 50 Hz.
-        # sleep_ms(0) still yields, so other tasks never starve under overload.
-        spent = time.ticks_diff(time.ticks_ms(), now)
+        # Deadline cadence: sleep only the REMAINDER of the period (a fixed
+        # sleep stacked on the work time stretched the cadence to ~30 ms).
+        # With the C sampler this only paces the DRAIN - the sampling itself
+        # is exact regardless. sleep_ms(0) still yields (no starvation).
+        spent = time.ticks_diff(time.ticks_ms(), t0)
         await asyncio.sleep_ms(IMU_PERIOD_MS - spent if spent < IMU_PERIOD_MS else 0)
 
 
@@ -1560,7 +1569,16 @@ def run():
     gps = GPS(board.gps_uart)
     gps.dump(10)
 
-    imu = QMI8658(board.qmi_spi, board.qmi_cs)
+    # IMU: prefer the winchy_fast C sampler (esp_timer task, hardware-exact
+    # 50 Hz into a ring buffer - immune to asyncio wake-up latency); fall back
+    # to the legacy Python driver on builds without the C module.
+    try:
+        from winchy.sensors.imu_fast import FastIMU
+        imu = FastIMU(config.QMI_SCK, config.QMI_MOSI, config.QMI_MISO,
+                      config.QMI_CS, 1000 // IMU_PERIOD_MS)
+    except ImportError:
+        imu = QMI8658(board.qmi_spi, board.qmi_cs)
+        print("IMU: legacy python driver")
     print("Accelerations:", imu.read_accel_avg(IMU_WINDOW))
     # Initial gyro bias from 50 samples; the unit is at rest at power-on.
     sums = [0.0, 0.0, 0.0]

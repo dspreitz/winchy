@@ -93,8 +93,9 @@ EOF
     sed -i 's/"Espressif Systems"/"Winchy"/g' mpconfigport.h
 fi
 
-echo ">> building firmware (frozen manifest: $(basename "$MANIFEST"))"
-make BOARD="$BOARD" FROZEN_MANIFEST="$MANIFEST"
+echo ">> building firmware (frozen manifest: $(basename "$MANIFEST"), user C modules)"
+make BOARD="$BOARD" FROZEN_MANIFEST="$MANIFEST" \
+     USER_C_MODULES="$REPO/firmware/cmodules/micropython.cmake"
 echo "$ROLE" > "$LAST_ROLE_FILE"   # record role for the next incremental decision
 
 DEST="$OUT/winchy-$ROLE-$MPY_REF.bin"

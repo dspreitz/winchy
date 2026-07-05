@@ -36,6 +36,8 @@ _GYRO_LSB_PER_DPS = 128    # CTRL3 range bits: +/-256 dps
 
 
 class QMI8658:
+    DRAIN = 1   # legacy path: one fresh sample per imu_task wake (no ring)
+
     def __init__(self, spi, cs):
         self._spi = spi
         self._cs = cs
@@ -124,6 +126,12 @@ class QMI8658:
                  az / _ACCEL_LSB_PER_G),
                 (gx / _GYRO_LSB_PER_DPS, gy / _GYRO_LSB_PER_DPS,
                  gz / _GYRO_LSB_PER_DPS))
+
+    def next_sample(self):
+        """(ticks_ms, accel, gyro) - one fresh burst sample. Same interface as
+        imu_fast.FastIMU.next_sample(); the caller owns the pacing (DRAIN=1)."""
+        a, g = self.read_accel_gyro()
+        return (time.ticks_ms(), a, g)
 
     def read_accel(self):
         """(x, y, z) specific force in g."""
