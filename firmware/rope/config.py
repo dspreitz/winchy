@@ -35,6 +35,17 @@ GPS_PPS = 6   # u-blox 1PPS (TIMEPULSE) -> ESP32 GPIO6, disciplines the RTC
 # 10 Hz needs the raised baud (at 9600 only ~5 Hz fits).
 GPS_NAV_RATE_HZ = 10
 
+# IMU sampling path. True = winchy_fast C sampler (esp_timer task, hardware-
+# exact 50 Hz; the C module stays in the image either way). False = legacy
+# Python driver via machine.SPI(2).
+# DISABLED 2026-07-05 for the stability bisect: since the C sampler went live,
+# the rope hard-froze (VM dead: no radio/console/WiFi, no watchdog) under the
+# WiFi-rejoin + motion + streaming combination (hotspot-dance repro), plus 5x
+# rst=WDT/PANIC in the field logs. Suspects: this C module OR the
+# @micropython.native decorators from the same day. Re-enable only after the
+# repro passes clean.
+IMU_FAST = False
+
 # QMI8658 IMU on SPI2
 QMI_SCK = 36
 QMI_MOSI = 35

@@ -1569,16 +1569,16 @@ def run():
     gps = GPS(board.gps_uart)
     gps.dump(10)
 
-    # IMU: prefer the winchy_fast C sampler (esp_timer task, hardware-exact
-    # 50 Hz into a ring buffer - immune to asyncio wake-up latency); fall back
-    # to the legacy Python driver on builds without the C module.
-    try:
+    # IMU path is chosen by config.IMU_FAST (see there - stability bisect):
+    # True = winchy_fast C sampler (esp_timer task, hardware-exact 50 Hz),
+    # False = legacy Python driver on machine.SPI(2).
+    if config.IMU_FAST:
         from winchy.sensors.imu_fast import FastIMU
         imu = FastIMU(config.QMI_SCK, config.QMI_MOSI, config.QMI_MISO,
                       config.QMI_CS, 1000 // IMU_PERIOD_MS)
-    except ImportError:
+    else:
         imu = QMI8658(board.qmi_spi, board.qmi_cs)
-        print("IMU: legacy python driver")
+        print("IMU: legacy python driver (IMU_FAST disabled)")
     print("Accelerations:", imu.read_accel_avg(IMU_WINDOW))
     # Initial gyro bias from 50 samples; the unit is at rest at power-on.
     sums = [0.0, 0.0, 0.0]
