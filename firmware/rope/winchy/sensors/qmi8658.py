@@ -55,11 +55,19 @@ class QMI8658:
         # = 2.62% of 31.25 Hz) so rotation-rate / oscillation dynamics aren't
         # smoothed away. ~9 Hz stays under Nyquist at the current ~21 Hz read
         # loop; raising the read rate (then a wider LPF) is a future action.
-        self._write(_REG_CTRL1, 0b00100000)
+        # CTRL1 bit6 = ADDR_AI (register address auto-increment): enables the
+        # 12-byte BURST read in read_accel_gyro() - one SPI transaction per
+        # sample instead of 12, which was the read-loop bottleneck (~21 Hz).
+        # Bit5 kept as before (chip byte-order setting; the byte assembly in
+        # the reads matches it unchanged).
+        self._write(_REG_CTRL1, 0b01100000)
         self._write(_REG_CTRL2, 0x05)   # accel: +/-2g, 250 Hz ODR, self-test off
         self._write(_REG_CTRL3, 0x45)   # gyro:  +/-256 dps, 250 Hz ODR, self-test off
         self._write(_REG_CTRL7, 0b10000011)  # accel + gyro enabled
         self._write(_REG_CTRL5, 0x33)   # LPF on, mode 01 = 3.59% of ODR (~9 Hz)
+        # Preallocated burst-read buffers (no per-sample allocation at 50 Hz).
+        self._burst = bytearray(12)              # AX_L..GZ_H (0x35..0x40)
+        self._cmd_ax = bytes([_REG_AX_L | 0x80])  # read command, start at AX_L
 
     def _read(self, reg, length=1):
         self._cs.value(0)
@@ -79,6 +87,43 @@ class QMI8658:
         if value & 0x8000:
             value -= 65536
         return value
+
+    def read_accel_gyro(self):
+        """Accel (g) + gyro (dps) in ONE 12-byte burst read (auto-increment
+        from AX_L): ((ax, ay, az), (gx, gy, gz)).
+
+        The old per-register path costs 12 SPI transactions each with ~0.5-1 ms
+        of Python overhead - that capped the 50 Hz IMU loop at ~21 Hz. One
+        transaction + local byte assembly removes the bottleneck. Byte order
+        matches _read_int16 exactly (value = byte[addr+1] << 8 | byte[addr]),
+        so the readings are bit-identical to the old path."""
+        b = self._burst
+        self._cs.value(0)
+        self._spi.write(self._cmd_ax)
+        self._spi.readinto(b)
+        self._cs.value(1)
+        ax = (b[1] << 8) | b[0]
+        ay = (b[3] << 8) | b[2]
+        az = (b[5] << 8) | b[4]
+        gx = (b[7] << 8) | b[6]
+        gy = (b[9] << 8) | b[8]
+        gz = (b[11] << 8) | b[10]
+        if ax & 0x8000:
+            ax -= 65536
+        if ay & 0x8000:
+            ay -= 65536
+        if az & 0x8000:
+            az -= 65536
+        if gx & 0x8000:
+            gx -= 65536
+        if gy & 0x8000:
+            gy -= 65536
+        if gz & 0x8000:
+            gz -= 65536
+        return ((ax / _ACCEL_LSB_PER_G, ay / _ACCEL_LSB_PER_G,
+                 az / _ACCEL_LSB_PER_G),
+                (gx / _GYRO_LSB_PER_DPS, gy / _GYRO_LSB_PER_DPS,
+                 gz / _GYRO_LSB_PER_DPS))
 
     def read_accel(self):
         """(x, y, z) specific force in g."""

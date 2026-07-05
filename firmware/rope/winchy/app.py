@@ -349,8 +349,9 @@ async def imu_task(imu, state, filt, gyro_bias):
         # Defense in depth: an SPI hiccup in one read must not kill the task
         # (under asyncio.gather that reboots the whole app - see force_task).
         try:
-            accel = imu.read_accel()
-            gyro = imu.read_gyro()
+            # One 12-byte SPI burst instead of 12 single-register reads - the
+            # per-transaction Python overhead was what capped the loop at ~21 Hz.
+            accel, gyro = imu.read_accel_gyro()
             now = time.ticks_ms()
             dt = time.ticks_diff(now, last) / 1000.0
             last = now
