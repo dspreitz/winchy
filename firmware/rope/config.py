@@ -38,11 +38,16 @@ GPS_NAV_RATE_HZ = 10
 # IMU sampling path. True = winchy_fast C sampler (esp_timer task, hardware-
 # exact 50 Hz; the C module stays in the image either way). False = legacy
 # Python driver via machine.SPI(2).
-# v1 (esp_timer service task + unbounded polling SPI) froze the VM under the
-# WiFi-rejoin + motion + streaming combination (hotspot-dance repro, bisected
-# 2026-07-05) and caused 5x rst=WDT/PANIC in the field. v2 samples from a
-# DEDICATED priority-10 task with BOUNDED interrupt SPI transactions and
-# self-quarantine (imu_stats) - re-enabled for the v2 verification dance.
+# v1 (esp_timer service task + unbounded polling SPI) froze the VM under
+# WiFi-rejoin + motion + streaming (hotspot-dance repro, bisected 2026-07-05)
+# and caused rst=WDT/PANIC in the field - fixed by v2 (dedicated priority-10
+# task, bounded interrupt SPI, imu_stats), which passed two hotspot dances at
+# exact 50 Hz. The remaining "post-v2 panics" turned out to be a BENCH
+# ARTIFACT, not firmware: a wedged USB-CDC connection with an attached-but-
+# stalled host reader makes every print() block, crawling the whole VM into
+# watchdog territory (proven live: closing the host's COM handle restored
+# 0.1 Hz -> 2 Hz telemetry instantly). Lesson: never leave long-held serial
+# readers attached to the rope; use WiFi/log-based observation instead.
 IMU_FAST = True
 
 # QMI8658 IMU on SPI2
