@@ -84,6 +84,9 @@ TELEMETRY_PERIOD_MS = 500   # 2 Hz. SF7/BW250 airtime ~30 ms -> ~6% duty, well
                             # (roadmap) would burst higher during a launch.
 REPORT_REQUEST_EVERY = 2    # ask the winch for a LINK_REPORT every Nth frame
                             # (~1 Hz at 2 Hz telemetry); 0 disables feedback
+TELEMETRY_PRINT_EVERY = 10  # verbose status prints every Nth frame (~5 s):
+                            # USB-CDC console writes BLOCK the loop, and six
+                            # lines per 500 ms measurably stole IMU cadence
 REPORT_WINDOW_MS = 150      # extra RX dwell after a request so the winch's
                             # half-duplex reply lands before the next TX; must
                             # exceed reply airtime + winch processing (~60 ms
@@ -441,7 +444,14 @@ async def imu_task(imu, state, filt, gyro_bias):
                         state.raw_recording = False
         except Exception as e:
             print("imu task iteration error:", e)
-        await asyncio.sleep_ms(IMU_PERIOD_MS)
+            await asyncio.sleep_ms(IMU_PERIOD_MS)
+            continue
+        # Deadline cadence: sleep only the REMAINDER of the period. The fixed
+        # 20 ms sleep stacked on ~10 ms of work (Kalman + row formatting) gave a
+        # ~30 ms cadence (~33 Hz); sleeping the remainder yields the true 50 Hz.
+        # sleep_ms(0) still yields, so other tasks never starve under overload.
+        spent = time.ticks_diff(time.ticks_ms(), now)
+        await asyncio.sleep_ms(IMU_PERIOD_MS - spent if spent < IMU_PERIOD_MS else 0)
 
 
 # machine.reset_cause() -> label. THE discriminator for unexplained reboots
@@ -954,16 +964,20 @@ async def telemetry_task(sx, state):
             seq, protocol.PHASE_IDLE, force, state.angle_deg,
             state.baro_alt_m, state.batt_mv, flags,  # real cell, not sys rail
             state.batt_pct, state.glider_speed_ms)
-        print("ADC value:", force)
-        print("Seilwinkel:", state.angle_deg)
-        ax, ay, az = state.accel
-        gx, gy, gz = state.gyro_dps
-        print("Motion: |a|=%.3f g a=(%.2f,%.2f,%.2f) gyro=(%.1f,%.1f,%.1f) dps"
-              % (math.sqrt(ax * ax + ay * ay + az * az), ax, ay, az,
-                 gx, gy, gz))
-        if state.qnh_hpa:
-            print("Baro alt: %.1f m (GPS %.1f m, %+.1f m/s)"
-                  % (state.baro_alt_m, state.alt_m, state.climb_rate_ms))
+        # Verbose status only every Nth frame: console writes block the loop
+        # and were part of what kept the IMU cadence above its 20 ms target.
+        verbose = frame_count % TELEMETRY_PRINT_EVERY == 0
+        if verbose:
+            print("ADC value:", force)
+            print("Seilwinkel:", state.angle_deg)
+            ax, ay, az = state.accel
+            gx, gy, gz = state.gyro_dps
+            print("Motion: |a|=%.3f g a=(%.2f,%.2f,%.2f) gyro=(%.1f,%.1f,%.1f) dps"
+                  % (math.sqrt(ax * ax + ay * ay + az * az), ax, ay, az,
+                     gx, gy, gz))
+            if state.qnh_hpa:
+                print("Baro alt: %.1f m (GPS %.1f m, %+.1f m/s)"
+                      % (state.baro_alt_m, state.alt_m, state.climb_rate_ms))
         if ADR_ENABLED:
             new_power = _adr_next_power(state)
             if new_power != state.tx_power_dbm:
@@ -1008,7 +1022,8 @@ async def telemetry_task(sx, state):
                 gps_buf = []
         seq = (seq + 1) & 0xFFFF
         state.tx_count += 1
-        print("Sent packet (binary):", frame)
+        if verbose:
+            print("Sent packet (binary):", frame)
         await asyncio.sleep_ms(TELEMETRY_PERIOD_MS
                                + (REPORT_WINDOW_MS if report_requested else 0))
 

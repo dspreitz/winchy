@@ -15,6 +15,16 @@
 
 import math
 
+# @micropython.native compiles the hot methods (called at the 50 Hz IMU rate)
+# to machine code (~2x). On CPython (host tests) the decorator is a no-op, so
+# behaviour and tests are identical on both.
+try:
+    import micropython
+    _native = micropython.native
+except (ImportError, AttributeError):      # CPython host
+    def _native(f):
+        return f
+
 _DEG2RAD = math.pi / 180.0
 
 
@@ -40,6 +50,7 @@ class GravityKalman:
         self._r_static = r_static
         self._r_dynamic = r_dynamic
 
+    @_native
     def predict(self, gyro_dps, dt):
         if self.g is None:
             return
@@ -69,6 +80,7 @@ class GravityKalman:
                 self.g = (gx2 / norm, gy2 / norm, gz2 / norm)
         self.p += self._q * dt
 
+    @_native
     def update(self, accel_g):
         ax, ay, az = accel_g
         norm = math.sqrt(ax * ax + ay * ay + az * az)
@@ -114,6 +126,7 @@ class VerticalKalman:
         self._p01 = 0.0
         self._p11 = 10.0
 
+    @_native
     def predict(self, dt):
         if self.alt is None:
             return
@@ -128,6 +141,7 @@ class VerticalKalman:
         self._p01 = p01 + q * dt ** 3 / 2
         self._p11 = p11 + q * dt ** 2
 
+    @_native
     def update(self, alt_m):
         if self.alt is None:
             self.alt = alt_m

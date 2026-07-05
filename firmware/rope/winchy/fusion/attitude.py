@@ -15,7 +15,16 @@
 
 import math
 
+# @micropython.native: called at the 50 Hz IMU rate; no-op shim on CPython.
+try:
+    import micropython
+    _native = micropython.native
+except (ImportError, AttributeError):      # CPython host
+    def _native(f):
+        return f
 
+
+@_native
 def rope_inclination(ax, ay, az):
     """Angle between the rope (device Y axis) and gravity, in degrees.
 
@@ -31,6 +40,7 @@ def rope_inclination(ax, ay, az):
     return math.degrees(angle_rad)
 
 
+@_native
 def rope_angle_above_ground(ax, ay, az):
     """Rope elevation angle relative to the ground ("Seilwinkel")."""
     return 90 - rope_inclination(ax, ay, az)
