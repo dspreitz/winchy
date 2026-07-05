@@ -153,7 +153,9 @@ static mp_obj_t winchy_imu_init(size_t n_args, const mp_obj_t *args) {
     qmi_write(0x03, 0x05);    // CTRL2: accel +/-2g, 250 Hz ODR
     qmi_write(0x04, 0x45);    // CTRL3: gyro +/-256 dps, 250 Hz ODR
     qmi_write(0x08, 0x83);    // CTRL7: accel + gyro enabled
-    qmi_write(0x06, 0x33);    // CTRL5: LPF on, ~9 Hz
+    qmi_write(0x06, 0x55);    // CTRL5: LPF on, mode 10 = 5.32% of ODR (~13 Hz -
+                              // safe under the 25 Hz Nyquist of exact 50 Hz
+                              // sampling; passes rotation/oscillation dynamics)
     mp_hal_delay_ms(10);      // first conversions settle
 
     taskENTER_CRITICAL(&s_mux);

@@ -53,10 +53,10 @@ class QMI8658:
         if who != _WHO_AM_I_VALUE:
             raise RuntimeError("QMI8658 not found (WHO_AM_I=0x%02x)" % who)
         # CTRL2/3 set ODR 250 Hz (was 31.25) and clear the stray self-test bits;
-        # CTRL5 widens the low-pass to ~9 Hz (mode 01 = 3.59% of ODR, was 0.82 Hz
-        # = 2.62% of 31.25 Hz) so rotation-rate / oscillation dynamics aren't
-        # smoothed away. ~9 Hz stays under Nyquist at the current ~21 Hz read
-        # loop; raising the read rate (then a wider LPF) is a future action.
+        # CTRL5 sets the low-pass to ~13 Hz (mode 10 = 5.32% of ODR) so
+        # rotation-rate / oscillation dynamics pass through - safe under the
+        # 25 Hz Nyquist now that the winchy_fast C sampler delivers exact 50 Hz
+        # (this legacy driver mirrors the C module's register setup).
         # CTRL1 bit6 = ADDR_AI (register address auto-increment): enables the
         # 12-byte BURST read in read_accel_gyro() - one SPI transaction per
         # sample instead of 12, which was the read-loop bottleneck (~21 Hz).
@@ -66,7 +66,7 @@ class QMI8658:
         self._write(_REG_CTRL2, 0x05)   # accel: +/-2g, 250 Hz ODR, self-test off
         self._write(_REG_CTRL3, 0x45)   # gyro:  +/-256 dps, 250 Hz ODR, self-test off
         self._write(_REG_CTRL7, 0b10000011)  # accel + gyro enabled
-        self._write(_REG_CTRL5, 0x33)   # LPF on, mode 01 = 3.59% of ODR (~9 Hz)
+        self._write(_REG_CTRL5, 0x55)   # LPF on, mode 10 = 5.32% of ODR (~13 Hz)
         # Preallocated burst-read buffers (no per-sample allocation at 50 Hz).
         self._burst = bytearray(12)              # AX_L..GZ_H (0x35..0x40)
         self._cmd_ax = bytes([_REG_AX_L | 0x80])  # read command, start at AX_L
