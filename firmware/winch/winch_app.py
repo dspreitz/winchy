@@ -72,6 +72,15 @@ lora = AsyncSX1262(
         "crc_en": True,
         "implicit_header": False,
     })
+# The official driver never calls its calibrate methods itself (public
+# methods, no internal callers). On this board the SX1262's power-on
+# auto-calibration ran WITHOUT the TCXO (DIO3-powered, enabled only later in
+# the constructor), so recalibrate everything now that the TCXO is running,
+# then image-calibrate the 869 MHz band. The old driver did both
+# (CALIBRATE_ALL in config(), calibrateImage in setFrequency); without them
+# TX was inaudible on the first migration attempt (2026-07-06).
+lora.calibrate()
+lora.calibrate_image()
 
 i2c = I2C(0, sda=Pin(18), scl=Pin(17))
 display = ssd1306.SSD1306_I2C(128, 64, i2c)

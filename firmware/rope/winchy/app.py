@@ -1759,6 +1759,14 @@ def run():
                 "crc_en": True,                     # the winch's old driver
                 "implicit_header": False,
             })
+        # The official driver never calls its calibrate methods itself. On
+        # this board the power-on auto-calibration ran WITHOUT the TCXO
+        # (DIO3-powered, enabled only later in the constructor), so
+        # recalibrate with the TCXO running + image-calibrate the 869 MHz
+        # band - the old driver did both; without them TX was inaudible on
+        # the first migration attempt (2026-07-06).
+        sx.calibrate()
+        sx.calibrate_image()
         state.tx_power_dbm = config.LORA_TX_POWER_DBM  # ADR adjusts from here
     else:
         # Soak diagnostic (panic hunt 2026-07-06): run everything EXCEPT the
