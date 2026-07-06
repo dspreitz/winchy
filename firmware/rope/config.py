@@ -118,8 +118,8 @@ OLED_HEIGHT = 64
 ROPE_DASHBOARD = True
 
 # Radio master switch. False = SX1262 never initialized, no telemetry task,
-# no soft-IRQ callback (soak diagnostic for the WDT panic hunt 2026-07-06;
-# overnight the panic cadence tripled exactly while the radio was in a
-# pathological RF-saturation state - radio path is the prime suspect).
-# MUST be True for field use.
-RADIO_ENABLED = False
+# no soft-IRQ callback. Panic-hunt result 2026-07-06: the radio-OFF soak ran
+# 195 min clean while radio-on crashed every 10-45 min -> the WDT panic lives
+# in the radio path (driver/soft-IRQ). True again for the daytime phase soaks
+# (with the distance-aware ADR hardening) and for field use.
+RADIO_ENABLED = True
