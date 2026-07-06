@@ -28,10 +28,12 @@ import struct
 import time
 
 import micropython
-from machine import I2C, Pin, RTC, UART
+from machine import I2C, Pin, RTC, SPI, UART
 import ssd1306
-from sx1262 import SX1262
-from _sx126x import ERR_NONE
+# Radio: official micropython-lib lora driver (single-context radio, migrated
+# 2026-07-06 together with the rope - see the rope app.py header for the full
+# WDT-panic story the old micropySX126X IRQ architecture caused).
+from lora import AsyncSX1262
 
 import crossupload
 import protocol
@@ -53,11 +55,23 @@ LORA_TX_POWER_DBM = 22  # +22 dBm (SX1262 max), within g3's 500 mW ERP; the winc
                         # Keeps the link symmetric so the back-channel reaches the
                         # rope at range. Needs OCP >= 140 mA (set in begin()).
 
-lora = SX1262(spi_bus=1, clk=5, mosi=6, miso=3, cs=7, irq=33, rst=8, gpio=34)
-lora.begin(freq=LORA_FREQ_MHZ, bw=LORA_BW_KHZ, sf=LORA_SF, cr=LORA_CR,
-           syncWord=LORA_SYNC_WORD, power=LORA_TX_POWER_DBM, currentLimit=140.0,
-           preambleLength=8, implicit=False, crcOn=True,
-           tcxoVoltage=1.7, useRegulatorLDO=False, blocking=True)
+lora = AsyncSX1262(
+    spi=SPI(1, baudrate=2000000, sck=Pin(5), mosi=Pin(6), miso=Pin(3)),
+    cs=Pin(7), busy=Pin(34), dio1=Pin(33), reset=Pin(8),
+    dio2_rf_sw=True,
+    dio3_tcxo_millivolts=1700,
+    dio3_tcxo_start_time_us=5000,
+    lora_cfg={
+        "freq_khz": int(LORA_FREQ_MHZ * 1000),
+        "bw": int(LORA_BW_KHZ),
+        "sf": LORA_SF,
+        "coding_rate": LORA_CR,
+        "preamble_len": 8,
+        "output_power": LORA_TX_POWER_DBM,
+        "syncword": LORA_SYNC_WORD,
+        "crc_en": True,
+        "implicit_header": False,
+    })
 
 i2c = I2C(0, sda=Pin(18), scl=Pin(17))
 display = ssd1306.SSD1306_I2C(128, 64, i2c)
@@ -312,7 +326,7 @@ def show_telemetry(msg):
     display.show()
 
 
-def send_link_report():
+async def send_link_report():
     # EMA-smooth the per-report-window loss so a single gap in the (tiny)
     # window doesn't swing the reported figure. Sending auto-returns to RX.
     global tx_seq, recv_window, lost_window, loss_ema
@@ -320,8 +334,8 @@ def send_link_report():
     window_loss = (100.0 * lost_window / total) if total else 0.0
     loss_ema = LOSS_EMA_ALPHA * window_loss + (1 - LOSS_EMA_ALPHA) * loss_ema
     loss_pct = int(round(loss_ema))
-    lora.send(protocol.encode_link_report(tx_seq, last_rssi, last_snr,
-                                          loss_pct))
+    await lora.send(protocol.encode_link_report(tx_seq, last_rssi, last_snr,
+                                                loss_pct))
     tx_seq = (tx_seq + 1) & 0xFFFF
     recv_window = 0
     lost_window = 0
@@ -329,11 +343,11 @@ def send_link_report():
         last_rssi, last_snr, loss_pct))
 
 
-def _cross_send():
+async def _cross_send():
     # Send ONE pending cross-upload frame (ACK first, else a retry CMD ~1 s
     # apart; decision in shared/crossupload.py, pure + host-tested). Called
-    # from on_receive only on TELEMETRY cycles that do NOT send a LINK_REPORT,
-    # so we never TX twice in one RX callback (half-duplex).
+    # from the radio task only on TELEMETRY cycles that do NOT send a
+    # LINK_REPORT, so we never TX twice per received frame (half-duplex).
     global tx_seq, cross_ack_nonce, cross_cmd_nonce, cross_cmd_tries, cross_cmd_ts
     now = time.ticks_ms()
     kind, nonce, tries, done = crossupload.tx_plan(
@@ -352,20 +366,17 @@ def _cross_send():
     if frame is not None:
         tx_seq = (tx_seq + 1) & 0xFFFF
         try:
-            lora.send(frame)               # cross-frame is best-effort; a SPI
-        except Exception as e:             # collision just drops it (re-armed by
-            print("cross-upload TX deferred:", e)   # the next RX), no crash
+            await lora.send(frame)     # cross-frame is best-effort
+        except Exception as e:
+            print("cross-upload TX error:", e)
 
 
-def _send_winch_pos():
+async def _send_winch_pos():
     # Send the surveyed winch position to the rope (low rate). Like the
-    # LINK_REPORT, a send auto-returns the radio to RX. accuracy_m may be inf
-    # (n<2) or large; the byte field saturates at 25.5 m.
-    # The radio is shared with the RX IRQ: this send can land mid-SPI relative
-    # to an incoming rope frame and raise (ERR_CHIP_NOT_FOUND). Catch it so a
-    # collision drops ONE WINCH_POS instead of killing the GPS task (same guard
-    # as on_receive). Returns True on a clean send, False if it collided so the
-    # caller can retry sooner.
+    # LINK_REPORT, the driver suspends RX for the send and resumes after.
+    # accuracy_m may be inf (n<2) or large; the byte field saturates at
+    # 25.5 m. Returns True on a clean send, False on error (caller retries
+    # sooner).
     global tx_seq
     acc = survey.accuracy_m
     if acc == float("inf") or acc > 25.5:
@@ -376,10 +387,10 @@ def _send_winch_pos():
     if survey.converged:
         status |= protocol.WINCH_SURVEY_DONE
     try:
-        lora.send(protocol.encode_winch_pos(tx_seq, survey.lat, survey.lon,
-                                            survey.alt or 0.0, acc, status))
+        await lora.send(protocol.encode_winch_pos(
+            tx_seq, survey.lat, survey.lon, survey.alt or 0.0, acc, status))
     except Exception as e:
-        print("[TX] winch_pos send collided, will retry:", e)
+        print("[TX] winch_pos send error, will retry:", e)
         return False
     tx_seq = (tx_seq + 1) & 0xFFFF
     print("[TX] winch_pos lat=%.6f lon=%.6f acc=%.1f conv=%s"
@@ -606,9 +617,9 @@ async def _gps_task():
             now = time.ticks_ms()
             if (survey.lat is not None
                     and time.ticks_diff(now, last_send) >= WINCH_POS_PERIOD_S * 1000):
-                if _send_winch_pos():
+                if await _send_winch_pos():
                     last_send = now              # clean send -> next in 15 s
-                else:                            # radio collided -> retry in ~2 s
+                else:                            # send failed -> retry in ~2 s
                     last_send = now - (WINCH_POS_PERIOD_S - 2) * 1000
             # Inject time aiding once the internet has given us UTC (via _serve).
             if _aid_utc is not None and not _aided_time:
@@ -850,35 +861,33 @@ def _reset_log(uploaded):
     print("winch_rxlog.csv offloaded; reset")
 
 
-def on_receive(events):
-    # Runs from the DIO1 IRQ (scheduled) and can land mid-SPI relative to a
-    # task-side lora.send (WINCH_POS / link report); a corrupted command
-    # raises ERR_CHIP_NOT_FOUND. Guard the WHOLE handler and re-arm RX - the
-    # same protection the rope's on_radio has had all along; without it an
-    # exception left the radio NOT re-armed (deaf until the next TX, <=15 s).
-    try:
-        _on_receive(events)
-    except Exception as e:
-        print("radio cb error:", e)
+async def _radio_task():
+    # Single-context radio (matches the rope): the driver's DIO1 ISR only
+    # sets a flag; every SPI byte moves from asyncio context. A send from
+    # another task suspends this recv; the driver resumes RX after TX_DONE.
+    while True:
         try:
-            lora.startReceive()
-        except Exception:
-            pass
+            rx = await lora.recv(None)
+        except Exception as e:
+            print("radio recv error:", e)
+            await asyncio.sleep_ms(250)
+            continue
+        if not rx:
+            continue
+        try:
+            await _handle_rx(rx)
+        except Exception as e:
+            print("radio rx handling error:", e)
 
 
-def _on_receive(events):
+async def _handle_rx(rx):
     global last_seq, received, lost, last_rssi, last_snr
     global recv_window, lost_window, latest, clock_set, last_rx_ms
     global cross_ack_nonce, cross_last_cmd, cross_last_cmd_ts
     global cross_cmd_nonce, _upload_request
-    if not (events & SX1262.RX_DONE):
-        return
-    frame, err = lora.recv()
-    if err != ERR_NONE:
-        print("Receive error:", lora.STATUS[err])
-        return
-    last_rssi = int(lora.getRSSI())
-    last_snr = int(lora.getSNR())
+    frame = bytes(rx)
+    last_rssi = int(rx.rssi if rx.rssi is not None else 0)
+    last_snr = int(rx.snr if rx.snr is not None else 0)
     msg = protocol.decode(frame)
     if msg is None:
         print("Ignoring unknown frame:", frame)
@@ -932,9 +941,9 @@ def _on_receive(events):
         if not uploading:           # keep the upload notice on screen if busy
             show_telemetry(msg)
         if msg["flags"] & protocol.FLAG_REQUEST_REPORT:
-            send_link_report()
+            await send_link_report()
         else:
-            _cross_send()           # opportunistic cross-upload TX (non-report)
+            await _cross_send()     # opportunistic cross-upload TX (non-report)
     elif msg["type"] == protocol.UPLOAD_CMD:
         # Rope asked us to upload too. ACK every copy (sent by _cross_send);
         # trigger our upload once per nonce - the dedup EXPIRES
@@ -1291,8 +1300,6 @@ async def _serve():
         await asyncio.sleep_ms(1000)
 
 
-lora.setBlockingCallback(False, on_receive)
-
 display.fill(0)
 display.text("Waiting for data", 0, 0)
 display.show()
@@ -1314,8 +1321,9 @@ if WIFI_ENABLED:
 
 
 async def _main():
-    # RX stays IRQ-driven. Run the GPS survey-in + WINCH_POS alongside the
-    # WiFi dashboard and periodic flush.
+    # Radio RX runs as its own task (single-context radio) alongside the GPS
+    # survey-in + WINCH_POS, the WiFi dashboard and the periodic flush.
+    asyncio.create_task(_radio_task())
     asyncio.create_task(_gps_task())
     await _serve()
 
