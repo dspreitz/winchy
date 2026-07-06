@@ -22,7 +22,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "firmware",
                                 "shared"))
 
-from adr import next_tx_power
+from adr import fspl_db, next_tx_power, power_cap_dbm
 
 
 def test_stale_report_jumps_to_max():
@@ -62,3 +62,54 @@ def test_loss_beats_good_rssi():
     # Good RSSI but heavy loss: the frames that DID get through report "fine" -
     # that is exactly the survivorship bias, so loss must win and jump to max.
     assert next_tx_power(5, True, 50, -60) == 22
+
+
+# --- distance-aware hardening (bench saturation latch-up, 2026-07-06) ---
+
+def test_fspl_sane():
+    # ~31.5 dB at 1 m, +20 dB per decade @ 869.525 MHz
+    assert 31 < fspl_db(1) < 32
+    assert 51 < fspl_db(10) < 52
+    assert 91 < fspl_db(1000) < 92
+
+
+def test_power_cap_curve():
+    assert power_cap_dbm(1) == -9         # bench: clamped to the floor
+    assert power_cap_dbm(50) in (0, 1)    # staging area: single digits
+    assert 15 <= power_cap_dbm(300) <= 17
+    assert power_cap_dbm(600) == 22       # field: cap == max, no change
+    assert power_cap_dbm(2000) == 22
+
+
+def test_near_stale_fails_quiet_to_cap():
+    # THE latch-up fix: lossy/stale at bench distance means RX saturation,
+    # so go to the distance cap (the floor), NOT to max.
+    assert next_tx_power(22, False, 0, 0, distance_m=2) == -9
+    assert next_tx_power(22, True, 80, 0, distance_m=2) == -9
+
+
+def test_far_stale_still_fails_loud():
+    # At range the old behaviour is sacred: stale -> max, immediately.
+    assert next_tx_power(5, False, 0, -80, distance_m=800) == 22
+
+
+def test_unknown_distance_is_legacy():
+    assert next_tx_power(5, False, 0, -80) == 22
+    assert next_tx_power(10, True, 0, -60) == 9
+
+
+def test_cap_bounds_good_link_too():
+    # Even with feedback, never exceed what the distance justifies.
+    assert next_tx_power(10, True, 0, -95, distance_m=2) == -9   # raise capped
+    assert next_tx_power(10, True, 0, -80, distance_m=2) == -9   # hold capped
+
+
+def test_latch_probe_ladder_when_stale_without_distance():
+    # Stale forever at unknown distance: after probe_start cycles the power
+    # walks max -> mid -> min (cycling) instead of latching at max.
+    assert next_tx_power(22, False, 0, 0, stale_count=0) == 22
+    assert next_tx_power(22, False, 0, 0, stale_count=23) == 22
+    assert next_tx_power(22, False, 0, 0, stale_count=24) == 22   # step 0: max
+    assert next_tx_power(22, False, 0, 0, stale_count=40) == 6    # step 1: mid
+    assert next_tx_power(22, False, 0, 0, stale_count=56) == -9   # step 2: min
+    assert next_tx_power(22, False, 0, 0, stale_count=72) == 22   # cycles

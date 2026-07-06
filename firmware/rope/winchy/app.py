@@ -252,20 +252,40 @@ ADR_STEP_UP_DB = 4            # raise quickly to restore margin
 ADR_STEP_DOWN_DB = 1          # trim gently
 ADR_LOSS_HIGH_PCT = 20        # loss above this -> jump to max
 ADR_REPORT_TIMEOUT_MS = 4000  # no fresh report this long -> jump to max
+# Distance-aware hardening (bench night 2026-07-06: blind fail-loud latched
+# both ends at +22 dBm in mutual RX saturation; see shared/adr.py header).
+ADR_NEAR_M = 50               # closer than this + lossy -> assume saturation
+ADR_TARGET_RSSI_DBM = -80     # distance cap aims for this at the winch
+ADR_CAP_MARGIN_DB = 15        # fading/obstruction margin on top of FSPL
+ADR_PROBE_START = 24          # stale decision cycles before the probe ladder
+ADR_PROBE_HOLD = 16           # cycles per probe step (max -> mid -> min)
 
 
 def _adr_next_power(state):
     """Next TX power (dBm). The decision itself lives in shared/adr.py (pure,
     host-tested - a regression here means a dead link at range); this wrapper
-    just supplies the report freshness and the tuning constants."""
+    supplies report freshness, the winch-distance prior and the stale-cycle
+    count. winch_dist_m keeps its LAST value when the link is down - that is
+    intended (the winch is parked), it is exactly what breaks the saturation
+    latch-up."""
     fresh = (state.link_report_ts != 0 and time.ticks_diff(
         time.ticks_ms(), state.link_report_ts) <= ADR_REPORT_TIMEOUT_MS)
+    if fresh:
+        state.adr_stale_cycles = 0
+    else:
+        state.adr_stale_cycles += 1
+    dist = (state.winch_dist_m
+            if state.winch_pos_ts and state.winch_dist_m > 0 else None)
     return adr.next_tx_power(
         state.tx_power_dbm, fresh, state.link_loss_pct, state.link_rssi_dbm,
         power_min=ADR_TX_POWER_MIN_DBM, power_max=ADR_TX_POWER_MAX_DBM,
         rssi_low=ADR_RSSI_LOW_DBM, rssi_high=ADR_RSSI_HIGH_DBM,
         step_up=ADR_STEP_UP_DB, step_down=ADR_STEP_DOWN_DB,
-        loss_high_pct=ADR_LOSS_HIGH_PCT)
+        loss_high_pct=ADR_LOSS_HIGH_PCT,
+        distance_m=dist, near_m=ADR_NEAR_M,
+        target_rssi=ADR_TARGET_RSSI_DBM, margin_db=ADR_CAP_MARGIN_DB,
+        stale_count=state.adr_stale_cycles,
+        probe_start=ADR_PROBE_START, probe_hold=ADR_PROBE_HOLD)
 
 # Barometric altitude calibration against GPS, only while IDLE (during a
 # launch the unit climbs and GPS/baro lag differently, so the reference is

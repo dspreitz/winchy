@@ -91,6 +91,8 @@ class State:
         self.link_snr_db = 0
         self.link_loss_pct = 0
         self.link_report_ts = 0  # time.ticks_ms of last report; 0 = never
+        self.adr_stale_cycles = 0  # consecutive ADR decisions without fresh
+                                   # feedback; drives the anti-latch probe
         self.tx_power_dbm = 0    # current radio TX power, driven by ADR
         # Winch position (from WINCH_POS over the radio) + derived geometry.
         self.winch_lat = 0.0
