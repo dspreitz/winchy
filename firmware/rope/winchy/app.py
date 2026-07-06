@@ -239,7 +239,14 @@ except ImportError:
 #   * optimise SLOW: trim 1 dB at a time, and only when RSSI is well clear of
 #     the floor, so it never walks the link down to the edge.
 # Only power is adapted; SF/BW stay fixed (would need both ends retuned).
-ADR_ENABLED = True
+# Phase-3 soak diagnostic (2026-07-06): False = TX at fixed power, NO
+# standby()/setOutputPower() during operation. Phase 2 (TX-only, ADR on)
+# crashed as fast as full-duplex while the ADR probe ladder was cycling
+# power every ~8 s - the runtime power-reconfig (standby+setOutputPower,
+# whose own comment warns about SPI corruption when the radio IRQ fires
+# mid-command) is the prime suspect. Clean here -> reconfig path guilty;
+# crash -> plain send/TX-done path. Re-enable for field use.
+ADR_ENABLED = False
 ADR_TX_POWER_MIN_DBM = -9     # SX1262 floor (driver clamps below this)
 ADR_TX_POWER_MAX_DBM = 22     # SX1262 max (+22 dBm / 158 mW), within g3's 500 mW
                               # ERP cap. Needs OCP >= 140 mA in sx.begin() or the
