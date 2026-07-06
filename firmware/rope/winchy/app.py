@@ -25,18 +25,9 @@ import micropython
 import os
 import time
 
-from machine import Pin, RTC, SPI
+from machine import Pin, RTC
 import sh1106
-# Radio: the official micropython-lib lora driver (lora-sx126x + lora-async).
-# Replaced micropySX126X (2026-07-06): that driver ran its ENTIRE IRQ handling
-# (getIrqStatus + startReceive re-arm + user callback, each an SPI transaction
-# with sleep_ms busy-waits) inside the scheduled DIO1 pin interrupt, while
-# telemetry_task did SPI from the main context - an unsynchronized dual-context
-# bus with a driver-made preemption window (sleep_ms services the scheduler
-# MID-TRANSACTION, CS low). Bisect-proven source of the stochastic WDT/PANIC
-# (MTBF ~15-20 min, needed only TX + TX_DONE IRQ). The official driver's ISR
-# only sets a flag; ALL SPI happens in asyncio context (single-context radio).
-from lora import AsyncSX1262
+from sx1262 import SX1262
 
 import adr
 import config
@@ -978,66 +969,6 @@ def _cross_tx_frame(state, seq):
     return None
 
 
-async def radio_task(sx, state):
-    """All radio RX handling, in plain asyncio context (single-context radio:
-    the driver's DIO1 ISR only sets a ThreadSafeFlag; every SPI byte moves
-    from here or telemetry_task, and asyncio tasks only yield at await points,
-    so driver calls are atomic - no locks needed). recv() keeps the modem
-    listening; a send() from telemetry_task suspends RX and the driver
-    resumes it automatically after TX_DONE."""
-    while True:
-        try:
-            rx = await sx.recv(None)     # continuous listen, IRQ-woken
-        except Exception as e:
-            print("radio recv error:", e)
-            await asyncio.sleep_ms(250)
-            continue
-        if not rx:
-            continue
-        try:
-            msg = protocol.decode(bytes(rx))
-        except Exception:
-            msg = None
-        if msg and msg["type"] == protocol.LINK_REPORT:
-            state.link_rssi_dbm = msg["rssi_dbm"]
-            state.link_snr_db = msg["snr_db"]
-            state.link_loss_pct = msg["loss_pct"]
-            state.link_report_ts = time.ticks_ms()
-            print("Link report: rssi={} dBm snr={} dB loss={}%".format(
-                msg["rssi_dbm"], msg["snr_db"], msg["loss_pct"]))
-        elif msg and msg["type"] == protocol.WINCH_POS:
-            state.winch_lat = msg["lat"]
-            state.winch_lon = msg["lon"]
-            state.winch_alt_m = msg["altitude_m"]
-            state.winch_acc_m = msg["hacc_m"]
-            state.winch_status = msg["status"]
-            state.winch_pos_ts = time.ticks_ms()
-            print("Winch pos: %.6f %.6f acc=%.1f m status=%d" % (
-                msg["lat"], msg["lon"], msg["hacc_m"], msg["status"]))
-        elif msg and msg["type"] == protocol.UPLOAD_CMD:
-            # Winch asked us to upload too. ACK every copy (telemetry_task
-            # sends it); trigger our upload once per nonce - the dedup
-            # EXPIRES (crossupload.accept_cmd) so a rebooted winch's
-            # reused nonce still triggers.
-            now = time.ticks_ms()
-            if crossupload.accept_cmd(
-                    msg["nonce"], state.cross_last_cmd,
-                    time.ticks_diff(now, state.cross_last_cmd_ts)):
-                state.cross_last_cmd = msg["nonce"]
-                state.cross_last_cmd_ts = now
-                state.upload_request = True
-                print("Cross-upload requested by winch (nonce %d)"
-                      % msg["nonce"])
-            state.cross_ack_nonce = msg["nonce"]
-        elif msg and msg["type"] == protocol.UPLOAD_ACK:
-            if msg["nonce"] == state.cross_cmd_nonce:
-                state.cross_cmd_nonce = None      # winch got it; stop retry
-                print("Cross-upload ACKed by winch (nonce %d)"
-                      % msg["nonce"])
-        else:
-            print("RX ?: %s (rssi=%s)" % (bytes(rx), rx.rssi))
-
-
 async def telemetry_task(sx, state):
     seq = 0
     frame_count = 0
@@ -1086,12 +1017,13 @@ async def telemetry_task(sx, state):
         if ADR_ENABLED:
             new_power = _adr_next_power(state)
             if new_power != state.tx_power_dbm:
-                # configure() refuses while receiving: stop RX first, the
-                # radio_task's recv() then returns None and re-arms listen.
-                # No IRQ-collision guard needed anymore (single-context radio).
+                # setOutputPower must run from standby (it errors in RX). The
+                # SPI sequence can be corrupted if the RX IRQ (on_radio) fires
+                # mid-command, so guard it: on a collision, leave power as-is
+                # and retry next cycle. send() below recovers from any state.
                 try:
                     sx.standby()
-                    sx.configure({"output_power": new_power})
+                    sx.setOutputPower(new_power)
                     print("ADR: tx power %d -> %d dBm (snr=%d loss=%d%%)"
                           % (state.tx_power_dbm, new_power, state.link_snr_db,
                              state.link_loss_pct))
@@ -1103,14 +1035,18 @@ async def telemetry_task(sx, state):
         cross = _cross_tx_frame(state, seq)
         if cross is not None:
             frame = cross
-        # await returns once TX_DONE fired; the driver then resumes the
-        # radio_task's suspended RX automatically, so the winch's reply is
-        # caught with no explicit listen window; we just dwell longer on
-        # report cycles so it isn't clobbered.
+        # Driver auto-returns to RX after this TX (non-blocking mode), so the
+        # winch's reply is caught by on_radio with no explicit listen window;
+        # we just dwell longer on report cycles so it isn't clobbered.
         try:
-            await sx.send(frame)
+            sx.send(frame)  # non-blocking; TX_DONE arrives via radio callback
         except Exception as e:
-            print("TX error:", e)   # drop this frame; next cycle retries
+            # SPI collided with the RX IRQ; drop this frame, recover to RX.
+            print("TX deferred:", e)
+            try:
+                sx.startReceive()
+            except Exception:
+                pass
         if gpslog:  # this frame's position, keyed by seq for the post-walk join
             gps_buf.append("%d,%d,%.6f,%.6f,%.1f,%d,%d,%d\n" % (
                 seq, time.ticks_ms(), state.lat, state.lon, state.alt_m,
@@ -1660,7 +1596,6 @@ async def _main(pmu, adc, imu, baro, sx, display, state, gyro_bias, mag):
     ]
     if sx is not None:
         tasks.append(telemetry_task(sx, state))
-        tasks.append(radio_task(sx, state))
     if display:
         tasks.append(display_task(display, state))
     if WIFI_ENABLED and WIFI_NETWORKS:
@@ -1735,30 +1670,75 @@ def run():
         display = None
         print("Display disabled (config.DISPLAY_ENABLED)")
 
-    # --- LoRa (official lora-sx126x driver; RX handling lives in radio_task)
+    # --- LoRa
+    def on_radio(events):
+        # Runs from the DIO1 IRQ and can land mid-SPI relative to a task's
+        # send(); a corrupted command raises ERR_CHIP_NOT_FOUND. Catch it and
+        # re-arm RX so a collision drops one frame instead of crashing.
+        try:
+            if events & SX1262.RX_DONE:
+                frame, err = sx.recv()
+                msg = protocol.decode(frame)
+                if msg and msg["type"] == protocol.LINK_REPORT:
+                    state.link_rssi_dbm = msg["rssi_dbm"]
+                    state.link_snr_db = msg["snr_db"]
+                    state.link_loss_pct = msg["loss_pct"]
+                    state.link_report_ts = time.ticks_ms()
+                    print("Link report: rssi={} dBm snr={} dB loss={}%".format(
+                        msg["rssi_dbm"], msg["snr_db"], msg["loss_pct"]))
+                elif msg and msg["type"] == protocol.WINCH_POS:
+                    state.winch_lat = msg["lat"]
+                    state.winch_lon = msg["lon"]
+                    state.winch_alt_m = msg["altitude_m"]
+                    state.winch_acc_m = msg["hacc_m"]
+                    state.winch_status = msg["status"]
+                    state.winch_pos_ts = time.ticks_ms()
+                    print("Winch pos: %.6f %.6f acc=%.1f m status=%d" % (
+                        msg["lat"], msg["lon"], msg["hacc_m"], msg["status"]))
+                elif msg and msg["type"] == protocol.UPLOAD_CMD:
+                    # Winch asked us to upload too. ACK every copy (telemetry_task
+                    # sends it); trigger our upload once per nonce - the dedup
+                    # EXPIRES (crossupload.accept_cmd) so a rebooted winch's
+                    # reused nonce still triggers.
+                    now = time.ticks_ms()
+                    if crossupload.accept_cmd(
+                            msg["nonce"], state.cross_last_cmd,
+                            time.ticks_diff(now, state.cross_last_cmd_ts)):
+                        state.cross_last_cmd = msg["nonce"]
+                        state.cross_last_cmd_ts = now
+                        state.upload_request = True
+                        print("Cross-upload requested by winch (nonce %d)"
+                              % msg["nonce"])
+                    state.cross_ack_nonce = msg["nonce"]
+                elif msg and msg["type"] == protocol.UPLOAD_ACK:
+                    if msg["nonce"] == state.cross_cmd_nonce:
+                        state.cross_cmd_nonce = None      # winch got it; stop retry
+                        print("Cross-upload ACKed by winch (nonce %d)"
+                              % msg["nonce"])
+                else:
+                    print("Receive: {}, {}".format(frame, SX1262.STATUS[err]))
+            elif events & SX1262.TX_DONE:
+                print("TX done.")
+        except Exception as e:
+            print("radio cb error:", e)
+            try:
+                sx.startReceive()
+            except Exception:
+                pass
+
     if getattr(config, "RADIO_ENABLED", True):
-        sx = AsyncSX1262(
-            spi=SPI(config.LORA_SPI_BUS, baudrate=2000000,
-                    sck=Pin(config.LORA_CLK), mosi=Pin(config.LORA_MOSI),
-                    miso=Pin(config.LORA_MISO)),
-            cs=Pin(config.LORA_CS),
-            busy=Pin(config.LORA_BUSY),
-            dio1=Pin(config.LORA_IRQ),
-            reset=Pin(config.LORA_RST),
-            dio2_rf_sw=True,                 # DIO2 drives the RF switch
-            dio3_tcxo_millivolts=1700,       # DIO3-powered TCXO (as before)
-            dio3_tcxo_start_time_us=5000,    # old driver's TCXO settle time
-            lora_cfg={
-                "freq_khz": int(config.LORA_FREQ_MHZ * 1000),
-                "bw": int(config.LORA_BW_KHZ),
-                "sf": config.LORA_SF,
-                "coding_rate": config.LORA_CR,
-                "preamble_len": 8,
-                "output_power": config.LORA_TX_POWER_DBM,
-                "syncword": config.LORA_SYNC_WORD,  # writes 0x1424, matches
-                "crc_en": True,                     # the winch's old driver
-                "implicit_header": False,
-            })
+        sx = SX1262(spi_bus=config.LORA_SPI_BUS, clk=config.LORA_CLK,
+                    mosi=config.LORA_MOSI, miso=config.LORA_MISO,
+                    cs=config.LORA_CS, irq=config.LORA_IRQ,
+                    rst=config.LORA_RST, gpio=config.LORA_BUSY)
+        sx.begin(freq=config.LORA_FREQ_MHZ, bw=config.LORA_BW_KHZ,
+                 sf=config.LORA_SF, cr=config.LORA_CR,
+                 syncWord=config.LORA_SYNC_WORD,
+                 power=config.LORA_TX_POWER_DBM, currentLimit=140.0,
+                 preambleLength=8, implicit=False, implicitLen=0xFF,
+                 crcOn=True, txIq=False, rxIq=False,
+                 tcxoVoltage=1.7, useRegulatorLDO=False, blocking=True)
+        sx.setBlockingCallback(False, on_radio)
         state.tx_power_dbm = config.LORA_TX_POWER_DBM  # ADR adjusts from here
     else:
         # Soak diagnostic (panic hunt 2026-07-06): run everything EXCEPT the
