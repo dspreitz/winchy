@@ -151,9 +151,10 @@ def enter_bootloader():
             # A dead CDC often means the chip ALREADY left for the ROM
             # bootloader (enumeration can take ~60 s) - check that first,
             # only then try the driver-level USB reset.
-            log("  serial error: %s -> checking for ROM port first"
+            log("  serial error: %s -> waiting for ROM (up to 5 min; no"
+                " usb resets - they delay the enumeration)"
                 % type(e).__name__)
-            dl = rope_download_port(150)
+            dl = rope_download_port(300)
             if dl:
                 return dl
             log("  no ROM port either -> WinchyUsbReset")
