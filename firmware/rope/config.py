@@ -116,3 +116,10 @@ OLED_HEIGHT = 64
 # falls back to the duty-cycled WiFi behaviour (power saving, upload-only).
 # Set False for flight. See app.py dashboard_task / wifi_task.
 ROPE_DASHBOARD = True
+
+# Radio master switch. False = SX1262 never initialized, no telemetry task,
+# no soft-IRQ callback (soak diagnostic for the WDT panic hunt 2026-07-06;
+# overnight the panic cadence tripled exactly while the radio was in a
+# pathological RF-saturation state - radio path is the prime suspect).
+# MUST be True for field use.
+RADIO_ENABLED = False

@@ -1565,9 +1565,10 @@ async def _main(pmu, adc, imu, baro, sx, display, state, gyro_bias, mag):
         mag_task(mag, state),
         baro_task(baro, state, vertical_filter),
         gps_task(state),
-        telemetry_task(sx, state),
         supervisor_task(pmu, state),
     ]
+    if sx is not None:
+        tasks.append(telemetry_task(sx, state))
     if display:
         tasks.append(display_task(display, state))
     if WIFI_ENABLED and WIFI_NETWORKS:
@@ -1698,19 +1699,27 @@ def run():
             except Exception:
                 pass
 
-    sx = SX1262(spi_bus=config.LORA_SPI_BUS, clk=config.LORA_CLK,
-                mosi=config.LORA_MOSI, miso=config.LORA_MISO,
-                cs=config.LORA_CS, irq=config.LORA_IRQ,
-                rst=config.LORA_RST, gpio=config.LORA_BUSY)
-    sx.begin(freq=config.LORA_FREQ_MHZ, bw=config.LORA_BW_KHZ,
-             sf=config.LORA_SF, cr=config.LORA_CR,
-             syncWord=config.LORA_SYNC_WORD,
-             power=config.LORA_TX_POWER_DBM, currentLimit=140.0,
-             preambleLength=8, implicit=False, implicitLen=0xFF,
-             crcOn=True, txIq=False, rxIq=False,
-             tcxoVoltage=1.7, useRegulatorLDO=False, blocking=True)
-    sx.setBlockingCallback(False, on_radio)
-    state.tx_power_dbm = config.LORA_TX_POWER_DBM  # ADR adjusts from here
+    if getattr(config, "RADIO_ENABLED", True):
+        sx = SX1262(spi_bus=config.LORA_SPI_BUS, clk=config.LORA_CLK,
+                    mosi=config.LORA_MOSI, miso=config.LORA_MISO,
+                    cs=config.LORA_CS, irq=config.LORA_IRQ,
+                    rst=config.LORA_RST, gpio=config.LORA_BUSY)
+        sx.begin(freq=config.LORA_FREQ_MHZ, bw=config.LORA_BW_KHZ,
+                 sf=config.LORA_SF, cr=config.LORA_CR,
+                 syncWord=config.LORA_SYNC_WORD,
+                 power=config.LORA_TX_POWER_DBM, currentLimit=140.0,
+                 preambleLength=8, implicit=False, implicitLen=0xFF,
+                 crcOn=True, txIq=False, rxIq=False,
+                 tcxoVoltage=1.7, useRegulatorLDO=False, blocking=True)
+        sx.setBlockingCallback(False, on_radio)
+        state.tx_power_dbm = config.LORA_TX_POWER_DBM  # ADR adjusts from here
+    else:
+        # Soak diagnostic (panic hunt 2026-07-06): run everything EXCEPT the
+        # radio - the SX1262 chip stays in reset, no soft-IRQ callback, no
+        # telemetry task. A clean multi-hour soak in this mode implicates
+        # the radio path; a crash exonerates it.
+        sx = None
+        print("RADIO DISABLED (config.RADIO_ENABLED=False) - soak diagnostic")
 
     print("Starting asyncio runtime")
     asyncio.run(_main(pmu, adc, imu, baro, sx, display, state, gyro_bias, mag))
