@@ -117,9 +117,10 @@ OLED_HEIGHT = 64
 # Set False for flight. See app.py dashboard_task / wifi_task.
 ROPE_DASHBOARD = True
 
-# Radio master switch. False = SX1262 never initialized, no telemetry task,
-# no soft-IRQ callback. Panic-hunt result 2026-07-06: the radio-OFF soak ran
-# 195 min clean while radio-on crashed every 10-45 min -> the WDT panic lives
-# in the radio path (driver/soft-IRQ). True again for the daytime phase soaks
-# (with the distance-aware ADR hardening) and for field use.
+# Radio master switch. False = radio never initialized, no telemetry/radio
+# task (kept as a diagnostic lever; it was how the 2026-07-06 panic hunt
+# isolated the radio path). The hunt's conclusion: the old micropySX126X
+# driver's IRQ architecture caused stochastic WDT panics; fixed by migrating
+# to the official micropython-lib lora driver (single-context, + explicit
+# calibrate() after TCXO enable). Verified 2026-07-07: 8+ h soak, 0 panics.
 RADIO_ENABLED = True

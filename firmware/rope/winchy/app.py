@@ -248,17 +248,17 @@ except ImportError:
 #   * optimise SLOW: trim 1 dB at a time, and only when RSSI is well clear of
 #     the floor, so it never walks the link down to the edge.
 # Only power is adapted; SF/BW stay fixed (would need both ends retuned).
-# Phase-3 soak diagnostic (2026-07-06): False = TX at fixed power, NO
-# standby()/setOutputPower() during operation. Phase 2 (TX-only, ADR on)
-# crashed as fast as full-duplex while the ADR probe ladder was cycling
-# power every ~8 s - the runtime power-reconfig (standby+setOutputPower,
-# whose own comment warns about SPI corruption when the radio IRQ fires
-# mid-command) is the prime suspect. Clean here -> reconfig path guilty;
-# crash -> plain send/TX-done path. Re-enable for field use.
-ADR_ENABLED = False
+# Re-enabled 2026-07-07 after the WDT-panic hunt concluded: the panics came
+# from the old radio driver's IRQ architecture (SPI inside the scheduled DIO1
+# interrupt), not from ADR itself. With the official single-context driver
+# the power change is a plain standby() + configure() from asyncio context -
+# no IRQ collision possible. Distance-aware hardening (shared/adr.py) caps
+# power on the bench so the RF-saturation latch-up cannot recur.
+ADR_ENABLED = True
 ADR_TX_POWER_MIN_DBM = -9     # SX1262 floor (driver clamps below this)
 ADR_TX_POWER_MAX_DBM = 22     # SX1262 max (+22 dBm / 158 mW), within g3's 500 mW
-                              # ERP cap. Needs OCP >= 140 mA in sx.begin() or the
+                              # ERP cap. OCP: the SX1262 reset default is
+                              # already 140 mA, enough for +22 dBm.
                               # PA can't deliver it. Battery cost on the rope is
                               # ~7 mA average (118 mA x ~6% TX duty).
 ADR_RSSI_LOW_DBM = -90        # winch RSSI below this -> raise (keeps ~20 dB above
