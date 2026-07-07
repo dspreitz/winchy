@@ -183,6 +183,9 @@ MOTION_GYRO_DPS = 10.0      # bias-corrected gyro magnitude over this = moving
 WIFI_ENABLED = True
 WIFI_JOIN_TIMEOUT_S = 15    # wait this long per network for join + DHCP
 WIFI_PERIOD_S = 600         # try to offload this often while idle (10 min)
+WIFI_ROAM_PERIOD_S = 60     # check this often for a higher-priority network
+                            # (field bug 2026-07-07: latched onto the Airbus
+                            # site AP, never switched to the phone hotspot)
 GITHUB_REPO = "dspreitz/winchy-logs"
 GITHUB_RELEASE_TAG = "logs"
 GITHUB_ASSET = "rope_rawlog.csv"
@@ -1599,6 +1602,18 @@ async def dashboard_task(state):
         # freeze the dashboard + stall the 50 Hz sampling for seconds. A manual
         # "Upload log" click still runs immediately (explicit user intent).
         still = not state.raw_recording
+        # Roam UP the priority list when a better network comes in range
+        # (the operator's hotspot is often enabled only after we already
+        # joined a site AP - see roam_to_preferred). The scan stutters the
+        # link for ~2 s, so: only while still + IDLE, and never when already
+        # on the top-priority network (then it returns without scanning).
+        if (wlan.isconnected() and still and state.phase == protocol.PHASE_IDLE
+                and n and n % WIFI_ROAM_PERIOD_S == 0):
+            roamed = await wifi.roam_to_preferred(wlan, WIFI_NETWORKS)
+            if roamed:
+                print("Rope dashboard WiFi roamed to '%s' - http://%s/"
+                      % (roamed, wlan.ifconfig()[0]))
+                # announced_ip is stale now; the announce below re-fires.
         # Announce our IP as a tappable dashboard link in the winchy-logs
         # release body, so it's findable on any subnet. On IP change only.
         if (GITHUB_TOKEN and wlan.isconnected() and still

@@ -196,6 +196,9 @@ WIFI_ENABLED = True
 WIFI_HOSTNAME = "winchy"    # reachable as winchy.local (mDNS) + via router DNS
 WIFI_RETRY_S = 30           # when WiFi is down, retry the join this often (s)
 WIFI_PROBE_S = 30           # how often to probe winchy-logs reachability (s)
+WIFI_ROAM_PERIOD_S = 60     # check this often for a higher-priority network
+                            # (field bug 2026-07-07, rope side: latched onto
+                            # the Airbus site AP instead of the phone hotspot)
 try:
     from secrets import WIFI_NETWORKS              # [(ssid, password), ...]
 except ImportError:
@@ -1256,6 +1259,16 @@ async def _serve():
             # live OLED/dashboard never freezes mid-launch (roadmap #12).
             busy = (time.ticks_diff(time.ticks_ms(), last_rx_ms) < 3000
                     and latest.get("speed", 0) >= UPLOAD_PAUSE_SPEED_MS)
+            # Roam UP the priority list when a better network comes in range
+            # (see wifi.roam_to_preferred; on the top-priority network this
+            # returns immediately without the ~2 s scan). Not while a launch
+            # is active - the scan stutters the dashboard/OLED updates.
+            if (wlan is not None and wlan.isconnected() and not busy
+                    and n and n % WIFI_ROAM_PERIOD_S == 0):
+                roamed = await wifi.roam_to_preferred(wlan, WIFI_NETWORKS)
+                if roamed:
+                    print("WiFi roamed to '%s' - http://%s/"
+                          % (roamed, wlan.ifconfig()[0]))
             # Announce our IP as a tappable dashboard link in the release body, so
             # the winch is findable on any subnet. On IP change only (no API spam).
             if (GITHUB_TOKEN and not busy

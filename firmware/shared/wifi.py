@@ -11,11 +11,21 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 # Multi-AP WiFi join, shared by both segments. Given a list of known networks
-# it scans, then connects to the strongest one that is actually in range -
-# falling back through the rest - so a device roams between sites (home bench,
-# field router, phone hotspot) without reconfiguration. Async so it never
-# blocks the asyncio loop. The caller owns the WLAN (active(True) first) and
-# the power policy (the rope duty-cycles WiFi off between attempts).
+# it scans, then connects to the highest-PRIORITY one that is actually in
+# range - falling back through the rest - so a device roams between sites
+# (home bench, field router, phone hotspot) without reconfiguration. Async so
+# it never blocks the asyncio loop. The caller owns the WLAN (active(True)
+# first) and the power policy (the rope duty-cycles WiFi off between attempts).
+#
+# PRIORITY IS THE LIST ORDER of `networks`, NOT signal strength. Field test
+# 2026-07-07 (Airbus site): selection by RSSI made the rope join the site's
+# strong corporate AP while the winch joined the operator's phone hotspot -
+# different subnets, so the rope's dashboard was unreachable from the phone
+# and the test had to be aborted. The operator expresses intent by ordering
+# WIFI_NETWORKS; the strongest signal is NOT the most useful network.
+# roam_to_preferred() completes the contract: once connected, periodically
+# switch UP the priority list when a better network comes in range (a hotspot
+# is often enabled only after the device has already latched onto a site AP).
 
 import asyncio
 
@@ -50,9 +60,54 @@ async def reset_iface(wlan):
     tune(wlan)
 
 
+async def scan_rssi(wlan):
+    """Scan and return {ssid: best_rssi}. An EMPTY result is a known driver
+    glitch right after a drop, so retry once after a short settle before
+    concluding "nothing in range"."""
+    seen = {}
+    for attempt in range(2):
+        try:
+            for ap in wlan.scan():
+                ssid = ap[0].decode() if isinstance(ap[0], bytes) else ap[0]
+                rssi = ap[3]
+                if ssid not in seen or rssi > seen[ssid]:
+                    seen[ssid] = rssi
+        except Exception as e:
+            print("WiFi scan failed:", e)
+        if seen:
+            break
+        await asyncio.sleep_ms(500)
+    return seen
+
+
+def order_candidates(networks, seen):
+    """Join order for `networks` [(ssid, password), ...] given a scan result
+    {ssid: rssi}: list order IS the priority - visible networks first (in
+    list order, NOT by RSSI - see the module header for the field test this
+    cost), then the unseen ones (scan can miss a hidden/edge AP) as a
+    last-ditch try, also in list order."""
+    visible = [(s, p) for (s, p) in networks if s in seen]
+    return visible + [(s, p) for (s, p) in networks if s not in seen]
+
+
+def preferred_ssid(networks, current, seen, min_rssi=-75):
+    """The SSID the device SHOULD be on instead of `current`: the first
+    (= highest-priority) configured network that is visible with a usable
+    signal (>= min_rssi, so a barely-audible AP never steals a working
+    link) and ranks ABOVE current in the list. None = stay put. An unknown
+    `current` (not in the list) ranks below everything."""
+    for ssid, _ in networks:
+        if ssid == current:
+            return None
+        if ssid in seen and seen[ssid] >= min_rssi:
+            return ssid
+    return None
+
+
 async def connect_any(wlan, networks, timeout_s=15):
-    """Connect to the best in-range network from `networks` (list of
-    (ssid, password)). Returns the joined SSID, or None if none joined."""
+    """Connect to the highest-priority in-range network from `networks`
+    (list of (ssid, password), LIST ORDER = PRIORITY). Returns the joined
+    SSID, or None if none joined."""
     if wlan.isconnected():
         try:
             return wlan.config("essid")
@@ -70,30 +125,8 @@ async def connect_any(wlan, networks, timeout_s=15):
         pass
     await asyncio.sleep_ms(700)
 
-    # Scan; an EMPTY result is a known driver glitch right after a drop, so
-    # retry once after a short settle before concluding "nothing in range".
-    seen = {}
-    for attempt in range(2):
-        try:
-            for ap in wlan.scan():
-                ssid = ap[0].decode() if isinstance(ap[0], bytes) else ap[0]
-                rssi = ap[3]
-                if ssid not in seen or rssi > seen[ssid]:
-                    seen[ssid] = rssi
-        except Exception as e:
-            print("WiFi scan failed:", e)
-        if seen:
-            break
-        await asyncio.sleep_ms(500)
-
-    # Configured networks that are visible, strongest first; then any unseen
-    # (in case the scan missed a hidden/edge AP) as a last-ditch try.
-    visible = sorted(((seen[s], s, p) for (s, p) in networks if s in seen),
-                     reverse=True)
-    ordered = [(s, p) for (_, s, p) in visible]
-    ordered += [(s, p) for (s, p) in networks if s not in seen]
-
-    for ssid, pw in ordered:
+    seen = await scan_rssi(wlan)
+    for ssid, pw in order_candidates(networks, seen):
         print("WiFi: trying '%s'%s" % (
             ssid, "" if ssid in seen else " (not in scan)"))
         try:
@@ -110,3 +143,36 @@ async def connect_any(wlan, networks, timeout_s=15):
         except Exception:
             pass
     return None
+
+
+async def roam_to_preferred(wlan, networks, min_rssi=-75):
+    """While connected to a lower-priority network, switch to a
+    higher-priority one that has come in range (field bug 2026-07-07: the
+    rope latched onto the site AP and never reconsidered, so the phone
+    hotspot - enabled after the join - was never picked up). Costs one scan
+    (a ~2 s off-channel trip that stutters the served link), so the caller
+    should gate the cadence (and skip while a launch/motion is active); on
+    the top-priority network it returns immediately without scanning.
+    Returns the newly joined SSID, or None (= still on the old network).
+    If the switch attempt fails, connect_any falls back down the ordered
+    list - the old network is still in it, so the device rejoins rather
+    than being left offline."""
+    if not networks or not wlan.isconnected():
+        return None
+    try:
+        current = wlan.config("essid")
+    except Exception:
+        return None
+    if current == networks[0][0]:
+        return None                     # already best - no scan cost
+    seen = await scan_rssi(wlan)
+    target = preferred_ssid(networks, current, seen, min_rssi)
+    if target is None:
+        return None
+    print("WiFi roam: '%s' (%d dBm) outranks '%s'"
+          % (target, seen[target], current))
+    try:
+        wlan.disconnect()               # else connect_any early-returns
+    except Exception:
+        pass
+    return await connect_any(wlan, networks)
