@@ -31,7 +31,15 @@ def _hms():
 
 
 def _data(s):
+    # Age of the last WINCH_POS in seconds (-1 = never received). Drives the
+    # survey banner: the operator must SEE whether the winch has a converged
+    # position before ride 1 (field test #2: ride flown 2 min after winch
+    # boot -> survey not converged -> no distance the whole ride).
+    wage = -1
+    if s.winch_pos_ts:
+        wage = time.ticks_diff(time.ticks_ms(), s.winch_pos_ts) // 1000
     return {
+        "wacc": s.winch_acc_m, "wage": wage,
         "fix": s.gps_fix, "sats": s.gps_sats, "hacc": s.gps_hacc_m,
         "lat": s.lat, "lon": s.lon,
         "gspeed": s.ground_speed_ms, "baro_alt": s.baro_alt_m,
@@ -60,6 +68,7 @@ td.l{color:#8ac;width:46%}
 .stale{opacity:.4}.g{color:#1c1}.r{color:#c33}
 </style></head><body>
 <h1>Winchy rope</h1>
+<div id=wbanner style="font-size:4.8vw;font-weight:bold;text-align:center;padding:10px 6px;margin:2px 0 6px;border-radius:6px;background:#333">--</div>
 <table>
 <tr><td class=l>Time</td><td id=clock>--</td></tr>
 <tr><td class=l>GPS</td><td id=gps>--</td></tr>
@@ -100,7 +109,10 @@ function render(d){
   wd.textContent=f(d.wdist,1)+' m';
   cl.textContent=f(d.cable,1)+' m';
   el.textContent=f(d.elev,1)+' deg';
-  wpos.textContent=(d.wfix?'fix':'no fix')+(d.wsurv?' SURVEYED':'');
+  wpos.textContent=(d.wfix?'fix':'no fix')+(d.wsurv?' SURVEYED':'')+(d.wage>=0?'  ('+d.wage+'s ago)':'');
+  if(d.wage<0||d.wage>60){wbanner.textContent='WINCH: no data'+(d.wage>60?' ('+d.wage+'s)':'');wbanner.style.background='#622';}
+  else if(!d.wsurv){wbanner.textContent='WINCH surveying… ±'+f(d.wacc,1)+' m — WAIT';wbanner.style.background='#653';}
+  else{wbanner.textContent='WINCH position ready  ±'+f(d.wacc,1)+' m';wbanner.style.background='#252';}
   batt.textContent=(d.battpct>100?'--':d.battpct+'%')+'  '+f(d.battmv/1000,2)+'V'+(d.charging?' CHG':'')+(d.battlow?' LOW':'');
   tx.textContent=d.txdbm+' dBm';
   link.textContent=d.rssi+' dBm  snr '+d.snr+'  loss '+d.loss+'%';
