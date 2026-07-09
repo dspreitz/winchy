@@ -44,3 +44,34 @@ def test_lower_pressure_means_higher_altitude():
     assert (pressure_to_altitude_m(900.0, ref)
             > pressure_to_altitude_m(950.0, ref)
             > pressure_to_altitude_m(1000.0, ref))
+
+
+# --- totality: these must NEVER return complex/inf (2026-07-09 crash loop:
+# a poisoned last_fix.json with alt=58316 m made (1 - alt/44330) negative,
+# the fractional power went COMPLEX and took down both Kalman filters and
+# the telemetry encoder on every boot).
+
+def test_regression_58km_altitude_stays_real():
+    qnh = sea_level_pressure_hpa(974.2, 58316.3)   # the exact field values
+    assert isinstance(qnh, float) and qnh > 0
+    alt = pressure_to_altitude_m(974.2, qnh)
+    assert isinstance(alt, float)
+
+
+def test_negative_and_zero_qnh_stay_real():
+    for ref in (0.0, -50.0, 1e-9):
+        alt = pressure_to_altitude_m(974.2, ref)
+        assert isinstance(alt, float)
+
+
+def test_garbage_pressure_stays_real():
+    # BMP280 occasionally returns 0 hPa (known glitch).
+    alt = pressure_to_altitude_m(0.0, 1013.25)
+    assert isinstance(alt, float)
+    qnh = sea_level_pressure_hpa(0.0, 370.0)
+    assert isinstance(qnh, float) and qnh > 0
+
+
+def test_clamps_do_not_disturb_sane_values():
+    ref = sea_level_pressure_hpa(979.7, 373.2)     # bench round-trip intact
+    assert abs(pressure_to_altitude_m(979.7, ref) - 373.2) < 0.01

@@ -679,7 +679,19 @@ async def raw_writer_task(state):
         await asyncio.sleep_ms(0)      # yield so imu_task samples between chunks
 
 
+# A glider on a winch lives between the Dead Sea and the troposphere; any
+# stored fix outside this envelope is a GPS glitch, and persisting it is
+# poison: a last_fix.json with alt=58316 m (2026-07-09) drove the ISA QNH
+# math complex at every boot -> crash loop. Gate on SAVE and on LOAD (the
+# load gate also disarms an already-poisoned file after an upgrade).
+LAST_FIX_ALT_MIN_M = -430.0
+LAST_FIX_ALT_MAX_M = 9000.0
+
+
 def _save_last_fix(lat, lon, alt):
+    if not (LAST_FIX_ALT_MIN_M <= alt <= LAST_FIX_ALT_MAX_M):
+        print("last_fix NOT saved (implausible alt %.0f m)" % alt)
+        return
     try:
         with open(LAST_FIX_PATH, "w") as f:
             f.write('{"lat":%.6f,"lon":%.6f,"alt":%.1f}' % (lat, lon, alt))
@@ -691,9 +703,18 @@ def _load_last_fix_alt():
     # Return the last persisted GPS MSL altitude (m), or None.
     try:
         import json
-        return float(json.loads(open(LAST_FIX_PATH).read())["alt"])
+        alt = float(json.loads(open(LAST_FIX_PATH).read())["alt"])
     except (OSError, ValueError, KeyError):
         return None
+    if not (LAST_FIX_ALT_MIN_M <= alt <= LAST_FIX_ALT_MAX_M):
+        print("last_fix IGNORED (implausible alt %.0f m)" % alt)
+        _event("last_fix ignored: alt %.0f m" % alt)
+        try:
+            os.remove(LAST_FIX_PATH)       # disarm the poisoned cache
+        except OSError:
+            pass
+        return None
+    return alt
 
 
 async def baro_task(baro, state, vertical):
