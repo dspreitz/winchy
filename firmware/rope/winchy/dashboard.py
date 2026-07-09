@@ -78,13 +78,14 @@ td.l{color:#8ac;width:46%}
 <tr><td class=l>Link (winch)</td><td id=link>--</td></tr>
 <tr><td class=l>Logging</td><td id=rec>--</td></tr>
 </table>
-<button id=ulbtn onclick=ul() style="font-size:5vw;padding:12px;margin:8px 2px;width:97%;background:#235;color:#eee;border:1px solid #8ac;border-radius:6px">Upload log to GitHub</button>
+<button onclick=ul(1) style="font-size:5vw;padding:12px;margin:8px 1px 2px;width:48%;background:#253;color:#eee;border:1px solid #8ca;border-radius:6px">Upload last ride</button>
+<button onclick=ul(0) style="font-size:5vw;padding:12px;margin:8px 1px 2px;width:48%;background:#235;color:#eee;border:1px solid #8ac;border-radius:6px">Upload full log</button>
 <div id=ulmsg style="font-size:4vw;color:#8ac;padding:2px 6px">&nbsp;</div>
 <script>
 var last=Date.now();var ws;
 var UPLBL={uploading:'uploading…',ok:'✓ upload verified',unverified:'⚠ uploaded, NOT verified',fail:'✗ upload failed',nodata:'nothing new to upload'};
-function ul(){ulmsg.textContent='uploading…';
- fetch('/upload',{method:'POST'}).catch(function(e){ulmsg.textContent='✗ upload error';});}
+function ul(r){ulmsg.textContent='uploading…';
+ fetch('/upload'+(r?'?mode=ride':''),{method:'POST'}).catch(function(e){ulmsg.textContent='✗ upload error';});}
 function f(x,n){return (x==null)?'--':x.toFixed(n);}
 function render(d){
   last=Date.now();document.body.className='';
@@ -180,7 +181,8 @@ async def handle(reader, writer):
             await writer.drain()
         elif path.startswith(b"/upload"):  # manual log upload (picked up by app)
             if state is not None and not state.uploading:   # ignore while busy
-                state.upload_request = True
+                # ?mode=ride = last episode only (field-sized); default = full
+                state.upload_request = "ride" if b"mode=ride" in path else True
                 # Also ask the winch to upload, over the radio (cross-upload).
                 # telemetry_task sends UPLOAD_CMD(nonce) up to 5x until ACKed.
                 state.cross_nonce_ctr = (state.cross_nonce_ctr + 1) & 0xFF

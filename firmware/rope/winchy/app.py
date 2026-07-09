@@ -42,6 +42,7 @@ import adr
 import config
 import crossupload
 import imubias
+import logtail
 import protocol
 import wifi
 import gpstime
@@ -606,6 +607,7 @@ async def raw_writer_task(state):
                 if cur <= state.raw_uploaded_bytes:
                     rawf = _reset_raw_file(rawf)
                     raw_bytes = len(RAW_LOG_HEADER)
+                    state.last_episode_start = None   # offsets now invalid
                     print("raw.csv offloaded; reset")
                 state.raw_uploaded_bytes = 0
 
@@ -638,7 +640,12 @@ async def raw_writer_task(state):
                     rawf = _reset_raw_file(rawf)
                     raw_bytes = len(RAW_LOG_HEADER)
                     unflushed = 0
+                    state.last_episode_start = None   # offsets now invalid
                     print("raw.csv hit cap; rotated (keeping recent data)")
+                if r.startswith("# motion-start"):
+                    # Remember where the newest episode begins - the manual
+                    # "Upload last ride" sends the file from here.
+                    state.last_episode_start = raw_bytes
                 rawf.write(r)
                 raw_bytes += len(r)
                 unflushed += 1
@@ -1201,95 +1208,208 @@ def _upload_suffix():
     return "x%06x" % (time.ticks_ms() & 0xFFFFFF)
 
 
-def _gzip_file(path):
-    # Return (data, ext, content_type). Gzip the file if this build's deflate
-    # supports compression; otherwise upload the raw CSV. This ESP32-S3
-    # MicroPython is decompress-only: `deflate` imports fine but DeflateIO has
-    # no .write, so the compress path raises AttributeError - fall back to raw
-    # (the original behaviour; the rope uploads 4 MB this way fine).
+# Upload plumbing, reworked after field test #2 (2026-07-07): the old path
+# gzipped the WHOLE file into RAM and pushed it through blocking urequests -
+# at ~4 MB over a phone hotspot that froze the asyncio loop (no TX, no
+# dashboard) for MINUTES and then failed. Now the body is staged to a temp
+# file and POSTed in small chunks with awaits between them, so telemetry and
+# the dashboard stay live and the operator sees progress. Only DNS + the TLS
+# handshake + the response read still block (seconds, socket-timeout-bounded).
+UPLOAD_TMP = "upload.tmp"        # staged (gzipped) POST body; deleted after
+UPLOAD_CHUNK = 2048              # stage/POST chunk size (yield between chunks)
+UPLOAD_TAIL_CAP = 2 * 1024 * 1024   # ride upload: max bytes searched/sent
+
+_release_id = None               # cached GitHub release id (also in a file, so
+                                 # later boots skip the huge release JSON GET)
+RELEASE_ID_PATH = "relid.txt"
+
+
+def _github_release_id(hdr):
+    """The 'logs' release id. Fetched at most once (the release JSON carries
+    EVERY asset - a big parse on this chip), then cached in RAM + file."""
+    global _release_id
+    if _release_id is not None:
+        return _release_id
     try:
-        import deflate
-        import io
-        buf = io.BytesIO()
-        comp = deflate.DeflateIO(buf, deflate.GZIP)
-        comp.write            # AttributeError if compression isn't compiled in
-    except (ImportError, AttributeError):
-        return open(path, "rb").read(), "", "text/csv"
-    f = open(path, "rb")
+        with open(RELEASE_ID_PATH) as f:
+            _release_id = int(f.read().strip())
+        return _release_id
+    except (OSError, ValueError):
+        pass
+    import urequests
+    r = urequests.get("https://api.github.com/repos/%s/releases/tags/%s"
+                      % (GITHUB_REPO, GITHUB_RELEASE_TAG), headers=hdr,
+                      timeout=GITHUB_TIMEOUT_S)
+    rid = r.json()["id"]
+    r.close()
+    gc.collect()
+    _release_id = rid
     try:
-        while True:
-            chunk = f.read(4096)
+        with open(RELEASE_ID_PATH, "w") as f:
+            f.write(str(rid))
+    except OSError:
+        pass
+    return rid
+
+
+def _drop_release_id():
+    """Invalidate the cached id (a POST 404 means the release was recreated)."""
+    global _release_id
+    _release_id = None
+    try:
+        os.remove(RELEASE_ID_PATH)
+    except OSError:
+        pass
+
+
+async def _stage_upload(path, start, size_cap):
+    """Stage file[start : start+size_cap] into UPLOAD_TMP, gzipped when this
+    build's deflate can compress (custom builds can; stock is decompress-only
+    -> raw CSV fallback). Chunked with yields. Returns (bytes, ext, ctype).
+    size_cap is the caller's size snapshot, so rows appended (or a rotation)
+    during staging never bleed into the body."""
+    src = open(path, "rb")
+    dst = open(UPLOAD_TMP, "wb")
+    comp = None
+    ext, ctype = "", "text/csv"
+    try:
+        try:
+            import deflate
+            comp = deflate.DeflateIO(dst, deflate.GZIP)
+            comp.write        # AttributeError when compression isn't built in
+            ext, ctype = ".gz", "application/gzip"
+        except (ImportError, AttributeError):
+            comp = None
+        src.seek(start)
+        left = size_cap
+        out = comp or dst
+        while left > 0:
+            chunk = src.read(UPLOAD_CHUNK if left > UPLOAD_CHUNK else left)
             if not chunk:
                 break
-            comp.write(chunk)
-        comp.close()          # flush the gzip trailer
+            out.write(chunk)
+            left -= len(chunk)
+            await asyncio.sleep_ms(0)
+        if comp:
+            comp.close()      # flush the gzip trailer (dst closed below)
     finally:
-        f.close()
-    return buf.getvalue(), ".gz", "application/gzip"
+        src.close()
+        try:
+            dst.close()
+        except Exception:
+            pass
+    return os.stat(UPLOAD_TMP)[6], ext, ctype
 
 
-def _github_upload_raw(asset):
-    # Upload the rope log to a (now unique-named) asset on the 'logs' release,
-    # gzip-compressed, then VERIFY by reading the asset back from the server and
-    # comparing its stored size to the bytes we sent (server-vs-device check).
-    # Blocks the asyncio loop for the round-trips (~secs) - only called while
-    # IDLE, so the launch path is never affected.
-    # Returns (ok, verified): ok = upload HTTP 2xx; verified = the server's
-    # stored asset size equals the uploaded byte count.
-    import urequests
+def _resp_asset_size(body):
+    """The 'size' field from GitHub's asset-created JSON, parsed with a plain
+    byte scan - tolerant of chunked framing that would break json.loads."""
+    i = body.find(b'"size"')
+    if i < 0:
+        return -1
+    k = body.find(b":", i) + 1
+    while k < len(body) and body[k:k + 1] in b" \t":
+        k += 1
+    n = -1
+    while k < len(body) and 48 <= body[k] <= 57:
+        n = (0 if n < 0 else n) * 10 + (body[k] - 48)
+        k += 1
+    return n
+
+
+async def _https_post_file(host, path, ctype, body_path, body_len, state):
+    """Streaming HTTPS POST of a staged file. Yields between chunks and
+    publishes progress to state.upload_status. Returns (status, resp_body)."""
+    import socket
+    import tls
+    ai = socket.getaddrinfo(host, 443)[0][-1]   # blocking DNS (no timeout!)
+    s = socket.socket()
+    s.settimeout(GITHUB_TIMEOUT_S)
+    resp = b""
+    try:
+        s.connect(ai)
+        ctx = tls.SSLContext(tls.PROTOCOL_TLS_CLIENT)
+        ctx.verify_mode = tls.CERT_NONE          # same trust model as urequests
+        s = ctx.wrap_socket(s, server_hostname=host)
+        s.write(("POST %s HTTP/1.1\r\nHost: %s\r\n"
+                 "Authorization: Bearer %s\r\nUser-Agent: winchy\r\n"
+                 "Accept: application/vnd.github+json\r\n"
+                 "Content-Type: %s\r\nContent-Length: %d\r\n"
+                 "Connection: close\r\n\r\n"
+                 % (path, host, GITHUB_TOKEN, ctype, body_len)).encode())
+        sent = 0
+        with open(body_path, "rb") as f:
+            while True:
+                chunk = f.read(UPLOAD_CHUNK)
+                if not chunk:
+                    break
+                mv = memoryview(chunk)
+                while len(mv):               # ssl write may be partial
+                    n = s.write(mv)
+                    mv = mv[len(mv) if n is None else n:]
+                sent += len(chunk)
+                state.upload_status = "up %d%%" % (100 * sent // body_len)
+                await asyncio.sleep_ms(0)    # telemetry/dashboard slot
+        while len(resp) < 8192:              # status + headers + small JSON
+            b = s.read(1024)
+            if not b:
+                break
+            resp += b
+            await asyncio.sleep_ms(0)
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+    try:
+        status = int(resp.split(b"\r\n", 1)[0].split(b" ")[1])
+    except (IndexError, ValueError):
+        status = 0
+    parts = resp.split(b"\r\n\r\n", 1)
+    return status, parts[1] if len(parts) > 1 else b""
+
+
+async def _github_upload_raw(asset, start, size_cap, state):
+    # Upload raw.csv[start : start+size_cap] as a (unique-named) asset on the
+    # 'logs' release. Verification now comes from the POST RESPONSE itself
+    # (GitHub returns the created asset incl. its stored size) - the old
+    # read-back GET of the whole release JSON is gone.
+    # Returns (ok, verified).
     hdr = {"Authorization": "Bearer " + GITHUB_TOKEN, "User-Agent": "winchy",
            "Accept": "application/vnd.github+json"}
     ok = False
     verified = False
     try:
-        r = urequests.get("https://api.github.com/repos/%s/releases/tags/%s"
-                          % (GITHUB_REPO, GITHUB_RELEASE_TAG), headers=hdr, timeout=GITHUB_TIMEOUT_S)
-        rel = r.json()
-        r.close()
-        rid = rel["id"]
-        gc.collect()
-        body, ext, ctype = _gzip_file(RAW_LOG_PATH)
-        sent = len(body)
+        rid = _github_release_id(hdr)      # cached: blocks only the first time
+        staged, ext, ctype = await _stage_upload(RAW_LOG_PATH, start, size_cap)
         name = asset + ext
-        for a in rel.get("assets", ()):    # unique names, but clear a stale retry
-            if a.get("name") == name:
-                urequests.delete(
-                    "https://api.github.com/repos/%s/releases/assets/%d"
-                    % (GITHUB_REPO, a["id"]), headers=hdr, timeout=GITHUB_TIMEOUT_S).close()
-        gc.collect()
-        h2 = dict(hdr)
-        h2["Content-Type"] = ctype
-        u = urequests.post(
-            "https://uploads.github.com/repos/%s/releases/%d/assets?name=%s"
-            % (GITHUB_REPO, rid, name), data=body, headers=h2,
-            timeout=GITHUB_TIMEOUT_S)
-        ok = 200 <= u.status_code < 300
-        print("GitHub upload %s: HTTP %d (%d B)" % (name, u.status_code, sent))
-        u.close()
-        gc.collect()
-        if ok:
-            # Read the asset back from the release and compare its stored size to
-            # what we sent - the server-vs-device verification.
-            r2 = urequests.get("https://api.github.com/repos/%s/releases/tags/%s"
-                               % (GITHUB_REPO, GITHUB_RELEASE_TAG), headers=hdr, timeout=GITHUB_TIMEOUT_S)
-            rel2 = r2.json()
-            r2.close()
-            for a in rel2.get("assets", ()):
-                if a.get("name") == name:
-                    verified = (a.get("size", -1) == sent)
-                    break
-            print("GitHub verify %s: %s (server vs %d B sent)"
-                  % (name, "OK" if verified else "MISMATCH", sent))
+        status, body = await _https_post_file(
+            "uploads.github.com",
+            "/repos/%s/releases/%d/assets?name=%s" % (GITHUB_REPO, rid, name),
+            ctype, UPLOAD_TMP, staged, state)
+        ok = 200 <= status < 300
+        verified = ok and _resp_asset_size(body) == staged
+        print("GitHub upload %s: HTTP %d (%d B) %s"
+              % (name, status, staged, "verified" if verified else ""))
+        if status == 404:                  # release recreated -> refetch id
+            _drop_release_id()
     except Exception as e:
         print("GitHub upload failed:", e)
+    try:
+        os.remove(UPLOAD_TMP)
+    except OSError:
+        pass
     gc.collect()
     return ok, verified
 
 
-async def _run_upload(state):
+async def _run_upload(state, ride=False):
     # Drive one raw.csv upload + the dashboard status. Each upload goes to a
     # UNIQUE asset (so chunks are never overwritten), and the device flash is
     # only reclaimed (raw_uploaded_bytes) once the server copy is verified.
+    # ride=True (dashboard "Upload last ride"): send only the LAST recorded
+    # episode - the natural unit for a quick post-ride look in the field,
+    # where the full file is minutes of hotspot uplink (field test #2).
     if state.uploading:                    # one already in flight -> ignore
         return
     try:
@@ -1299,15 +1419,36 @@ async def _run_upload(state):
     if size <= len(RAW_LOG_HEADER):        # header only - nothing to offload
         state.upload_status = "nodata"
         return
+    start = 0
+    base = GITHUB_ASSET
+    if ride:
+        base = "rope_ride.csv"
+        # Writer-tracked offset (this boot); after a reboot fall back to a
+        # backward scan for the last "# motion-start" marker, and with no
+        # marker at all (continuous mode) to a line-aligned tail window.
+        start = state.last_episode_start
+        if start is None or start >= size:
+            try:
+                with open(RAW_LOG_PATH, "rb") as f:
+                    start = logtail.last_marker_offset(
+                        f, cap_bytes=UPLOAD_TAIL_CAP)
+                    if start is None:
+                        start = logtail.align_to_line(
+                            f, size - UPLOAD_TAIL_CAP if
+                            size > UPLOAD_TAIL_CAP else 0)
+            except OSError:
+                start = 0
     state.uploading = True
     state.upload_status = "uploading"
     try:
         await asyncio.sleep_ms(600)        # let the dashboard push "uploading"
         stamp = state.log_start or _log_stamp() or "nogps"
-        asset = stamp + "_" + _upload_suffix() + "_" + GITHUB_ASSET
-        ok, verified = _github_upload_raw(asset)
+        asset = stamp + "_" + _upload_suffix() + "_" + base
+        ok, verified = await _github_upload_raw(asset, start, size - start,
+                                                state)
         if ok and verified:
-            state.raw_uploaded_bytes = size  # writer may now reclaim the flash
+            if not ride:                   # a partial upload reclaims nothing
+                state.raw_uploaded_bytes = size
             state.upload_status = "ok"
         elif ok:
             state.upload_status = "unverified"
@@ -1655,7 +1796,7 @@ async def dashboard_task(state):
                 and state.phase == protocol.PHASE_IDLE
                 and (state.upload_request
                      or (still and n and n % WIFI_PERIOD_S == 0))):
-            await _run_upload(state)
+            await _run_upload(state, ride=(state.upload_request == "ride"))
             state.upload_request = False   # clear the manual request once handled
         n += 1
         await asyncio.sleep_ms(1000)

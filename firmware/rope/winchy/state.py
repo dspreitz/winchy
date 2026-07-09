@@ -60,10 +60,14 @@ class State:
         self.raw_uploaded_bytes = 0  # >0 = raw.csv offloaded; writer resets it
         self.raw_q = []          # pending raw-log lines; drained by raw_writer_task
         self.raw_recording = False   # imu_task is mid-episode (gates the reset)
-        self.upload_request = False  # dashboard "Upload log" button -> wifi task
+        self.last_episode_start = None  # raw.csv offset of the newest
+                                        # "# motion-start" (writer-tracked; None
+                                        # after boot/rotation -> upload scans)
+        self.upload_request = False  # truthy = dashboard upload click; the
+                                     # string "ride" = last episode only
         # Upload progress for the dashboard, set by the upload task:
-        # "" idle | "uploading" | "ok" (verified) | "unverified" | "fail" |
-        # "nodata".
+        # "" idle | "uploading" | "up N%" | "ok" (verified) | "unverified" |
+        # "fail" | "nodata".
         self.upload_status = ""
         self.uploading = False   # an upload round-trip is in flight (guards re-entry)
         # Radio cross-upload: a WebGUI "Upload log" click also asks the WINCH to
