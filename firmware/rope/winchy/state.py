@@ -70,6 +70,9 @@ class State:
         # "fail" | "nodata".
         self.upload_status = ""
         self.uploading = False   # an upload round-trip is in flight (guards re-entry)
+        self.net_alive_ms = 0    # ticks of the last PROVEN two-way traffic
+                                 # (served request / HTTPS response); the
+                                 # liveness probe distrusts wlan.isconnected()
         # Radio cross-upload: a WebGUI "Upload log" click also asks the WINCH to
         # upload (protocol.UPLOAD_CMD, retried until UPLOAD_ACK). telemetry_task
         # owns the TX; on_radio sets the RX-side fields. nonce = idempotency id.

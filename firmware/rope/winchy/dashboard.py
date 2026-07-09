@@ -161,6 +161,8 @@ async def _ws_push(writer, key):
 async def handle(reader, writer):
     try:
         req = await reader.readline()
+        if state is not None:            # an inbound request = the link WORKS
+            state.net_alive_ms = time.ticks_ms()
         headers = {}
         while True:                       # read request headers
             h = await reader.readline()
@@ -192,6 +194,21 @@ async def handle(reader, writer):
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
                          b"Connection: close\r\n\r\nupload queued")
             await writer.drain()
+        elif path.startswith(b"/events"):  # persistent event log (small)
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+                         b"Connection: close\r\n\r\n")
+            await writer.drain()
+            try:
+                with open("events.log", "rb") as f:
+                    while True:
+                        chunk = f.read(1024)
+                        if not chunk:
+                            break
+                        writer.write(chunk)
+                        await writer.drain()
+            except OSError:
+                writer.write(b"(no events yet)")
+                await writer.drain()
         elif path.startswith(b"/raw"):    # download the raw log
             # STREAM in chunks: raw.csv can be 4 MB, and reading it whole
             # allocated one huge buffer that OOMed the ESP32 (MemoryError).

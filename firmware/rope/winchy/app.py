@@ -41,6 +41,7 @@ from lora import AsyncSX1262
 import adr
 import config
 import crossupload
+import eventlog
 import imubias
 import logtail
 import protocol
@@ -192,6 +193,20 @@ WIFI_PERIOD_S = 600         # try to offload this often while idle (10 min)
 WIFI_ROAM_PERIOD_S = 60     # check this often for a higher-priority network
                             # (field bug 2026-07-07: latched onto the Airbus
                             # site AP, never switched to the phone hotspot)
+# Liveness: wlan.isconnected() can LIE (zombie state, bench 2026-07-07:
+# ESSID/IP/RSSI healthy, no packet moves, rejoin never fires). Served
+# requests and HTTPS responses refresh state.net_alive_ms; once that goes
+# stale a tiny DNS probe to the gateway checks the truth, and repeated
+# failures force a full interface reset + rejoin.
+WIFI_LIVENESS_STALE_S = 60  # no proven traffic this long -> start probing
+WIFI_PROBE_RETRY_S = 10     # spacing between probes while stale
+WIFI_PROBE_FAILS_ZOMBIE = 2  # consecutive probe failures -> interface reset
+
+# Persistent event log (events.log, bounded, served at /events): WiFi joins/
+# drops/roams/zombies, upload results, boot reasons. Field test #2 was
+# diagnosed nearly blind because all of this lived only on the console.
+_events = eventlog.EventLog()
+_event = _events.log        # never raises (guarded inside EventLog)
 GITHUB_REPO = "dspreitz/winchy-logs"
 GITHUB_RELEASE_TAG = "logs"
 GITHUB_ASSET = "rope_rawlog.csv"
@@ -1389,6 +1404,8 @@ async def _github_upload_raw(asset, start, size_cap, state):
             ctype, UPLOAD_TMP, staged, state)
         ok = 200 <= status < 300
         verified = ok and _resp_asset_size(body) == staged
+        if status:                         # any response = proven traffic
+            state.net_alive_ms = time.ticks_ms()
         print("GitHub upload %s: HTTP %d (%d B) %s"
               % (name, status, staged, "verified" if verified else ""))
         if status == 404:                  # release recreated -> refetch id
@@ -1440,6 +1457,8 @@ async def _run_upload(state, ride=False):
                 start = 0
     state.uploading = True
     state.upload_status = "uploading"
+    mode = "ride" if ride else "full"
+    _event("upload %s start (%d B)" % (mode, size - start))
     try:
         await asyncio.sleep_ms(600)        # let the dashboard push "uploading"
         stamp = state.log_start or _log_stamp() or "nogps"
@@ -1454,6 +1473,7 @@ async def _run_upload(state, ride=False):
             state.upload_status = "unverified"
         else:
             state.upload_status = "fail"
+        _event("upload %s -> %s" % (mode, state.upload_status))
     finally:
         state.uploading = False
 
@@ -1712,16 +1732,25 @@ async def dashboard_task(state):
     n = 0
     join_fails = 0           # consecutive failed joins -> interface reset at 3
     retry_at = None          # ticks_ms of the next join attempt; None = due now
+    was_connected = False    # for the one-shot "wifi lost" event
+    probe_at = None          # next liveness probe (while traffic-stale)
+    probe_fails = 0
     while True:
+        conn = wlan.isconnected()
+        if was_connected and not conn:
+            _event("wifi lost")
+        was_connected = conn
         # (Re)join when down: FIRST attempt immediately, then backoff
         # 5 s -> 10 s -> 30 s (the old fixed ~30 s gate made hotspot handovers
         # take a minute). After 3 consecutive failures the interface is
         # power-cycled to clear a stuck supplicant.
-        if not wlan.isconnected() and (
+        if not conn and (
                 retry_at is None
                 or time.ticks_diff(time.ticks_ms(), retry_at) >= 0):
+            probe_fails = 0
             if join_fails >= 3:
                 print("WiFi: interface reset after repeated join failures")
+                _event("wifi iface reset (join failures)")
                 await wifi.reset_iface(wlan)
                 join_fails = 0
             joined = await wifi.connect_any(wlan, WIFI_NETWORKS,
@@ -1729,6 +1758,9 @@ async def dashboard_task(state):
             if joined:
                 print("Rope dashboard WiFi '%s' joined - http://%s/"
                       % (joined, wlan.ifconfig()[0]))
+                _event("wifi joined %s %s" % (joined, wlan.ifconfig()[0]))
+                state.net_alive_ms = time.ticks_ms()
+                was_connected = True
                 join_fails = 0
                 retry_at = None
                 if not server_started:
@@ -1740,6 +1772,28 @@ async def dashboard_task(state):
                 retry_at = time.ticks_add(time.ticks_ms(), delay_ms)
                 print("WiFi: join failed (%d), retry in %d s"
                       % (join_fails, delay_ms // 1000))
+        # LIVENESS (see the constants above): probe the gateway once the
+        # traffic proof goes stale; a repeatedly dead probe while
+        # "connected" is the zombie -> full interface reset, then the
+        # rejoin block above brings the link back for real.
+        elif conn and (time.ticks_diff(time.ticks_ms(), state.net_alive_ms)
+                       > WIFI_LIVENESS_STALE_S * 1000):
+            if (probe_at is None
+                    or time.ticks_diff(time.ticks_ms(), probe_at) >= 0):
+                probe_at = time.ticks_add(time.ticks_ms(),
+                                          WIFI_PROBE_RETRY_S * 1000)
+                if wifi.probe_gateway(wlan):
+                    state.net_alive_ms = time.ticks_ms()
+                    probe_fails = 0
+                    print("WiFi liveness probe ok")
+                else:
+                    probe_fails += 1
+                    print("WiFi liveness probe FAILED (%d)" % probe_fails)
+                    if probe_fails >= WIFI_PROBE_FAILS_ZOMBIE:
+                        _event("wifi ZOMBIE (connected but dead) - reset")
+                        await wifi.reset_iface(wlan)
+                        probe_fails = 0
+                        retry_at = None    # rejoin on the next iteration
         # HOLD OFF all blocking GitHub/NTP round-trips while the unit is MOVING
         # (a motion episode is recording). With a phone-hotspot riding along
         # (field tests) WiFi stays up during motion, and phase is still always
@@ -1758,6 +1812,8 @@ async def dashboard_task(state):
             if roamed:
                 print("Rope dashboard WiFi roamed to '%s' - http://%s/"
                       % (roamed, wlan.ifconfig()[0]))
+                _event("wifi roamed to %s %s" % (roamed, wlan.ifconfig()[0]))
+                state.net_alive_ms = time.ticks_ms()
                 # announced_ip is stale now; the announce below re-fires.
         # Announce our IP as a tappable dashboard link in the winchy-logs
         # release body, so it's findable on any subnet. On IP change only.
@@ -1771,6 +1827,8 @@ async def dashboard_task(state):
                     ssid = "?"
                 if _github_announce_ip(cur, ssid, "rope"):
                     announced_ip = cur
+                    _event("announced %s (%s)" % (cur, ssid))
+                    state.net_alive_ms = time.ticks_ms()   # full round-trip
         # NTP time fallback + GPS time-aiding: while WiFi is up and neither GPS
         # nor NTP has set the clock yet, sync from NTP (so logs are timestamped
         # even without a GPS fix) and inject coarse time into the GPS to speed up
@@ -1862,6 +1920,7 @@ async def _main(pmu, adc, imu, baro, sx, display, state, gyro_bias, mag):
 
 def run():
     print("Reset cause:", reset_cause_str())   # first thing: why did we boot?
+    _event("boot " + reset_cause_str())
     pmu = board.init_power()
     state = State()
 
@@ -1909,6 +1968,7 @@ def run():
         gyro_bias = _load_gyro_cal()
         print("Gyro bias: no still window - fallback (%.2f, %.2f, %.2f)"
               % gyro_bias)
+        _event("gyro bias: MOVING boot, fallback used")
 
     mag = Magnetometer()  # loads calibration.cal; input for the Kalman work
 

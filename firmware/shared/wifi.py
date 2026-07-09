@@ -145,6 +145,33 @@ async def connect_any(wlan, networks, timeout_s=15):
     return None
 
 
+def probe_gateway(wlan, timeout_ms=2000):
+    """Cheap two-way-traffic proof: one DNS query to the gateway (phones and
+    routers all run a DNS forwarder); ANY reply counts. Needed because
+    wlan.isconnected() can LIE - the zombie state seen on the bench
+    2026-07-07: ESSID/IP/RSSI all look healthy while no packet moves, and
+    the rejoin loop never fires because it only checks isconnected().
+    Blocking up to timeout_ms - callers gate it to idle moments."""
+    import socket
+    try:
+        gw = wlan.ifconfig()[2]
+        if not gw or gw == "0.0.0.0":
+            return False
+        # minimal A query for github.com (we only care that ANYTHING answers)
+        q = (b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+             b"\x06github\x03com\x00\x00\x01\x00\x01")
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(timeout_ms / 1000)
+        try:
+            s.sendto(q, (gw, 53))
+            s.recvfrom(256)
+            return True
+        finally:
+            s.close()
+    except Exception:
+        return False
+
+
 async def roam_to_preferred(wlan, networks, min_rssi=-75):
     """While connected to a lower-priority network, switch to a
     higher-priority one that has come in range (field bug 2026-07-07: the
