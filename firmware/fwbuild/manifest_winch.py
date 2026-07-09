@@ -21,7 +21,7 @@ freeze(R + "/firmware/winch", "ssd1306.py")
 
 # Shared modules
 freeze(R + "/firmware/shared", ("protocol.py", "nmea.py", "wifi.py", "survey.py",
-                                "gpstime.py", "crossupload.py"))
+                                "gpstime.py", "crossupload.py", "eventlog.py"))
 
 # Winch application (the former monolith main.py)
 freeze(R + "/firmware/winch", "winch_app.py")

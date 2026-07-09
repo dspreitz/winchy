@@ -36,11 +36,17 @@ import ssd1306
 from lora import AsyncSX1262
 
 import crossupload
+import eventlog
 import protocol
 import nmea
 import wifi
 import gpstime
 from survey import SurveyIn
+
+# Persistent event log (events.log, bounded, served at /events) - same
+# rationale as the rope's: WiFi/upload events must survive a field session.
+_events = eventlog.EventLog()
+_event = _events.log            # never raises (guarded inside EventLog)
 
 # Radio parameters: SF/BW/CR/sync/freq must match firmware/rope/config.py.
 # Band g3 (869.525 MHz, BW 250 kHz): 10% duty cycle, power/range headroom, and
@@ -128,11 +134,13 @@ ROPE_DATA_TIMEOUT_MS = 3000  # no rope telemetry for this long (6 frames at
 # avoid flash wear; clear winch_rxlog.csv before each run for a fresh log.
 LOG_TO_FLASH = True         # log every RX frame to flash; also served at /log
 LOG_PATH = "winch_rxlog.csv"
-LOG_MAX_BYTES = 4000000     # rolling cap, like the rope's raw.csv: ROTATE (reset
+LOG_MAX_BYTES = 1000000     # rolling cap, like the rope's raw.csv: ROTATE (reset
                             # + keep logging) instead of growing until the flash
-                            # is full - unbounded growth ended in ENOSPC and a
-                            # crash-guard reboot LOOP when uploads couldn't run
-                            # (no WiFi in the field)
+                            # is full. MUST stay well under the FS capacity: the
+                            # T3S3 filesystem is only ~2 MB, and the old 4 MB
+                            # value (copied from the 8 MB rope) could never
+                            # trigger - the log filled the FS and the app died
+                            # at import with ENOSPC for two days (2026-07-09)
 LOG_BUF_MAX = 4000          # cap the RAM row buffer (~80 KB) so a stalled main
                             # loop can never let the IRQ-fed buffer eat all RAM
 # Written at open and after an offload-reset; a file of exactly this size has
@@ -199,6 +207,15 @@ WIFI_PROBE_S = 30           # how often to probe winchy-logs reachability (s)
 WIFI_ROAM_PERIOD_S = 60     # check this often for a higher-priority network
                             # (field bug 2026-07-07, rope side: latched onto
                             # the Airbus site AP instead of the phone hotspot)
+# Liveness (ported from the rope 2026-07-09): wlan.isconnected() can LIE
+# (zombie: ESSID/IP healthy, no packet moves - the winch's own uploads went
+# silent this way on 2026-07-07 and the unbounded rxlog then filled the
+# flash). Served requests + any successful internet check refresh
+# net_alive_ms; stale -> tiny DNS probe to the GATEWAY (distinguishes
+# link-dead from internet-down); repeated dead probes -> interface reset.
+WIFI_LIVENESS_STALE_S = 60  # no proven traffic this long -> start probing
+WIFI_PROBE_RETRY_S = 10     # spacing between gateway probes while stale
+WIFI_PROBE_FAILS_ZOMBIE = 2  # consecutive dead probes -> interface reset
 try:
     from secrets import WIFI_NETWORKS              # [(ssid, password), ...]
 except ImportError:
@@ -260,6 +277,9 @@ _gps_time_cand = None       # pending GPS-time consistency candidate (gpstime)
 _gps_time_warn_ms = 0       # rate-limit the "GPS time rejected" log
 log_start = None            # "yyyymmdd-hhmm" session start, latched once synced
 online = False              # winchy-logs (GitHub) currently reachable? -> OLED "I"
+net_alive_ms = 0            # ticks of last PROVEN two-way traffic (served
+                            # request / internet check); liveness distrusts
+                            # wlan.isconnected() alone
 
 
 uploading = False   # True while a blocking GitHub round-trip runs: the OLED
@@ -1095,10 +1115,11 @@ async def _ws_push(writer, key):
 
 
 async def handle(reader, writer):
-    global _upload_request
+    global _upload_request, net_alive_ms
     global cross_nonce_ctr, cross_cmd_nonce, cross_cmd_tries, cross_cmd_ts
     try:
         req = await reader.readline()
+        net_alive_ms = time.ticks_ms()   # inbound request = the link WORKS
         headers = {}
         while True:                       # read request headers
             h = await reader.readline()
@@ -1136,8 +1157,23 @@ async def handle(reader, writer):
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
                          b"Connection: close\r\n\r\nupload queued")
             await writer.drain()
+        elif path.startswith(b"/events"):  # persistent event log (small)
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+                         b"Connection: close\r\n\r\n")
+            await writer.drain()
+            try:
+                with open("events.log", "rb") as f:
+                    while True:
+                        chunk = f.read(1024)
+                        if not chunk:
+                            break
+                        writer.write(chunk)
+                        await writer.drain()
+            except OSError:
+                writer.write(b"(no events yet)")
+                await writer.drain()
         elif path.startswith(b"/log"):   # serve the flash log for offload
-            # STREAM in chunks: the log can reach LOG_MAX_BYTES (4 MB), and
+            # STREAM in chunks: the log can reach LOG_MAX_BYTES, and
             # reading it whole allocated one huge buffer that OOMed the ESP32.
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/csv\r\n"
                          b"Connection: close\r\n\r\n")
@@ -1229,8 +1265,11 @@ async def _serve():
         wifi.tune(wlan)      # pm=PM_NONE (server role) + driver auto-reconnect
     else:
         print("WiFi: disabled or no secrets.py; dashboard off")
-    global log_start, online, _upload_request, _upload_status
+    global log_start, online, _upload_request, _upload_status, net_alive_ms
     n = 0
+    was_connected = False    # for the one-shot "wifi lost" event
+    probe_at = None          # next liveness gateway probe (while stale)
+    probe_fails = 0
     while True:                           # keep-alive + WiFi upkeep + flush
         # Defense in depth (like the GPS task): one bad iteration (a flash
         # write, a wlan call, an aiding inject) must never kill this task -
@@ -1240,13 +1279,21 @@ async def _serve():
             _flush_log()
             if clock_set and log_start is None:   # latch session start once synced
                 log_start = _stamp()
+            conn = wlan is not None and wlan.isconnected()
+            if was_connected and not conn:
+                _event("wifi lost")
+            was_connected = conn
             # (Re)join WiFi while it is down: at boot (n==0) and every WIFI_RETRY_S.
-            if (wlan is not None and not wlan.isconnected()
+            if (wlan is not None and not conn
                     and n % WIFI_RETRY_S == 0):
+                probe_fails = 0
                 joined = await wifi.connect_any(wlan, WIFI_NETWORKS, 15)
                 if joined:
                     print("WiFi '%s' joined - http://%s/  or  http://%s.local/"
                           % (joined, wlan.ifconfig()[0], WIFI_HOSTNAME))
+                    _event("wifi joined %s %s" % (joined, wlan.ifconfig()[0]))
+                    net_alive_ms = time.ticks_ms()
+                    was_connected = True
                     if not server_started:    # bind once; survives later rejoins
                         await asyncio.start_server(handle, "0.0.0.0", 80)
                         server_started = True
@@ -1255,6 +1302,26 @@ async def _serve():
                     _end_upload()
                 else:
                     print("WiFi: no known network in range; will retry")
+            # LIVENESS (ported from the rope; see the constants): the winch's
+            # own 2026-07-07 upload silence + the flash-full death that
+            # followed were a zombie link that isconnected() never noticed.
+            elif conn and (time.ticks_diff(time.ticks_ms(), net_alive_ms)
+                           > WIFI_LIVENESS_STALE_S * 1000):
+                if (probe_at is None
+                        or time.ticks_diff(time.ticks_ms(), probe_at) >= 0):
+                    probe_at = time.ticks_add(time.ticks_ms(),
+                                              WIFI_PROBE_RETRY_S * 1000)
+                    if wifi.probe_gateway(wlan):
+                        net_alive_ms = time.ticks_ms()
+                        probe_fails = 0
+                        print("WiFi liveness probe ok")
+                    else:
+                        probe_fails += 1
+                        print("WiFi liveness probe FAILED (%d)" % probe_fails)
+                        if probe_fails >= WIFI_PROBE_FAILS_ZOMBIE:
+                            _event("wifi ZOMBIE (connected but dead) - reset")
+                            await wifi.reset_iface(wlan)
+                            probe_fails = 0
             # Hold off blocking GitHub round-trips while a launch is active, so the
             # live OLED/dashboard never freezes mid-launch (roadmap #12).
             busy = (time.ticks_diff(time.ticks_ms(), last_rx_ms) < 3000
@@ -1269,6 +1336,9 @@ async def _serve():
                 if roamed:
                     print("WiFi roamed to '%s' - http://%s/"
                           % (roamed, wlan.ifconfig()[0]))
+                    _event("wifi roamed to %s %s"
+                           % (roamed, wlan.ifconfig()[0]))
+                    net_alive_ms = time.ticks_ms()
             # Announce our IP as a tappable dashboard link in the release body, so
             # the winch is findable on any subnet. On IP change only (no API spam).
             if (GITHUB_TOKEN and not busy
@@ -1282,6 +1352,8 @@ async def _serve():
                     _begin_upload("IP announce")
                     if _github_announce_ip(cur, ssid):
                         announced_ip = cur
+                        _event("announced %s (%s)" % (cur, ssid))
+                        net_alive_ms = time.ticks_ms()  # full round-trip
                     _end_upload()
             # winchy-logs reachability for the OLED "I": only when WiFi is up and a
             # token exists, probed against GitHub every WIFI_PROBE_S (so a hotspot
@@ -1289,6 +1361,8 @@ async def _serve():
             if wlan is not None and wlan.isconnected() and GITHUB_TOKEN:
                 if n % WIFI_PROBE_S == 0:
                     online = await _internet_ok()
+                    if online:               # real two-way internet traffic
+                        net_alive_ms = time.ticks_ms()
             else:
                 online = False
             # GitHub offload: periodic auto + manual dashboard "Upload log" trigger.
@@ -1308,10 +1382,12 @@ async def _serve():
                     if up and verified:
                         _reset_log(up)            # reclaim flash after a VERIFIED upload
                         _upload_status = "ok"
+                        net_alive_ms = time.ticks_ms()
                     elif up:
                         _upload_status = "unverified"  # uploaded but size mismatch
                     else:
                         _upload_status = "fail"
+                    _event("upload -> " + _upload_status)
                     _end_upload()
                 else:
                     _upload_status = "nodata"     # nothing new to offload (feedback)
@@ -1326,13 +1402,38 @@ display.fill(0)
 display.text("Waiting for data", 0, 0)
 display.show()
 print("Winch receiver ready | Reset cause:", reset_cause_str())
+_event("boot " + reset_cause_str())
 
 logf = None
 if LOG_TO_FLASH:
-    logf = open(LOG_PATH, "a")  # append so a reboot mid-run keeps prior data
-    logf.write(LOG_HEADER)      # delimiter; data rows carry UTC once synced
-    logf.write(_fw_line("winch", "winch_app.py"))   # one-time fw fingerprint
-    logf.flush()
+    # A full flash must NEVER kill the app at import (2026-07-09: the 4 MB
+    # cap couldn't trigger on the 2 MB FS, ENOSPC here crash-looped the winch
+    # for two days). Open normally; on failure drop the old log and retry;
+    # if even that fails (littlefs may hold orphaned blocks until a reboot),
+    # run WITHOUT flash logging rather than dying.
+    try:
+        logf = open(LOG_PATH, "a")  # append: a reboot mid-run keeps prior data
+        logf.write(LOG_HEADER)      # delimiter; data rows carry UTC once synced
+        logf.write(_fw_line("winch", "winch_app.py"))  # one-time fw fingerprint
+        logf.flush()
+    except OSError as e:
+        print("rxlog open failed (%s) - dropping the old log" % e)
+        _event("rxlog open failed (%s) - dropped old log" % e)
+        try:
+            if logf:
+                logf.close()
+        except OSError:
+            pass
+        try:
+            os.remove(LOG_PATH)
+            logf = open(LOG_PATH, "a")
+            logf.write(LOG_HEADER)
+            logf.write(_fw_line("winch", "winch_app.py"))
+            logf.flush()
+        except OSError as e2:
+            print("rxlog DISABLED (flash unusable):", e2)
+            _event("rxlog DISABLED: %s" % e2)
+            logf = None
 
 import asyncio
 if WIFI_ENABLED:
