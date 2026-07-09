@@ -41,6 +41,7 @@ from lora import AsyncSX1262
 import adr
 import config
 import crossupload
+import imubias
 import protocol
 import wifi
 import gpstime
@@ -75,8 +76,12 @@ BARO_PERIOD_MS = 1000
 
 # Gyro bias: learned slowly while IDLE and still, frozen during the tow so
 # it cannot chase real rotation.
-GYRO_BIAS_ALPHA = 0.01
-GYRO_STILL_TOLERANCE_G = 0.05
+# Live gyro-bias learning moved to shared/imubias.BiasTracker (2026-07-09,
+# field-test-#2 fix): the old accel-norm gate (|a|-1 < 0.05) never opened in
+# some orientations (per-axis accel scale error puts the rest norm at up to
+# ~1.06 g), so a poisoned boot bias could never heal. The tracker gates on
+# raw-gyro VARIANCE instead - bias-independent, heals within seconds of rest.
+GYRO_CAL_PATH = "gyro.cal"    # last good boot bias (JSON [x, y, z] dps)
 # Glider (CG-hook) speed = the rope-segment's own 3-D speed (sqrt(ground^2 +
 # climb^2)), which is the glider speed to within a small correction. The 5 m
 # rigid-link rotation term (L*thetadot) is DISABLED by default: it amplifies
@@ -381,7 +386,8 @@ async def mag_task(mag, state):
 
 
 async def imu_task(imu, state, filt, gyro_bias):
-    bias = list(gyro_bias)
+    tracker = imubias.BiasTracker(gyro_bias)
+    bias = tracker.bias     # live list - the tracker updates it in place
     last = time.ticks_ms()
     ring = []              # rolling pre-roll: (t_ms, rowstr), idle only
     recording = False
@@ -408,10 +414,8 @@ async def imu_task(imu, state, filt, gyro_bias):
             last = now
 
             norm = math.sqrt(accel[0] ** 2 + accel[1] ** 2 + accel[2] ** 2)
-            if (state.phase == protocol.PHASE_IDLE
-                    and abs(norm - 1.0) < GYRO_STILL_TOLERANCE_G):
-                for i in range(3):
-                    bias[i] += GYRO_BIAS_ALPHA * (gyro[i] - bias[i])
+            if state.phase == protocol.PHASE_IDLE:
+                tracker.update(gyro)   # variance-gated, self-healing learner
             corrected = (gyro[0] - bias[0], gyro[1] - bias[1],
                          gyro[2] - bias[2])
 
@@ -1657,6 +1661,35 @@ async def dashboard_task(state):
         await asyncio.sleep_ms(1000)
 
 
+def _load_gyro_cal():
+    """Last persisted good boot bias; zeros if none. Zeros are a SAFE
+    fallback: a real QMI8658 bias is a few dps, far below the 10 dps motion
+    threshold, and the BiasTracker converges on the exact value once the
+    unit rests."""
+    try:
+        import json
+        with open(GYRO_CAL_PATH) as f:
+            b = json.load(f)
+        return (float(b[0]), float(b[1]), float(b[2]))
+    except Exception:
+        return (0.0, 0.0, 0.0)
+
+
+def _save_gyro_cal(bias):
+    """Persist a good boot estimate for the moving-boot fallback. Skipped
+    when within 0.3 dps of the stored value (flash wear - this runs every
+    boot)."""
+    old = _load_gyro_cal()
+    if max(abs(bias[i] - old[i]) for i in range(3)) < 0.3:
+        return
+    try:
+        import json
+        with open(GYRO_CAL_PATH, "w") as f:
+            json.dump(list(bias), f)
+    except Exception as e:
+        print("gyro.cal save failed:", e)
+
+
 async def _main(pmu, adc, imu, baro, sx, display, state, gyro_bias, mag):
     # The app is up: re-enable Ctrl-C (main.py disabled it for the startup
     # window so a host attaching/probing during boot can't abort it). Now a
@@ -1709,15 +1742,32 @@ def run():
         imu = QMI8658(board.qmi_spi, board.qmi_cs)
         print("IMU: legacy python driver (IMU_FAST disabled)")
     print("Accelerations:", imu.read_accel_avg(IMU_WINDOW))
-    # Initial gyro bias from 50 samples; the unit is at rest at power-on.
-    sums = [0.0, 0.0, 0.0]
-    for _ in range(50):
-        g = imu.read_gyro()
-        for i in range(3):
-            sums[i] += g[i]
-        time.sleep_ms(5)
-    gyro_bias = tuple(v / 50 for v in sums)
-    print("Gyro bias (dps): (%.2f, %.2f, %.2f)" % gyro_bias)
+    # Initial gyro bias: only trust a STILL sample window. Field test #2
+    # (2026-07-07): powering on while the unit was handled averaged motion
+    # into the bias, the corrected gyro then exceeded the motion gate
+    # forever -> continuous 50 Hz recording rotated the ride data away and
+    # still=False blocked announce/roam/upload for the whole session.
+    # Reject moving windows (spread check, shared/imubias.py), retry
+    # briefly; if the unit never rests, fall back to the last persisted
+    # good bias - the imu_task BiasTracker heals it once the unit rests.
+    gyro_bias = None
+    for attempt in range(4):
+        win = []
+        for _ in range(50):
+            win.append(imu.read_gyro())
+            time.sleep_ms(5)
+        mean, still_ok = imubias.window_bias(win)
+        if still_ok:
+            gyro_bias = mean
+            break
+        print("Gyro bias: window %d rejected (moving)" % (attempt + 1))
+    if gyro_bias is not None:
+        _save_gyro_cal(gyro_bias)
+        print("Gyro bias (dps): (%.2f, %.2f, %.2f)" % gyro_bias)
+    else:
+        gyro_bias = _load_gyro_cal()
+        print("Gyro bias: no still window - fallback (%.2f, %.2f, %.2f)"
+              % gyro_bias)
 
     mag = Magnetometer()  # loads calibration.cal; input for the Kalman work
 
