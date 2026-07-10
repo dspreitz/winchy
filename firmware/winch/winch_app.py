@@ -761,11 +761,73 @@ def _gzip_file(path):
     return buf.getvalue(), ".gz", "application/gzip"
 
 
+# Cached GitHub release id (RAM + relid.txt), ported from the rope: the
+# release JSON now carries ~250 assets (hundreds of KB) and r.json() OOMs
+# this 2 MB-PSRAM board - the cause of EVERY upload failing verification on
+# 2026-07-10 (60+ unverified/fail events across the whole field day; and the
+# never-reclaimed log is what once filled the flash to death). relid.txt is
+# pre-seeded at deploy so even the first upload never parses the big JSON.
+_release_id = None
+RELEASE_ID_PATH = "relid.txt"
+
+
+def _github_release_id(hdr):
+    global _release_id
+    if _release_id is not None:
+        return _release_id
+    try:
+        with open(RELEASE_ID_PATH) as f:
+            _release_id = int(f.read().strip())
+        return _release_id
+    except (OSError, ValueError):
+        pass
+    import urequests
+    r = urequests.get("https://api.github.com/repos/%s/releases/tags/%s"
+                      % (GITHUB_REPO, GITHUB_RELEASE_TAG), headers=hdr,
+                      timeout=GITHUB_TIMEOUT_S)
+    rid = r.json()["id"]                   # big parse - once, then cached
+    r.close()
+    _release_id = rid
+    try:
+        with open(RELEASE_ID_PATH, "w") as f:
+            f.write(str(rid))
+    except OSError:
+        pass
+    return rid
+
+
+def _drop_release_id():
+    # A POST 404 means the release was recreated -> refetch next round.
+    global _release_id
+    _release_id = None
+    try:
+        os.remove(RELEASE_ID_PATH)
+    except OSError:
+        pass
+
+
+def _resp_asset_size(body):
+    # The 'size' field from GitHub's asset-created response, via a plain
+    # byte scan: no json parse (RAM), tolerant of chunked framing.
+    i = body.find(b'"size"')
+    if i < 0:
+        return -1
+    k = body.find(b":", i) + 1
+    while k < len(body) and body[k:k + 1] in b" \t":
+        k += 1
+    n = -1
+    while k < len(body) and 48 <= body[k] <= 57:
+        n = (0 if n < 0 else n) * 10 + (body[k] - 48)
+        k += 1
+    return n
+
+
 def _github_upload():
-    # Upload the current log to a (now unique-named) asset on the 'logs' release,
-    # gzip-compressed, then VERIFY by reading the asset back from the server and
-    # comparing its stored size to the bytes we sent (server-vs-device check).
-    # Blocks the asyncio loop for the round-trips (~secs); RX stays IRQ-driven.
+    # Upload the current log to a (unique-named) asset on the 'logs' release,
+    # gzip-compressed. Verification comes from the POST RESPONSE itself
+    # (GitHub returns the created asset incl. its stored size) - the old
+    # read-back of the whole release JSON is gone (see _github_release_id).
+    # Blocks the asyncio loop for the round-trip (~secs); RX stays IRQ-driven.
     # Returns (uploaded, verified): uploaded = UNCOMPRESSED bytes offloaded on
     # HTTP 2xx (0 on failure, so _reset_log's grew-during-upload check stays
     # correct); verified = the server's stored asset size equals the bytes sent.
@@ -782,12 +844,7 @@ def _github_upload():
     hdr = {"Authorization": "Bearer " + GITHUB_TOKEN, "User-Agent": "winchy",
            "Accept": "application/vnd.github+json"}
     try:
-        r = urequests.get("https://api.github.com/repos/%s/releases/tags/%s"
-                          % (GITHUB_REPO, GITHUB_RELEASE_TAG), headers=hdr, timeout=GITHUB_TIMEOUT_S)
-        rel = r.json()
-        r.close()
-        rid = rel["id"]
-        gc.collect()
+        rid = _github_release_id(hdr)
         try:
             orig_size = os.stat(LOG_PATH)[6]
         except OSError:
@@ -795,11 +852,6 @@ def _github_upload():
         body, ext, ctype = _gzip_file(LOG_PATH)
         sent = len(body)
         name = asset + ext
-        for a in rel.get("assets", ()):    # unique names, but clear a stale retry
-            if a.get("name") == name:
-                urequests.delete(
-                    "https://api.github.com/repos/%s/releases/assets/%d"
-                    % (GITHUB_REPO, a["id"]), headers=hdr, timeout=GITHUB_TIMEOUT_S).close()
         gc.collect()
         h2 = dict(hdr)
         h2["Content-Type"] = ctype
@@ -807,24 +859,19 @@ def _github_upload():
             "https://uploads.github.com/repos/%s/releases/%d/assets?name=%s"
             % (GITHUB_REPO, rid, name), data=body, headers=h2,
             timeout=GITHUB_TIMEOUT_S)
-        ok = 200 <= u.status_code < 300
-        print("GitHub upload %s: HTTP %d (%d B)" % (name, u.status_code, sent))
+        status = u.status_code
+        ok = 200 <= status < 300
+        resp = u.content if ok else b""    # small (~2 KB asset JSON)
         u.close()
         gc.collect()
+        print("GitHub upload %s: HTTP %d (%d B)" % (name, status, sent))
         if ok:
             uploaded = orig_size           # uncompressed size for the reset check
-            # Read the asset back from the release and compare its stored size to
-            # what we sent - the server-vs-device verification.
-            r2 = urequests.get("https://api.github.com/repos/%s/releases/tags/%s"
-                               % (GITHUB_REPO, GITHUB_RELEASE_TAG), headers=hdr, timeout=GITHUB_TIMEOUT_S)
-            rel2 = r2.json()
-            r2.close()
-            for a in rel2.get("assets", ()):
-                if a.get("name") == name:
-                    verified = (a.get("size", -1) == sent)
-                    break
-            print("GitHub verify %s: %s (server vs %d B sent)"
+            verified = _resp_asset_size(resp) == sent
+            print("GitHub verify %s: %s (%d B sent)"
                   % (name, "OK" if verified else "MISMATCH", sent))
+        elif status == 404:
+            _drop_release_id()
     except Exception as e:
         print("GitHub upload failed:", e)
     gc.collect()
