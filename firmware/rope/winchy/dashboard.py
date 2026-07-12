@@ -106,9 +106,13 @@ function render(d){
   spd.textContent=f(d.speed*3.6,1)+' km/h';
   force.textContent=d.force+' cnt';
   ang.textContent=f(d.angle,1)+' deg';
-  wd.textContent=f(d.wdist,1)+' m';
-  cl.textContent=f(d.cable,1)+' m';
-  el.textContent=f(d.elev,1)+' deg';
+  var gstale=(!d.fix)||d.wage<0||d.wage>60;  /* geometry holds its LAST value
+     (intended for ADR) - without a rope fix + fresh WINCH_POS it can be very
+     wrong (field test #4: 26 km = home-to-field from the persisted position) */
+  wd.textContent=f(d.wdist,1)+' m'+(gstale?' (stale)':'');
+  cl.textContent=f(d.cable,1)+' m'+(gstale?' (stale)':'');
+  el.textContent=f(d.elev,1)+' deg'+(gstale?' (stale)':'');
+  wd.style.opacity=cl.style.opacity=el.style.opacity=gstale?0.4:1;
   wpos.textContent=(d.wfix?'fix':'no fix')+(d.wsurv?' SURVEYED':'')+(d.wage>=0?'  ('+d.wage+'s ago)':'');
   if(d.wage<0||d.wage>60){wbanner.textContent='WINCH: no data'+(d.wage>60?' ('+d.wage+'s)':'');wbanner.style.background='#622';}
   else if(!d.wsurv){wbanner.textContent='WINCH surveying… ±'+f(d.wacc,1)+' m — WAIT';wbanner.style.background='#653';}

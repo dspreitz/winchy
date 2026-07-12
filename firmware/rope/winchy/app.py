@@ -598,9 +598,15 @@ async def raw_writer_task(state):
             raw_bytes = os.stat(RAW_LOG_PATH)[6]   # cap across reboots (append)
         except OSError:
             raw_bytes = 0
+        fw = _fw_line("rope", "winchy/app.py")     # one-time fw fingerprint
         rawf.write(RAW_LOG_HEADER)
-        rawf.write(_fw_line("rope", "winchy/app.py"))   # one-time fw fingerprint
+        rawf.write(fw)
         rawf.flush()
+        # Count the header+fingerprint into raw_bytes: it is the file-offset
+        # source for state.last_episode_start, and skipping these ~250 B made
+        # every "Upload last ride" start that many bytes EARLY (field test #4:
+        # torn first row, the # motion-start marker on line 4 instead of 1).
+        raw_bytes += len(RAW_LOG_HEADER) + len(fw)
     except OSError as e:
         print("raw log DISABLED (open/header failed):", e)
         return
