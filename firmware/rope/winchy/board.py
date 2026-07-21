@@ -47,14 +47,26 @@ else:
                   miso=Pin(config.QMI_MISO))
     qmi_cs = Pin(config.QMI_CS, Pin.OUT, value=1)
 
-# AXP2101 rail plan: (rail, millivolts, enable).
-# DC1 powers the ESP32-S3 itself - set but never toggled here.
-# BLDO2 supplies the ADS1232 breakout.
+# AXP2101 rail plan, FACTORY-PARITY since 2026-07-21: (rail, mV, state) -
+# state True = enable, False = explicitly DISABLE (overrides whatever the
+# PMU held), None = set voltage only (DC1 feeds the ESP32-S3 - never toggle).
+#
+# The old plan enabled EVERY rail ("replicate the monolith") including four
+# that LilyGo's factory firmware pointedly keeps OFF on the Supreme (DC2,
+# CPUSLDO, DLDO1, DLDO2 - all unloaded on this board; DLDO2/CPUSLDO hang
+# off DC4 which we also ran at 1.0 V instead of the factory 1.84 V).
+# Board #2 powered itself off ~55 s into that config on every boot while
+# running LilyGo's factory firmware indefinitely - prime suspect: a marginal
+# defect on one of those never-factory-enabled rails tripping the PMU's
+# protection. Factory parity is also simply correct: nothing of ours is on
+# them. Loads: ALDO1/2 sensors, ALDO3 radio, ALDO4 GPS, BLDO1 SD slot,
+# BLDO2 pin header (ADS1232 breakout), DC3/DC4/DC5 M.2 socket (empty; kept
+# at factory settings).
 _RAILS = (
-    ("DC1", 3300, False),
-    ("DC2", 1000, True),
+    ("DC1", 3300, None),
+    ("DC2", 1000, False),
     ("DC3", 3300, True),
-    ("DC4", 1000, True),
+    ("DC4", 1840, True),
     ("DC5", 3300, True),
     ("ALDO1", 3300, True),
     ("ALDO2", 3300, True),
@@ -62,9 +74,9 @@ _RAILS = (
     ("ALDO4", 3300, True),
     ("BLDO1", 3300, True),
     ("BLDO2", 3300, True),
-    ("CPUSLDO", 1000, True),
-    ("DLDO1", 3300, True),
-    ("DLDO2", 3300, True),
+    ("CPUSLDO", 1000, False),
+    ("DLDO1", 3300, False),
+    ("DLDO2", 3300, False),
 )
 
 
@@ -83,10 +95,12 @@ def init_power():
     pmu.setVbusCurrentLimit(pmu.XPOWERS_AXP2101_VBUS_CUR_LIM_1500MA)
     pmu.setSysPowerDownVoltage(2600)
 
-    for rail, millivolts, enable in _RAILS:
+    for rail, millivolts, state in _RAILS:
         getattr(pmu, "set" + rail + "Voltage")(millivolts)
-        if enable:
+        if state is True:
             getattr(pmu, "enable" + rail)()
+        elif state is False:
+            getattr(pmu, "disable" + rail)()
 
     pmu.setPowerKeyPressOffTime(pmu.XPOWERS_POWEROFF_6S)
     pmu.setPowerKeyPressOnTime(pmu.XPOWERS_POWERON_2S)
