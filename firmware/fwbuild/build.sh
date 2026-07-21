@@ -80,17 +80,34 @@ else
     done
     echo ">> fetching esp32 submodules"
     make BOARD="$BOARD" submodules >/dev/null
-    echo ">> applying Winchy config (deflate + USB name=winchy-$ROLE)"
+    echo ">> applying Winchy config (deflate + USB-Serial-JTAG console)"
     BOARD_H="boards/$BOARD/mpconfigboard.h"
     if ! grep -q "MICROPY_PY_DEFLATE_COMPRESS" "$BOARD_H"; then
         cat >> "$BOARD_H" <<'EOF'
 
 // --- Winchy custom build: enable deflate (gzip/zlib) compression ---
 #define MICROPY_PY_DEFLATE_COMPRESS (1)
+
+// --- Winchy custom build: console on the HARDWARE USB-Serial-JTAG ---
+// TinyUSB CDC could never emit Guru-Meditation/panic output (the panic
+// handler cannot run the TinyUSB stack - every C-level crash was invisible
+// until a UART adapter was clamped on), and its CDC wedged repeatedly
+// (writes rejected, raw-REPL corruption). The S3's fixed-function
+// USB-Serial-JTAG needs no firmware stack: ROM boot banner, IDF logs AND
+// panic dumps all arrive over plain USB, esptool can enter the bootloader
+// via its reset protocol (no more gentle-REPL machine.bootloader() dance),
+// and there is no device-side CDC state left to wedge. UART0 stays enabled
+// as a second REPL/console (MICROPY_HW_ENABLE_UART_REPL above), so the
+// GPIO43 clamp keeps working as a backstop. Enumeration note: the port is
+// now VID 0x303A PID 0x1001 with the MAC (colon form) as serial - the
+// same identity in the ROM bootloader and the running app.
+#define MICROPY_HW_ENABLE_USBDEV (0)
+#define MICROPY_HW_USB_CDC (0)
+#define MICROPY_HW_ESP_USB_SERIAL_JTAG (1)
 EOF
     fi
-    sed -i "s/\"Espressif Device\"/\"winchy-$ROLE\"/g" mpconfigport.h
-    sed -i 's/"Espressif Systems"/"Winchy"/g' mpconfigport.h
+    # (TinyUSB product-string seds retired with the CDC itself: the JTAG
+    # interface has fixed descriptors; boards are identified by MAC serial.)
 fi
 
 echo ">> building firmware (frozen manifest: $(basename "$MANIFEST"), user C modules)"
