@@ -23,6 +23,7 @@
 # pinout below, decodes live TELEMETRY frames from the rope unit, OLED works.
 # Deploy protocol.py (from firmware/shared/) alongside this file.
 
+import framebuf
 import os
 import struct
 import time
@@ -304,14 +305,73 @@ cross_last_cmd_ts = 0     # ticks_ms of that CMD; the dedup EXPIRES
                           # peer's reused nonce still triggers an upload
 
 
+# --- OLED drawing kit (Meshtastic-style) -----------------------------------
+# The stock 8x8 framebuf font is too small to read at arm's length on a winch,
+# so the numbers the driver actually steers by are drawn at 2x. The screen is
+# laid out like Meshtastic's: an INVERTED title bar (white background, black
+# text) carrying the mode plus status icons, and the payload below it.
+_HDR_H = 13                        # title bar height in px
+
+# 8x8 icons, one byte per row, MSB = leftmost pixel.
+_ICON_GPS = (0x3C, 0x42, 0x99, 0xA5, 0xA5, 0x99, 0x42, 0x3C)   # satellite/globe
+_ICON_LINK = (0x00, 0x3C, 0x42, 0x99, 0x24, 0x42, 0x18, 0x00)  # link/antenna
+
+_CHAR_BUF = bytearray(8)           # one 8x8 glyph, MONO_HLSB -> 1 byte/row
+_CHAR_FB = framebuf.FrameBuffer(_CHAR_BUF, 8, 8, framebuf.MONO_HLSB)
+
+
+def _text2(s, x, y, col=1):
+    """Draw the 8x8 font at 2x scale (16x16 per character)."""
+    for i, ch in enumerate(s):
+        _CHAR_FB.fill(0)
+        _CHAR_FB.text(ch, 0, 0, 1)
+        bx = x + i * 16
+        for row in range(8):
+            bits = _CHAR_BUF[row]
+            if not bits:
+                continue
+            for bit in range(8):
+                if bits & (0x80 >> bit):
+                    display.fill_rect(bx + bit * 2, y + row * 2, 2, 2, col)
+
+
+def _icon(rows, x, y, col=1):
+    for r, bits in enumerate(rows):
+        for bit in range(8):
+            if bits & (0x80 >> bit):
+                display.pixel(x + bit, y + r, col)
+
+
+def _header(title):
+    """Inverted title bar: white background, black title and status icons.
+
+    Right-hand side, right to left: "I" when winchy-logs is reachable, the
+    winch's own satellite count, and the GPS icon (struck through while the
+    winch has no fix - the operator needs to know the geometry is blind).
+    """
+    display.fill_rect(0, 0, 128, _HDR_H, 1)
+    display.text(title, 2, 3, 0)
+    x = 128
+    if online:                              # winchy-logs reachable
+        x -= 8
+        display.text("I", x, 3, 0)
+    sats = "%d" % gps_sats
+    x -= len(sats) * 8
+    display.text(sats, x, 3, 0)
+    x -= 10
+    _icon(_ICON_GPS, x, 3, 0)
+    if not gps_has_fix:
+        display.line(x, 3, x + 7, 10, 0)    # struck through = no fix
+
+
 def _begin_upload(what):
     global uploading
     uploading = True
     try:
         display.fill(0)
-        display.text("WiFi upload:", 0, 8)
-        display.text(what, 0, 24)
-        display.text("display pauses", 0, 44)
+        _header("UPLOAD")
+        _text2("WiFi", 0, 18)
+        display.text(what, 0, 38)
         display.text("back shortly...", 0, 54)
         display.show()
     except Exception:
@@ -333,27 +393,30 @@ def _end_upload():
 
 
 def show_telemetry(msg):
+    # Launch screen: phase in the title bar, then the two numbers the winch
+    # driver steers by (glider speed, cable force) at 2x, then a status line.
     global blink
     blink += 1
     display.fill(0)
-    # Top line: phase left, glider speed (km/h) right-aligned.
-    display.text(protocol.PHASE_NAMES.get(msg["phase"], "?"), 0, 0)
-    spd = "%.0f" % (msg["glider_speed_ms"] * 3.6)
-    right = 120 if online else 128             # leave the last cell for the "I"
-    display.text(spd, right - len(spd) * 8, 0)  # 8 px/char, 128 px wide
-    if online:                                  # winchy-logs reachable
-        display.text("I", 120, 0)
-    unit = "cnt" if msg["flags"] & protocol.FLAG_FORCE_UNCALIBRATED else "N"
-    display.text("F: {} {}".format(msg["force"], unit), 0, 14)
-    display.text("Angle: {:.1f}".format(msg["angle_deg"]), 0, 26)
-    display.text("Alt: {} m".format(msg["altitude_m"]), 0, 38)
-    # Bottom line shows link info, but while the rope reports a low battery it
-    # alternates with a warning so the operator can't miss it.
+    _header(protocol.PHASE_NAMES.get(msg["phase"], "?"))
+    _text2("%.0fkm/h" % (msg["glider_speed_ms"] * 3.6), 0, 16)
+    # 2x costs 16 px per character, so the force line has to stay <= 8 chars:
+    # calibrated newtons fit as-is, but raw ADC counts run six digits
+    # (-107829 in the field logs) and are shown in thousands instead.
+    if msg["flags"] & protocol.FLAG_FORCE_UNCALIBRATED:
+        force_txt = "%dk" % (msg["force"] // 1000)
+    else:
+        force_txt = "%dN" % msg["force"]
+    _text2(force_txt, 0, 34)
+    # Bottom line carries angle/altitude/link, but while the rope reports a low
+    # battery it alternates with a warning so the operator can't miss it.
     if (msg["flags"] & protocol.FLAG_BATTERY_LOW
             and (blink // WARN_BLINK_FRAMES) % 2 == 0):
         bottom = "!BATT LOW {:.1f}V".format(msg["batt_v"])
     else:
-        bottom = "rx{} l{} {}dBm".format(received, lost, last_rssi)
+        # 16 chars max at 8 px/char: "A45 H1200 -120dB" is the worst case.
+        bottom = "A{:.0f} H{} {}dB".format(
+            msg["angle_deg"], msg["altitude_m"], last_rssi)
     display.text(bottom, 0, 54)
     display.show()
 
@@ -434,18 +497,16 @@ def _show_survey():
     # OLED screen shown while no telemetry is arriving, so the operator can
     # watch the GPS lock and the survey converge.
     display.fill(0)
-    display.text("WINCH GPS", 0, 0)
-    if online:                                  # winchy-logs reachable
-        display.text("I", 120, 0)
-    display.text("sat %d  %s" % (gps_sats, "FIX" if gps_has_fix else "no fix"),
-                 0, 14)
+    _header("WINCH GPS")
     if survey.lat is None:
-        display.text("waiting for fix", 0, 34)
+        # The satellite count already sits in the title bar; the big line says
+        # what the operator must wait for.
+        _text2("NO FIX", 0, 20)
+        display.text("waiting for fix", 0, 54)
     else:
         acc = survey.accuracy_m
-        display.text("n=%d" % survey.n, 0, 26)
-        display.text("acc %s m" % ("--" if acc == float("inf")
-                                   else "%.1f" % acc), 0, 38)
+        _text2("%s m" % ("--" if acc == float("inf") else "%.1f" % acc), 0, 18)
+        display.text("n=%d" % survey.n, 0, 40)
         display.text("SURVEYED" if survey.converged else "surveying...", 0, 54)
     display.show()
 
