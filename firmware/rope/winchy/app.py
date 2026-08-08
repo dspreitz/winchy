@@ -2003,16 +2003,29 @@ def run():
                   dout=config.ADS_DOUT, gain0=config.ADS_GAIN0,
                   gain1=config.ADS_GAIN1, gain=config.ADS_GAIN,
                   speed=config.ADS_SPEED)
-    if config.ADS_SPEED is not None:
-        adc.set_speed(config.ADS_SPEED_HZ)
-        print("Force ADC data rate %d SPS" % config.ADS_SPEED_HZ)
-    try:
-        adc.calibrate_offset()   # zero the ADC internal offset before taring
-        print("Force ADC offset-calibrated")
-    except OSError as e:
-        print("Force ADC offset cal skipped:", e)
-    state.force_offset = adc.tare()
-    print("Force ADC tared, offset", state.force_offset)
+    # Boot must survive a missing/disconnected load cell: force sensing is one
+    # channel, not a precondition for flying the rest of the unit (telemetry,
+    # geometry, logging). force_task already tolerates read timeouts.
+    if not adc.present:
+        state.force_offset = 0
+        print("Force ADC absent - continuing without force sensing")
+        _event("force ADC absent")
+    else:
+        if config.ADS_SPEED is not None:
+            adc.set_speed(config.ADS_SPEED_HZ)
+            print("Force ADC data rate %d SPS" % config.ADS_SPEED_HZ)
+        try:
+            adc.calibrate_offset()   # zero the ADC internal offset before taring
+            print("Force ADC offset-calibrated")
+        except OSError as e:
+            print("Force ADC offset cal skipped:", e)
+        try:
+            state.force_offset = adc.tare()
+            print("Force ADC tared, offset", state.force_offset)
+        except OSError as e:
+            state.force_offset = 0
+            print("Force ADC tare failed, force uncalibrated:", e)
+            _event("force ADC tare failed")
 
     # --- Display
     display = sh1106.SH1106_I2C(config.OLED_WIDTH, config.OLED_HEIGHT,

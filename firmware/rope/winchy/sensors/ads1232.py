@@ -48,7 +48,35 @@ class ADS1232:
         self._pdwn.value(1)  # wake from power-down
         self._sclk.value(0)
         self.set_gain(gain)
-        self._dout.irq(trigger=Pin.IRQ_FALLING, handler=self._on_drdy)
+        # Arm DRDY only once the line looks like a converter. With no
+        # daughterboard attached DOUT floats and chatters, and IRQ_FALLING on a
+        # chattering pin buries the scheduler in interrupts: the app hangs
+        # right here at boot with no traceback and no crash.log, so main.py's
+        # crash guard never fires and the unit sits mute forever (found on a
+        # bare board 2026-08-08). A loose load-cell cable in the field would
+        # do exactly the same.
+        self.present = self._probe()
+        if self.present:
+            self._dout.irq(trigger=Pin.IRQ_FALLING, handler=self._on_drdy)
+        else:
+            print("ADS1232 not detected (DOUT chattering) - force disabled")
+
+    def _probe(self, window_ms=200, max_edges=20):
+        """True when DOUT behaves like a converter rather than a floating pin.
+
+        A real ADS1232 at 10-80 SPS changes DOUT a handful of times per window;
+        an unconnected input picks up noise and flips far more often.
+        """
+        edges = 0
+        last = self._dout.value()
+        deadline = time.ticks_add(time.ticks_ms(), window_ms)
+        while time.ticks_diff(deadline, time.ticks_ms()) > 0:
+            v = self._dout.value()
+            if v != last:
+                edges += 1
+                last = v
+            time.sleep_ms(1)
+        return edges <= max_edges
 
     def _on_drdy(self, _pin):
         self._ready = True
