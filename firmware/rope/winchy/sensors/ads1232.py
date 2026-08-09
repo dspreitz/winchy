@@ -138,6 +138,14 @@ class ADS1232:
     async def aread_raw(self, timeout_ms=250):
         """One signed 24-bit conversion, yielding to other tasks while the
         conversion completes. Raises asyncio.TimeoutError if DRDY stays away."""
+        # Guarantee a yield on EVERY call. When DOUT is already low the loop
+        # below never awaits, and force_task's `while True` then spins without
+        # ever handing control back - starving the entire asyncio runtime.
+        # That is what an unconnected (or stuck-low) DOUT line does: the app
+        # reaches "Starting asyncio runtime" and goes completely mute, no
+        # telemetry, no WiFi, no prints, no crash to reboot from. Reproduced
+        # on a bare board 2026-08-09 by pulling the ADS1232 daughterboard.
+        await asyncio.sleep_ms(0)
         # A stale flag (set by a previous shift's DOUT edges) returns
         # immediately while DOUT is still high, so wait again on the cleared
         # flag for the genuine DRDY edge.
