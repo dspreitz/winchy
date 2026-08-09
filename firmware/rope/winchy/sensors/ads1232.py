@@ -61,22 +61,26 @@ class ADS1232:
         else:
             print("ADS1232 not detected (DOUT chattering) - force disabled")
 
-    def _probe(self, window_ms=200, max_edges=20):
+    def _count_irq(self, _pin):
+        self._irq_n += 1
+
+    def _probe(self, window_ms=200, max_irqs=40):
         """True when DOUT behaves like a converter rather than a floating pin.
 
-        A real ADS1232 at 10-80 SPS changes DOUT a handful of times per window;
-        an unconnected input picks up noise and flips far more often.
+        Measures the thing that actually hurts: how often DOUT delivers a
+        falling edge. A real ADS1232 gives at most ~16 in 200 ms (80 SPS); an
+        unconnected line chatters far more and buries the scheduler. Polling
+        the pin level instead proved unreliable - a floating line can sit
+        quiet for the length of the window and still storm later (board 2,
+        2026-08-08), so the interrupt itself is armed with a minimal counting
+        handler and disarmed again before the verdict.
         """
-        edges = 0
-        last = self._dout.value()
-        deadline = time.ticks_add(time.ticks_ms(), window_ms)
-        while time.ticks_diff(deadline, time.ticks_ms()) > 0:
-            v = self._dout.value()
-            if v != last:
-                edges += 1
-                last = v
-            time.sleep_ms(1)
-        return edges <= max_edges
+        self._irq_n = 0
+        self._dout.irq(trigger=Pin.IRQ_FALLING, handler=self._count_irq)
+        time.sleep_ms(window_ms)
+        n = self._irq_n
+        self._dout.irq(handler=None)
+        return n <= max_irqs
 
     def _on_drdy(self, _pin):
         self._ready = True
