@@ -1,0 +1,43 @@
+# Winchy host workspace: pure, hardware-free crates (no_std) with host tests.
+# The ESP32-S3 firmware lives in ./firmware as a SEPARATE workspace (it needs
+# the Xtensa `esp` toolchain); it depends on these crates by path.
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+exclude = ["firmware"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/dspreitz/winchy"
+publish = false
+
+[workspace.dependencies]
+libm = "0.2"
+winchy-geo = { path = "crates/geo" }
+winchy-testkit = { path = "crates/testkit" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Embedded robustness: no hidden panics in firmware paths (allowed in tests
+# via clippy.toml).
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+dbg_macro = "warn"
+print_stdout = "warn"
+# Pedantic lints that fight deliberate fixed-point/wire-format code; every
+# lossy cast in this workspace is preceded by an explicit clamp.
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+module_name_repetitions = "allow"

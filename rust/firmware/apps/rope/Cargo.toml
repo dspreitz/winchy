@@ -1,0 +1,25 @@
+[package]
+name = "winchy-rope"
+description = "Winchy rope unit firmware (LilyGo T-Beam S3 Supreme)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "winchy-rope"
+harness = false
+
+[dependencies]
+esp-idf-svc.workspace = true
+log.workspace = true
+winchy-fusion.workspace = true
+winchy-gnss.workspace = true
+winchy-link.workspace = true
+winchy-protocol.workspace = true
+
+[build-dependencies]
+embuild.workspace = true
+
+[lints]
+workspace = true

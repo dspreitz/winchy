@@ -1,0 +1,18 @@
+[build]
+target = "xtensa-esp32s3-espidf"
+
+[target.xtensa-esp32s3-espidf]
+linker = "ldproxy"
+runner = "espflash flash --monitor"
+rustflags = ["--cfg", "espidf_time64"]
+
+[unstable]
+build-std = ["std", "panic_abort"]
+
+[env]
+MCU = "esp32s3"
+# ESP-IDF is downloaded and built by embuild into ./.embuild on first build.
+ESP_IDF_SDKCONFIG_DEFAULTS = "sdkconfig.defaults"
+
+[alias]
+lint = "clippy --workspace --all-targets -- -D warnings"

@@ -1,0 +1,42 @@
+# Winchy ESP32-S3 firmware workspace. Separate from ../Cargo.toml because it
+# builds with the Xtensa `esp` toolchain for xtensa-esp32s3-espidf; the pure
+# logic crates in ../crates are shared by path.
+[workspace]
+resolver = "3"
+members = ["apps/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[workspace.dependencies]
+esp-idf-svc = "0.53"
+log = "0.4"
+embuild = "0.33"
+winchy-fusion = { path = "../crates/fusion" }
+winchy-geo = { path = "../crates/geo" }
+winchy-gnss = { path = "../crates/gnss" }
+winchy-link = { path = "../crates/link" }
+winchy-protocol = { path = "../crates/protocol" }
+
+[workspace.lints.rust]
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+dbg_macro = "warn"
+
+[profile.release]
+opt-level = "s"
+debug = true
+
+[profile.dev]
+debug = true
+opt-level = "z"

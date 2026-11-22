@@ -1,0 +1,18 @@
+[package]
+name = "winchy-gnss"
+description = "u-blox UBX/NMEA protocol, survey-in and GNSS time decisions (no_std, no alloc)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+libm.workspace = true
+winchy-geo.workspace = true
+
+[dev-dependencies]
+winchy-testkit.workspace = true
+
+[lints]
+workspace = true

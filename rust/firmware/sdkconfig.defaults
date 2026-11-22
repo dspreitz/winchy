@@ -1,0 +1,8 @@
+# Rust std needs a larger main stack than the IDF default.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+# T-Beam S3 Supreme: 8 MB flash.
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+# Console + panic dumps on the native USB-Serial-JTAG port.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+# Watchdog: reset on a hung task instead of freezing silently.
+CONFIG_ESP_TASK_WDT_PANIC=y

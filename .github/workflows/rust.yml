@@ -1,0 +1,45 @@
+name: rust
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  # ---- Pure crates: format, lint, host tests --------------------------------
+  host:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - run: cargo fmt --all --check
+      - run: cargo lint
+      - run: cargo test --workspace
+
+  # ---- ESP32-S3 firmware: cross-build + lint ---------------------------------
+  firmware:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust/firmware
+    steps:
+      - uses: actions/checkout@v4
+      - uses: esp-rs/xtensa-toolchain@v1.6
+        with:
+          default: true
+          buildtargets: esp32s3
+          ldproxy: true
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/firmware
+      - run: cargo fmt --all --check
+      - run: cargo lint
+      - run: cargo build --release

@@ -1,0 +1,17 @@
+[package]
+name = "winchy-fusion"
+description = "Sensor fusion for the rope unit: rope angle, altitude, climb rate, glider speed, gyro bias"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+libm.workspace = true
+
+[dev-dependencies]
+winchy-testkit.workspace = true
+
+[lints]
+workspace = true
