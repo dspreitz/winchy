@@ -25,6 +25,7 @@ winchy-bmp280 = { path = "../crates/bmp280" }
 winchy-qmi8658 = { path = "../crates/qmi8658" }
 winchy-ads1232 = { path = "../crates/ads1232" }
 winchy-tbeam = { path = "../crates/tbeam" }
+winchy-sx126x = { path = "../crates/sx126x" }
 winchy-board = { path = "crates/board" }
 
 [workspace.lints.rust]

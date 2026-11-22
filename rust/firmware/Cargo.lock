@@ -1571,6 +1571,7 @@ dependencies = [
 name = "winchy-rope"
 version = "0.1.0"
 dependencies = [
+ "embedded-hal 1.0.0",
  "embuild",
  "esp-idf-svc",
  "log",
@@ -1579,6 +1580,14 @@ dependencies = [
  "winchy-board",
  "winchy-fusion",
  "winchy-qmi8658",
+ "winchy-sx126x",
+]
+
+[[package]]
+name = "winchy-sx126x"
+version = "0.1.0"
+dependencies = [
+ "embedded-hal 1.0.0",
 ]
 
 [[package]]

@@ -20,11 +20,13 @@ Rewrite of the MicroPython firmware in Rust (branch `rust`). Two workspaces:
 | `winchy-bmp280` | BMP280/BME280 barometer, bit-exact integer compensation | embedded-hal |
 | `winchy-qmi8658` | QMI8658 IMU over SPI, burst read | embedded-hal |
 | `winchy-ads1232` | ADS1232 force ADC, bit-banged | embedded-hal |
+| `winchy-sx126x` | SX1262 LoRa radio: init/calibration, TX, continuous RX, IRQ, packet status | embedded-hal |
 | `winchy-tbeam` | T-Beam S3 Supreme pin map + power profile (the only place with pin numbers) | axp2101 |
 | `winchy-testkit` | Seeded PRNG for simulation tests (dev only) | — |
 
 Firmware workspace: `winchy-board` turns the `winchy-tbeam` pin numbers into
-ESP-IDF drivers; `apps/rope` is currently a sensor bring-up diagnostic.
+ESP-IDF drivers; `apps/rope` is currently a bring-up diagnostic (sensors + a LoRa round trip
+with the unmodified MicroPython winch via a legacy v6 frame).
 
 Layering: logic crates never touch hardware. Drivers only see
 `embedded-hal` traits; only a board crate knows pins and PMU rails; the

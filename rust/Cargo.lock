@@ -107,6 +107,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "winchy-sx126x"
+version = "0.1.0"
+dependencies = [
+ "embedded-hal",
+ "embedded-hal-mock",
+]
+
+[[package]]
 name = "winchy-tbeam"
 version = "0.1.0"
 dependencies = [

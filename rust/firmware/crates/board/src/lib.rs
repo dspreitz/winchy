@@ -7,8 +7,8 @@
 use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::gpio::{AnyIOPin, Input, Output, PinDriver, Pull};
 use esp_idf_svc::hal::i2c::{I2C0, I2C1, I2cConfig, I2cDriver};
-use esp_idf_svc::hal::spi::config::{Config as SpiConfig, DriverConfig, MODE_3};
-use esp_idf_svc::hal::spi::{SPI2, SpiDeviceDriver, SpiDriver};
+use esp_idf_svc::hal::spi::config::{Config as SpiConfig, DriverConfig, MODE_0, MODE_3};
+use esp_idf_svc::hal::spi::{SPI2, SPI3, SpiDeviceDriver, SpiDriver};
 use esp_idf_svc::hal::units::Hertz;
 use esp_idf_svc::sys::EspError;
 use winchy_axp2101::Axp2101;
@@ -51,7 +51,24 @@ pub struct RopeBoard {
     pub imu_spi: SpiDeviceDriver<'static, SpiDriver<'static>>,
     /// Force ADC pins.
     pub ads: AdsPins,
+    /// SX1262 radio bus and control pins.
+    pub lora: LoraPins,
 }
+
+/// SX1262 SPI device and control pins.
+pub struct LoraPins {
+    /// SPI device (mode 0, CS handled by the driver).
+    pub spi: SpiDeviceDriver<'static, SpiDriver<'static>>,
+    /// BUSY input.
+    pub busy: PinDriver<'static, Input>,
+    /// RESET output (active low).
+    pub reset: PinDriver<'static, Output>,
+    /// DIO1 interrupt input.
+    pub dio1: PinDriver<'static, Input>,
+}
+
+/// SX1262 SPI clock (same as the proven MicroPython setup).
+const LORA_SPI_HZ: u32 = 2_000_000;
 
 /// One GPIO by number.
 fn io(n: u8) -> AnyIOPin<'static> {
@@ -70,6 +87,7 @@ impl RopeBoard {
         i2c0: I2C0<'static>,
         i2c1: I2C1<'static>,
         spi2: SPI2<'static>,
+        spi3: SPI3<'static>,
     ) -> Result<Self, BoardError> {
         let pmu_bus = I2cDriver::new(
             i2c1,
@@ -112,11 +130,32 @@ impl RopeBoard {
             gain1: PinDriver::output(io(pins::ads1232::GAIN1))?,
         };
 
+        let lora_bus = SpiDriver::new(
+            spi3,
+            io(pins::lora::SCK),
+            io(pins::lora::MOSI),
+            Some(io(pins::lora::MISO)),
+            &DriverConfig::new(),
+        )?;
+        let lora = LoraPins {
+            spi: SpiDeviceDriver::new(
+                lora_bus,
+                Some(io(pins::lora::CS)),
+                &SpiConfig::new()
+                    .baudrate(Hertz(LORA_SPI_HZ))
+                    .data_mode(MODE_0),
+            )?,
+            busy: PinDriver::input(io(pins::lora::BUSY), Pull::Floating)?,
+            reset: PinDriver::output(io(pins::lora::RESET))?,
+            dio1: PinDriver::input(io(pins::lora::DIO1), Pull::Floating)?,
+        };
+
         Ok(Self {
             pmu,
             sensor_i2c,
             imu_spi,
             ads,
+            lora,
         })
     }
 }

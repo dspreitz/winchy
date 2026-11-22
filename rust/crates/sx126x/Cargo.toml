@@ -1,0 +1,17 @@
+[package]
+name = "winchy-sx126x"
+description = "Semtech SX1262 LoRa radio driver over embedded-hal SPI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+embedded-hal.workspace = true
+
+[dev-dependencies]
+embedded-hal-mock.workspace = true
+
+[lints]
+workspace = true

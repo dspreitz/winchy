@@ -8,6 +8,7 @@ use winchy_bmp280::Bmp280;
 use winchy_board::RopeBoard;
 use winchy_fusion::attitude::rope_angle_above_ground_deg;
 use winchy_qmi8658::Qmi8658;
+use winchy_sx126x::{ChipConfig, IrqFlags, LoraConfig, Sx126x};
 
 fn main() {
     esp_idf_svc::sys::link_patches();
@@ -18,7 +19,7 @@ fn main() {
         log::error!("peripherals already taken");
         return;
     };
-    let mut board = match RopeBoard::init(p.i2c0, p.i2c1, p.spi2) {
+    let mut board = match RopeBoard::init(p.i2c0, p.i2c1, p.spi2, p.spi3) {
         Ok(b) => b,
         Err(e) => {
             log::error!("board init failed: {e:?}");
@@ -31,11 +32,13 @@ fn main() {
         sensor_i2c,
         imu_spi,
         ads,
+        lora,
         ..
     } = board;
     report_baro(sensor_i2c);
     report_imu(imu_spi);
     report_force(ads);
+    radio_round_trip(lora);
     log::info!("bring-up done");
 }
 
@@ -136,4 +139,106 @@ fn report_force(pins: winchy_board::AdsPins) {
         let r = esp_idf_svc::hal::interrupt::free(|| adc.read_raw());
         log::info!("ADS1232: raw {r:?} (after {waited} ms)");
     }
+}
+
+/// Legacy (MicroPython protocol v6) TELEMETRY frame with `REQUEST_REPORT`, so
+/// the unmodified winch answers with a v6 `LINK_REPORT`. Test-only.
+fn legacy_v6_telemetry(seq: u16) -> [u8; 17] {
+    let mut f = [0u8; 17];
+    f[0] = 6; // version
+    f[1] = 1; // TELEMETRY
+    f[2..4].copy_from_slice(&seq.to_le_bytes());
+    // phase 0, force 0, angle 0, altitude 0, battery 0
+    f[13] = 0x08 | 0x01; // flags: REQUEST_REPORT | FORCE_UNCALIBRATED
+    f[14] = 255; // battery percent unknown
+    f
+}
+
+fn radio_round_trip(p: winchy_board::LoraPins) {
+    let mut radio = Sx126x::new(p.spi, p.busy, p.reset, Ets);
+    if let Err(e) = radio.init(&ChipConfig::LILYGO, &LoraConfig::WINCHY) {
+        log::error!("SX1262 init: {e:?}");
+        return;
+    }
+    log::info!("SX1262: initialised (869.525 MHz SF7 BW250 CR4/8 sync 0x12)");
+    let mut dio1 = p.dio1;
+    let mut buf = [0u8; 255];
+    let (mut sent, mut replies) = (0u16, 0u32);
+    for seq in 0..6u16 {
+        if let Err(e) = radio.transmit(&legacy_v6_telemetry(seq)) {
+            log::error!("SX1262 tx: {e:?}");
+            return;
+        }
+        if !wait_irq(&mut radio, &mut dio1, IrqFlags::TX_DONE, 500) {
+            log::warn!("SX1262: no TX_DONE");
+            continue;
+        }
+        sent += 1;
+        let _ = radio.receive_continuous();
+        // Listen ~1.5 s for the winch's answer.
+        for _ in 0..300 {
+            FreeRtos::delay_ms(5);
+            if dio1.is_low() {
+                continue;
+            }
+            let Ok(flags) = radio.irq_status() else {
+                continue;
+            };
+            let _ = radio.clear_irq(flags);
+            if !flags.any(IrqFlags::RX_DONE) {
+                continue;
+            }
+            match radio.read_packet(&mut buf) {
+                Ok(info) => {
+                    let f = &buf[..info.len];
+                    let crc_ok = !flags.any(IrqFlags::CRC_ERR);
+                    log::info!(
+                        "SX1262 rx: {} B, rssi {} dBm, snr {} qdB, crc_ok {crc_ok}, bytes {:02x?}",
+                        info.len,
+                        info.status.rssi_dbm,
+                        info.status.snr_qdb,
+                        f
+                    );
+                    if crc_ok && f.len() == 8 && f[0] == 6 && f[1] == 5 {
+                        replies += 1;
+                        log::info!(
+                            "  winch LINK_REPORT: our frame arrived with rssi {} dBm, snr {} qdB, loss {} %",
+                            i16::from_le_bytes([f[4], f[5]]),
+                            i8::from_le_bytes([f[6]]),
+                            f[7]
+                        );
+                    }
+                }
+                Err(e) => log::error!("SX1262 read: {e:?}"),
+            }
+            break;
+        }
+    }
+    log::info!("SX1262: sent {sent}, winch replies {replies}");
+}
+
+fn wait_irq<S, B, R, D, PE>(
+    radio: &mut Sx126x<S, B, R, D>,
+    dio1: &mut esp_idf_svc::hal::gpio::PinDriver<'static, esp_idf_svc::hal::gpio::Input>,
+    want: u16,
+    timeout_ms: u32,
+) -> bool
+where
+    S: embedded_hal::spi::SpiDevice,
+    B: embedded_hal::digital::InputPin<Error = PE>,
+    R: embedded_hal::digital::OutputPin<Error = PE>,
+    D: embedded_hal::delay::DelayNs,
+{
+    for _ in 0..timeout_ms {
+        if dio1.is_high()
+            && let Ok(f) = radio.irq_status()
+        {
+            let _ = radio.clear_irq(f);
+            if f.any(want) {
+                return true;
+            }
+        }
+        FreeRtos::delay_ms(1);
+    }
+    false
 }
