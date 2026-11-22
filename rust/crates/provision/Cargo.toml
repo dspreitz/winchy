@@ -1,0 +1,11 @@
+[package]
+name = "winchy-provision"
+description = "Device provisioning: secret/config key registry and USB console command parser"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

@@ -27,6 +27,8 @@ winchy-ads1232 = { path = "../crates/ads1232" }
 winchy-tbeam = { path = "../crates/tbeam" }
 winchy-sx126x = { path = "../crates/sx126x" }
 winchy-board = { path = "crates/board" }
+winchy-settings = { path = "crates/settings" }
+winchy-provision = { path = "../crates/provision" }
 
 [workspace.lints.rust]
 missing_docs = "warn"

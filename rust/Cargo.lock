@@ -99,6 +99,10 @@ name = "winchy-protocol"
 version = "0.1.0"
 
 [[package]]
+name = "winchy-provision"
+version = "0.1.0"
+
+[[package]]
 name = "winchy-qmi8658"
 version = "0.1.0"
 dependencies = [

@@ -1576,6 +1576,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "winchy-provision"
+version = "0.1.0"
+
+[[package]]
 name = "winchy-qmi8658"
 version = "0.1.0"
 dependencies = [
@@ -1595,8 +1599,19 @@ dependencies = [
  "winchy-board",
  "winchy-fusion",
  "winchy-gnss",
+ "winchy-provision",
  "winchy-qmi8658",
+ "winchy-settings",
  "winchy-sx126x",
+]
+
+[[package]]
+name = "winchy-settings"
+version = "0.1.0"
+dependencies = [
+ "esp-idf-svc",
+ "log",
+ "winchy-provision",
 ]
 
 [[package]]

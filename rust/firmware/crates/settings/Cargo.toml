@@ -1,0 +1,15 @@
+[package]
+name = "winchy-settings"
+description = "NVS-backed settings store and USB-console provisioning for Winchy units"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+esp-idf-svc.workspace = true
+log.workspace = true
+winchy-provision.workspace = true
+
+[lints]
+workspace = true

@@ -4,6 +4,7 @@
 //! buffers or fixed-size internal state.
 #![cfg_attr(not(test), no_std)]
 
+pub mod assistnow;
 pub mod baud;
 pub mod detect;
 pub mod nmea;

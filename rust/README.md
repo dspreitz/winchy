@@ -22,9 +22,11 @@ Rewrite of the MicroPython firmware in Rust (branch `rust`). Two workspaces:
 | `winchy-ads1232` | ADS1232 force ADC, bit-banged | embedded-hal |
 | `winchy-sx126x` | SX1262 LoRa radio: init/calibration, TX, continuous RX, IRQ, packet status | embedded-hal |
 | `winchy-tbeam` | T-Beam S3 Supreme pin map + power profile (the only place with pin numbers) | axp2101 |
+| `winchy-provision` | Settings/secret key registry + USB console commands (secrets never echoed) | — |
 | `winchy-testkit` | Seeded PRNG for simulation tests (dev only) | — |
 
-Firmware workspace: `winchy-board` turns the `winchy-tbeam` pin numbers into
+Firmware workspace: `winchy-settings` stores provisioned values in NVS and
+runs the USB console; `winchy-board` turns the `winchy-tbeam` pin numbers into
 ESP-IDF drivers; `apps/rope` is currently a bring-up diagnostic (sensors, a LoRa round trip
 with the unmodified MicroPython winch via a legacy v6 frame, GNSS baud
 discovery + NAV-PVT + PPS labelling).
@@ -49,5 +51,21 @@ cd rust/firmware
 cargo build --release
 cargo run --release   # flash + serial monitor via espflash
 ```
+
+## Provisioning secrets (WiFi, AssistNow token, GitHub token)
+
+Secrets are never compiled into the image. They are typed once into the USB
+console and stored in NVS (namespace `winchy`); they survive reflashing the app.
+
+```sh
+espflash monitor --port /dev/cu.usbmodemXXXX   # wait for "winchy console"
+> set ztp_token <your Thingstream device-profile token>
+> set wifi1_ssid My Network
+> set wifi1_pass ********
+> list                                          # secrets show only their length
+```
+
+Keys: `ztp_token`, `ztp_url` (optional override), `github_token`,
+`wifi1_ssid`/`wifi1_pass` ... `wifi4_*` (slot number = priority).
 
 Toolchain setup (once): `cargo install espup espflash ldproxy --locked && espup install --targets esp32s3`.

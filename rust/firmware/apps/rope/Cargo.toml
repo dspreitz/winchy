@@ -21,6 +21,8 @@ winchy-fusion.workspace = true
 winchy-gnss.workspace = true
 winchy-qmi8658.workspace = true
 winchy-sx126x.workspace = true
+winchy-settings.workspace = true
+winchy-provision.workspace = true
 
 [build-dependencies]
 embuild.workspace = true

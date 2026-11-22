@@ -15,6 +15,10 @@ pub mod msg {
     pub const CFG_VALSET: (u8, u8) = (0x06, 0x8A);
     /// UBX-MGA-INI.
     pub const MGA_INI: (u8, u8) = (0x13, 0x40);
+    /// UBX-SEC-UNIQID (receiver unique id, for AssistNow ZTP).
+    pub const SEC_UNIQID: (u8, u8) = (0x27, 0x03);
+    /// UBX-MON-VER (firmware/hardware version, for AssistNow ZTP).
+    pub const MON_VER: (u8, u8) = (0x0A, 0x04);
 }
 
 /// Output buffer too small for the message.

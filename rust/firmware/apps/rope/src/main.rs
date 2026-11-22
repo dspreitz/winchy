@@ -19,6 +19,16 @@ fn main() {
         log::error!("peripherals already taken");
         return;
     };
+    let mut store = match esp_idf_svc::nvs::EspDefaultNvsPartition::take()
+        .and_then(winchy_settings::NvsStore::open)
+    {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("NVS: {e:?}");
+            return;
+        }
+    };
+    report_settings(&mut store);
     let mut board = match RopeBoard::init(p.i2c0, p.i2c1, p.spi2, p.spi3, p.uart1) {
         Ok(b) => b,
         Err(e) => {
@@ -42,6 +52,25 @@ fn main() {
     radio_round_trip(lora);
     gnss_bring_up(gnss);
     log::info!("bring-up done");
+
+    let mut console = winchy_settings::Console::new();
+    console.greet();
+    loop {
+        console.poll(&mut store, 20);
+    }
+}
+
+fn report_settings(store: &mut winchy_settings::NvsStore) {
+    use winchy_provision::{Key, Shown, Store, show};
+    let mut buf = [0u8; winchy_provision::MAX_VALUE_LEN];
+    let token = match store.get(Key::ZtpToken, &mut buf) {
+        Ok(v) => show(Key::ZtpToken, v),
+        Err(e) => {
+            log::warn!("settings: {e:?}");
+            Shown::Unset
+        }
+    };
+    log::info!("settings: AssistNow token {token:?}");
 }
 
 fn report_pmu(board: &mut RopeBoard) {
@@ -291,8 +320,8 @@ fn gnss_send(
     }
 }
 
-/// Long enough for the GPS UTC parameters (broadcast every 12.5 min).
-const GNSS_TEST_S: u64 = 900;
+/// GNSS section duration (raise to ~900 s to wait for UTC parameters + PPS).
+const GNSS_TEST_S: u64 = 30;
 
 /// Runs the baud discovery state machine against the real UART.
 fn gnss_find_baud(uart: &esp_idf_svc::hal::uart::UartDriver<'static>) -> u32 {
