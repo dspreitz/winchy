@@ -3,7 +3,7 @@
 # the Xtensa `esp` toolchain); it depends on these crates by path.
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = ["crates/*", "tools/*"]
 exclude = ["firmware"]
 
 [workspace.package]

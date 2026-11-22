@@ -1,0 +1,16 @@
+[package]
+name = "winchy-console"
+description = "Host-side serial console for provisioning Winchy units (exit, hidden secret entry)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rpassword = "7.5"
+serialport = { version = "4.10", default-features = false }
+winchy-provision = { path = "../../crates/provision" }
+
+[lints]
+workspace = true

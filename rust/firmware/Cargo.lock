@@ -1576,6 +1576,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "winchy-net"
+version = "0.1.0"
+
+[[package]]
+name = "winchy-net-esp"
+version = "0.1.0"
+dependencies = [
+ "esp-idf-svc",
+ "log",
+ "winchy-net",
+]
+
+[[package]]
 name = "winchy-provision"
 version = "0.1.0"
 
@@ -1599,9 +1612,11 @@ dependencies = [
  "winchy-board",
  "winchy-fusion",
  "winchy-gnss",
+ "winchy-net-esp",
  "winchy-provision",
  "winchy-qmi8658",
  "winchy-settings",
+ "winchy-storage",
  "winchy-sx126x",
 ]
 
@@ -1612,6 +1627,15 @@ dependencies = [
  "esp-idf-svc",
  "log",
  "winchy-provision",
+]
+
+[[package]]
+name = "winchy-storage"
+version = "0.1.0"
+dependencies = [
+ "esp-idf-svc",
+ "log",
+ "winchy-gnss",
 ]
 
 [[package]]

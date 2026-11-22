@@ -33,6 +33,29 @@ impl NvsStore {
     }
 }
 
+impl NvsStore {
+    /// Reads a device-internal value (not a console key, e.g. the AssistNow
+    /// chipcode the receiver registration returned).
+    ///
+    /// # Errors
+    /// NVS errors.
+    pub fn get_internal<'b>(
+        &self,
+        name: &str,
+        buf: &'b mut [u8],
+    ) -> Result<Option<&'b str>, EspError> {
+        self.nvs.get_str(name, buf)
+    }
+
+    /// Stores a device-internal value.
+    ///
+    /// # Errors
+    /// NVS errors.
+    pub fn set_internal(&self, name: &str, value: &str) -> Result<(), EspError> {
+        self.nvs.set_str(name, value)
+    }
+}
+
 impl Store for NvsStore {
     type Error = EspError;
 
@@ -72,17 +95,16 @@ impl Console {
         }
     }
 
-    /// Writes `text`, turning `\n` into `\r\n` for terminals.
+    /// Writes `text` (the console VFS already turns `\n` into `\r\n`).
     fn write(text: &str) {
         let mut out = std::io::stdout().lock();
-        for part in text.split_inclusive('\n') {
-            let (body, nl) = part.strip_suffix('\n').map_or((part, false), |b| (b, true));
-            let _ = out.write_all(body.as_bytes());
-            if nl {
-                let _ = out.write_all(b"\r\n");
-            }
-        }
+        let _ = out.write_all(text.as_bytes());
         let _ = out.flush();
+        drop(out);
+        // Without the driver the USB-Serial-JTAG VFS only pushes its TX FIFO
+        // on '\n'; fsync sends single echoed characters immediately.
+        // SAFETY: fsync on fd 1 (stdout) has no memory-safety preconditions.
+        unsafe { esp_idf_svc::sys::fsync(1) };
     }
 
     /// Reads pending input (sleeping `idle_ms` if there is none) and executes

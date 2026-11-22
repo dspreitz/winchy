@@ -22,6 +22,8 @@ winchy-gnss.workspace = true
 winchy-qmi8658.workspace = true
 winchy-sx126x.workspace = true
 winchy-settings.workspace = true
+winchy-storage.workspace = true
+winchy-net-esp.workspace = true
 winchy-provision.workspace = true
 
 [build-dependencies]

@@ -57,12 +57,20 @@ cargo run --release   # flash + serial monitor via espflash
 Secrets are never compiled into the image. They are typed once into the USB
 console and stored in NVS (namespace `winchy`); they survive reflashing the app.
 
+Use the bundled console (it keeps DTR/RTS low - with DTR asserted the
+native USB port stays silent, which is why `espflash monitor`'s interactive
+mode shows nothing):
+
 ```sh
-espflash monitor --port /dev/cu.usbmodemXXXX   # wait for "winchy console"
-> set ztp_token <your Thingstream device-profile token>
+cd rust
+cargo run -p winchy-console -- /dev/cu.usbmodemXXXX   # no port: lists Espressif ports
 > set wifi1_ssid My Network
-> set wifi1_pass ********
-> list                                          # secrets show only their length
+> set wifi1_pass                 # no value: asks with hidden input
+wifi1_pass (hidden):
+> set ztp_token                  # Thingstream AssistNow device-profile token
+ztp_token (hidden):
+> list                           # secrets show only their length
+> exit
 ```
 
 Keys: `ztp_token`, `ztp_url` (optional override), `github_token`,

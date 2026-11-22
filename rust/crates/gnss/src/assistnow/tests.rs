@@ -132,3 +132,38 @@ fn http_date() {
         "invalid day"
     );
 }
+
+#[test]
+fn crc32_check_value() {
+    assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+    assert_eq!(crc32(b""), 0);
+}
+
+#[test]
+fn cache_header_roundtrip_and_verify() {
+    let blob = b"\xb5\x62\x13\x20 predicted orbits";
+    let h = CacheHeader::for_blob(blob, 1_795_355_578);
+    assert_eq!(h.len as usize, blob.len());
+    let bytes = h.encode();
+    assert_eq!(&bytes[..4], &CACHE_MAGIC.to_le_bytes());
+    assert_eq!(CacheHeader::decode(&bytes), Some(h));
+    assert!(h.verifies(blob));
+    let mut corrupt = blob.to_vec();
+    corrupt[5] ^= 1;
+    assert!(!h.verifies(&corrupt));
+    assert!(!h.verifies(&blob[..blob.len() - 1]));
+}
+
+#[test]
+fn cache_header_rejects_erased_and_foreign_data() {
+    assert_eq!(
+        CacheHeader::decode(&[0xFF; CacheHeader::SIZE]),
+        None,
+        "erased flash"
+    );
+    assert_eq!(CacheHeader::decode(&[0u8; CacheHeader::SIZE]), None);
+    assert_eq!(CacheHeader::decode(&[0u8; 10]), None, "short");
+    let mut b = CacheHeader::for_blob(b"x", 1).encode();
+    b[4] = 2; // unknown version
+    assert_eq!(CacheHeader::decode(&b), None);
+}

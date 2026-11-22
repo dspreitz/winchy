@@ -28,6 +28,9 @@ winchy-tbeam = { path = "../crates/tbeam" }
 winchy-sx126x = { path = "../crates/sx126x" }
 winchy-board = { path = "crates/board" }
 winchy-settings = { path = "crates/settings" }
+winchy-storage = { path = "crates/storage" }
+winchy-net = { path = "../crates/net" }
+winchy-net-esp = { path = "crates/net-esp" }
 winchy-provision = { path = "../crates/provision" }
 
 [workspace.lints.rust]

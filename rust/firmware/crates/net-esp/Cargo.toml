@@ -1,0 +1,15 @@
+[package]
+name = "winchy-net-esp"
+description = "WiFi (priority join, roaming, zombie probe), HTTPS and SNTP on ESP-IDF"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+esp-idf-svc.workspace = true
+log.workspace = true
+winchy-net.workspace = true
+
+[lints]
+workspace = true

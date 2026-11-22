@@ -1,6 +1,8 @@
 //! Winchy rope unit firmware. Currently a hardware bring-up diagnostic:
 //! power profile, then one round of readings from every sensor.
 
+mod assist;
+
 use esp_idf_svc::hal::delay::{Ets, FreeRtos};
 use esp_idf_svc::hal::peripherals::Peripherals;
 use winchy_ads1232::{Ads1232, Gain};
@@ -19,15 +21,21 @@ fn main() {
         log::error!("peripherals already taken");
         return;
     };
-    let mut store = match esp_idf_svc::nvs::EspDefaultNvsPartition::take()
-        .and_then(winchy_settings::NvsStore::open)
-    {
+    let (Ok(sysloop), Ok(nvs_part)) = (
+        esp_idf_svc::eventloop::EspSystemEventLoop::take(),
+        esp_idf_svc::nvs::EspDefaultNvsPartition::take(),
+    ) else {
+        log::error!("event loop / NVS partition unavailable");
+        return;
+    };
+    let mut store = match winchy_settings::NvsStore::open(nvs_part.clone()) {
         Ok(s) => s,
         Err(e) => {
             log::error!("NVS: {e:?}");
             return;
         }
     };
+    let modem = p.modem;
     report_settings(&mut store);
     let mut board = match RopeBoard::init(p.i2c0, p.i2c1, p.spi2, p.spi3, p.uart1) {
         Ok(b) => b,
@@ -50,7 +58,8 @@ fn main() {
     report_imu(imu_spi);
     report_force(ads);
     radio_round_trip(lora);
-    gnss_bring_up(gnss);
+    gnss_bring_up(&gnss);
+    network_bring_up(&gnss, &mut store, modem, sysloop, nvs_part.clone());
     log::info!("bring-up done");
 
     let mut console = winchy_settings::Console::new();
@@ -357,15 +366,15 @@ fn gnss_find_baud(uart: &esp_idf_svc::hal::uart::UartDriver<'static>) -> u32 {
     }
 }
 
-fn gnss_bring_up(g: winchy_board::GnssPins) {
+fn gnss_bring_up(g: &winchy_board::GnssPins) {
     use esp_idf_svc::hal::delay::TickType;
     use winchy_gnss::time::{ClockSource, PpsDiscipline, TimeAction, TimeFix};
     use winchy_gnss::ubx::{Framer, NavPvt, msg, receiver_config};
 
-    let uart = g.uart;
-    let baud = gnss_find_baud(&uart);
+    let uart = &g.uart;
+    let baud = gnss_find_baud(uart);
     let _ = uart.change_baudrate(esp_idf_svc::hal::units::Hertz(baud));
-    gnss_send(&uart, &receiver_config(10));
+    gnss_send(uart, &receiver_config(10));
     log::info!("GNSS: running at {baud} baud, NAV-PVT 10 Hz requested");
 
     let mut framer = Framer::new();
@@ -440,4 +449,75 @@ fn gnss_bring_up(g: winchy_board::GnssPins) {
         }
     }
     log::info!("GNSS: {navs} NAV-PVT, {edges} PPS edges, {labelled} labelled");
+}
+
+/// Configured WiFi networks from NVS, in priority order (slot 1 first).
+fn configured_networks(store: &mut winchy_settings::NvsStore) -> Vec<winchy_net_esp::Network> {
+    use winchy_provision::{Key, Store, WIFI_SLOTS};
+    (1..=WIFI_SLOTS)
+        .filter_map(|slot| {
+            let mut sb = [0u8; winchy_provision::MAX_VALUE_LEN];
+            let ssid = store
+                .get(Key::WifiSsid(slot), &mut sb)
+                .ok()
+                .flatten()?
+                .to_owned();
+            let mut pb = [0u8; winchy_provision::MAX_VALUE_LEN];
+            let password = store
+                .get(Key::WifiPass(slot), &mut pb)
+                .ok()
+                .flatten()
+                .unwrap_or("")
+                .to_owned();
+            Some(winchy_net_esp::Network { ssid, password })
+        })
+        .collect()
+}
+
+fn network_bring_up(
+    gnss: &winchy_board::GnssPins,
+    store: &mut winchy_settings::NvsStore,
+    modem: esp_idf_svc::hal::modem::Modem<'static>,
+    sysloop: esp_idf_svc::eventloop::EspSystemEventLoop,
+    nvs: esp_idf_svc::nvs::EspDefaultNvsPartition,
+) {
+    let networks = configured_networks(store);
+    if networks.is_empty() {
+        log::warn!("net: no WiFi configured (console: set wifi1_ssid ... / set wifi1_pass ...)");
+        return;
+    }
+    let mut wifi = match winchy_net_esp::Wifi::new(modem, sysloop, nvs) {
+        Ok(w) => w,
+        Err(e) => {
+            log::error!("net: WiFi init: {e:?}");
+            return;
+        }
+    };
+    let Some(ssid) = wifi.connect_any(&networks) else {
+        log::warn!("net: no configured network could be joined");
+        return;
+    };
+    log::info!(
+        "net: joined '{ssid}', ip/gw {:?}, gateway probe {}",
+        wifi.ip_and_gateway(),
+        if wifi.probe_gateway(std::time::Duration::from_secs(2)) {
+            "ok"
+        } else {
+            "FAILED"
+        }
+    );
+    let now = match winchy_net_esp::sntp_sync(std::time::Duration::from_secs(15)) {
+        Ok(t) => {
+            log::info!("net: SNTP time {t}");
+            Some(t)
+        }
+        Err(e) => {
+            log::warn!("net: SNTP: {e:?}");
+            None
+        }
+    };
+    match winchy_storage::MgaCache::open() {
+        Ok(cache) => assist::run(&gnss.uart, store, &cache, now),
+        Err(e) => log::error!("assistnow: cache partition: {e:?}"),
+    }
 }

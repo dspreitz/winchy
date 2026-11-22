@@ -1,0 +1,11 @@
+[package]
+name = "winchy-net"
+description = "Network policy: WiFi join order, roaming decision, zombie-link DNS probe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

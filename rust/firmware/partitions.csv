@@ -1,0 +1,8 @@
+# Winchy rope unit (8 MB flash). nvs stays at 0x9000 so provisioned
+# settings survive the re-layout.
+# Name,    Type, SubType, Offset,   Size
+nvs,       data, nvs,     0x9000,   0x6000
+phy_init,  data, phy,     0xf000,   0x1000
+factory,   app,  factory, 0x10000,  0x300000
+assist,    data, undefined,    0x310000, 0x40000
+storage,   data, undefined,    0x350000, 0x4B0000

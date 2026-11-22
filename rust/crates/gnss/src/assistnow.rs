@@ -266,5 +266,85 @@ fn unescape<'o>(raw: &[u8], out: &'o mut [u8]) -> Option<&'o str> {
     core::str::from_utf8(&out[..n]).ok()
 }
 
+/// Magic of a cache header ("MGA1").
+pub const CACHE_MAGIC: u32 = 0x4D47_4131;
+/// Cache header format version.
+pub const CACHE_VERSION: u16 = 1;
+
+/// Header stored in front of the cached MGA blob on the raw flash partition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheHeader {
+    /// Blob length, bytes.
+    pub len: u32,
+    /// Download time, Unix seconds (0 = unknown).
+    pub downloaded_at_s: i64,
+    /// CRC-32 (IEEE) of the blob.
+    pub crc32: u32,
+}
+
+impl CacheHeader {
+    /// Encoded size.
+    pub const SIZE: usize = 24;
+
+    /// Header describing `blob`.
+    #[must_use]
+    pub fn for_blob(blob: &[u8], downloaded_at_s: i64) -> Self {
+        Self {
+            len: u32::try_from(blob.len()).unwrap_or(u32::MAX),
+            downloaded_at_s,
+            crc32: crc32(blob),
+        }
+    }
+
+    /// Encodes as magic, version, reserved, len, time, crc (little-endian).
+    #[must_use]
+    pub fn encode(&self) -> [u8; Self::SIZE] {
+        let mut b = [0u8; Self::SIZE];
+        b[0..4].copy_from_slice(&CACHE_MAGIC.to_le_bytes());
+        b[4..6].copy_from_slice(&CACHE_VERSION.to_le_bytes());
+        b[8..12].copy_from_slice(&self.len.to_le_bytes());
+        b[12..20].copy_from_slice(&self.downloaded_at_s.to_le_bytes());
+        b[20..24].copy_from_slice(&self.crc32.to_le_bytes());
+        b
+    }
+
+    /// Decodes; `None` for erased flash, wrong magic or version.
+    #[must_use]
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        let b: &[u8; Self::SIZE] = b.get(..Self::SIZE)?.try_into().ok()?;
+        let u32_at = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        if u32_at(0) != CACHE_MAGIC || u16::from_le_bytes([b[4], b[5]]) != CACHE_VERSION {
+            return None;
+        }
+        let mut t = [0u8; 8];
+        t.copy_from_slice(&b[12..20]);
+        Some(Self {
+            len: u32_at(8),
+            downloaded_at_s: i64::from_le_bytes(t),
+            crc32: u32_at(20),
+        })
+    }
+
+    /// True if `blob` matches this header's length and CRC.
+    #[must_use]
+    pub fn verifies(&self, blob: &[u8]) -> bool {
+        blob.len() == self.len as usize && crc32(blob) == self.crc32
+    }
+}
+
+/// CRC-32 (IEEE 802.3, reflected, as used by zlib).
+#[must_use]
+pub fn crc32(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
 #[cfg(test)]
 mod tests;
