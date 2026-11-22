@@ -15,6 +15,7 @@
 pub mod fixed;
 mod frame;
 mod message;
+pub mod v6;
 
 pub use frame::{DecodeError, EncodeError, Frame, MAX_FRAME_LEN, VERSION};
 pub use message::{

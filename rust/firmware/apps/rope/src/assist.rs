@@ -2,6 +2,7 @@
 //! orbits over HTTPS when the cache is missing or stale, and feed them to the
 //! GNSS receiver. The request/response logic lives in `winchy_gnss::assistnow`.
 
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use esp_idf_svc::hal::delay::{FreeRtos, TickType};
@@ -18,13 +19,17 @@ use winchy_provision::{Key, Store};
 use winchy_settings::NvsStore;
 use winchy_storage::MgaCache;
 
+use crate::shared::lock;
+
 const NVS_CHIPCODE: &str = "mga_chip";
 const NVS_SERVICE_URL: &str = "mga_url";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_BLOB: usize = 200 * 1024;
 
 /// Polls one UBX message (empty payload) and returns the complete reply frame.
-fn poll_frame(uart: &UartDriver<'static>, (class, id): (u8, u8)) -> Option<Vec<u8>> {
+/// Holds the UART for the whole exchange (the GNSS task waits meanwhile).
+fn poll_frame(uart: &Mutex<UartDriver<'static>>, (class, id): (u8, u8)) -> Option<Vec<u8>> {
+    let uart = lock(uart);
     let mut poll = [0u8; 8];
     let n = write_frame(class, id, &[], &mut poll).ok()?;
     let _ = uart.clear_rx();
@@ -51,16 +56,16 @@ fn poll_frame(uart: &UartDriver<'static>, (class, id): (u8, u8)) -> Option<Vec<u
 }
 
 /// Streams the MGA blob (optionally preceded by coarse UTC time aiding).
-fn feed(uart: &UartDriver<'static>, blob: &[u8], time: Option<UtcDateTime>, acc_s: u16) {
+fn feed(uart: &Mutex<UartDriver<'static>>, blob: &[u8], time: Option<UtcDateTime>, acc_s: u16) {
     if let Some(t) = time {
         let mut frame = [0u8; 32];
         if let Ok(n) = write_mga_ini_time_utc(t, acc_s, &mut frame) {
-            let _ = uart.write(&frame[..n]);
+            let _ = lock(uart).write(&frame[..n]);
             FreeRtos::delay_ms(20);
         }
     }
     for chunk in blob.chunks(FEED_CHUNK) {
-        let _ = uart.write(chunk);
+        let _ = lock(uart).write(chunk);
         FreeRtos::delay_ms(FEED_GAP_MS);
     }
     log::info!(
@@ -71,7 +76,7 @@ fn feed(uart: &UartDriver<'static>, blob: &[u8], time: Option<UtcDateTime>, acc_
 }
 
 /// One-time ZTP registration; caches chipcode + service URL in NVS.
-fn register(uart: &UartDriver<'static>, store: &mut NvsStore, token: &str) -> Option<()> {
+fn register(uart: &Mutex<UartDriver<'static>>, store: &Mutex<NvsStore>, token: &str) -> Option<()> {
     let uniqid = poll_frame(uart, msg::SEC_UNIQID);
     let monver = poll_frame(uart, msg::MON_VER);
     let (Some(uniqid), Some(monver)) = (uniqid, monver) else {
@@ -83,7 +88,7 @@ fn register(uart: &UartDriver<'static>, store: &mut NvsStore, token: &str) -> Op
         .map_err(|e| log::warn!("assistnow: register body: {e:?}"))
         .ok()?;
     let mut url_buf = [0u8; winchy_provision::MAX_VALUE_LEN];
-    let url = store
+    let url = lock(store)
         .get(Key::ZtpUrl, &mut url_buf)
         .ok()
         .flatten()
@@ -106,22 +111,24 @@ fn register(uart: &UartDriver<'static>, store: &mut NvsStore, token: &str) -> Op
     let (mut chip, mut svc) = ([0u8; 256], [0u8; 256]);
     let chipcode = json_string_field(&resp.body, "chipcode", &mut chip)?;
     let service_url = json_string_field(&resp.body, "serviceUrl", &mut svc)?;
-    store.set_internal(NVS_CHIPCODE, chipcode).ok()?;
-    store.set_internal(NVS_SERVICE_URL, service_url).ok()?;
+    let nvs = lock(store);
+    nvs.set_internal(NVS_CHIPCODE, chipcode).ok()?;
+    nvs.set_internal(NVS_SERVICE_URL, service_url).ok()?;
+    drop(nvs);
     log::info!("assistnow: receiver registered");
     Some(())
 }
 
 /// Downloads a fresh blob; returns it with the server time.
-fn download(store: &NvsStore) -> Option<(Vec<u8>, Option<UtcDateTime>)> {
+fn download(store: &Mutex<NvsStore>) -> Option<(Vec<u8>, Option<UtcDateTime>)> {
     let (mut chip, mut svc) = ([0u8; 256], [0u8; 256]);
-    let chipcode = store.get_internal(NVS_CHIPCODE, &mut chip).ok().flatten()?;
-    let service_url = store
-        .get_internal(NVS_SERVICE_URL, &mut svc)
-        .ok()
-        .flatten()?;
     let mut url = [0u8; 768];
-    let url = download_url(service_url, chipcode, &mut url).ok()?;
+    let url = {
+        let nvs = lock(store);
+        let chipcode = nvs.get_internal(NVS_CHIPCODE, &mut chip).ok().flatten()?;
+        let service_url = nvs.get_internal(NVS_SERVICE_URL, &mut svc).ok().flatten()?;
+        download_url(service_url, chipcode, &mut url).ok()?
+    };
     let resp = https(Method::Get, url, None, &[], MAX_BLOB, HTTP_TIMEOUT)
         .map_err(|e| log::warn!("assistnow: download: {e:?}"))
         .ok()?;
@@ -139,13 +146,13 @@ fn download(store: &NvsStore) -> Option<(Vec<u8>, Option<UtcDateTime>)> {
 /// Registers if needed, downloads, caches and feeds a fresh blob.
 /// Returns false if anything failed (the caller then feeds the old cache).
 fn refresh(
-    uart: &UartDriver<'static>,
-    store: &mut NvsStore,
+    uart: &Mutex<UartDriver<'static>>,
+    store: &Mutex<NvsStore>,
     cache: &MgaCache,
     now: Option<i64>,
 ) -> bool {
     let mut tok = [0u8; winchy_provision::MAX_VALUE_LEN];
-    let Some(token) = store
+    let Some(token) = lock(store)
         .get(Key::ZtpToken, &mut tok)
         .ok()
         .flatten()
@@ -155,7 +162,7 @@ fn refresh(
         return false;
     };
     let mut probe = [0u8; 8];
-    let registered = store
+    let registered = lock(store)
         .get_internal(NVS_CHIPCODE, &mut probe)
         .ok()
         .flatten()
@@ -175,17 +182,24 @@ fn refresh(
     true
 }
 
-/// Full AssistNow cycle. `now` is the system time if it is trustworthy.
-pub fn run(uart: &UartDriver<'static>, store: &mut NvsStore, cache: &MgaCache, now: Option<i64>) {
+/// Feeds the cached blob (at GNSS start-up, before any network).
+pub fn feed_cached(uart: &Mutex<UartDriver<'static>>, cache: &MgaCache) {
+    match cache.load() {
+        Some((_, blob)) => feed(uart, &blob, None, 2),
+        None => log::info!("assistnow: no cached orbits"),
+    }
+}
+
+/// Downloads and feeds fresh orbits if the cache is missing or stale. `now`
+/// is the system time if it is trustworthy. Returns true if it refreshed.
+pub fn refresh_if_due(
+    uart: &Mutex<UartDriver<'static>>,
+    store: &Mutex<NvsStore>,
+    cache: &MgaCache,
+    now: Option<i64>,
+) -> bool {
     let state = cache.header().map_or(Cache::Missing, |h| Cache::Present {
         downloaded_at_s: (h.downloaded_at_s > 0).then_some(h.downloaded_at_s),
     });
-    log::info!("assistnow: cache {state:?}");
-    if should_download(state, now) && refresh(uart, store, cache, now) {
-        return;
-    }
-    match cache.load() {
-        Some((_, blob)) => feed(uart, &blob, None, 2),
-        None => log::info!("assistnow: nothing to feed"),
-    }
+    should_download(state, now) && refresh(uart, store, cache, now)
 }

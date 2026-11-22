@@ -11,7 +11,7 @@ Rewrite of the MicroPython firmware in Rust (branch `rust`). Two workspaces:
 
 | Crate | What it does | Depends on |
 |-------|--------------|------------|
-| `winchy-protocol` | Versioned LoRa frames (encode/decode, fixed-point) | — |
+| `winchy-protocol` | Versioned LoRa frames (encode/decode, fixed-point); `v6` = transitional codec for the MicroPython winch | — |
 | `winchy-geo` | Winch↔rope geometry on the local tangent plane | — |
 | `winchy-gnss` | UBX framing/NAV-PVT/CFG-VALSET, NMEA, survey-in, GNSS time trust, PPS edge labelling, baud discovery state machine | geo |
 | `winchy-fusion` | Gravity + vertical Kalman, rope angle, ISA altitude, glider speed, gyro bias | — |
@@ -22,14 +22,31 @@ Rewrite of the MicroPython firmware in Rust (branch `rust`). Two workspaces:
 | `winchy-ads1232` | ADS1232 force ADC, bit-banged | embedded-hal |
 | `winchy-sx126x` | SX1262 LoRa radio: init/calibration, TX, continuous RX, IRQ, packet status | embedded-hal |
 | `winchy-tbeam` | T-Beam S3 Supreme pin map + power profile (the only place with pin numbers) | axp2101 |
+| `winchy-rope-logic` | Rope app decisions: shared state, telemetry, battery warning, QNH, ADR feedback, radio cycle, PPS clock maths | protocol, link, geo, gnss, fusion |
 | `winchy-provision` | Settings/secret key registry + USB console commands (secrets never echoed) | — |
 | `winchy-testkit` | Seeded PRNG for simulation tests (dev only) | — |
 
 Firmware workspace: `winchy-settings` stores provisioned values in NVS and
 runs the USB console; `winchy-board` turns the `winchy-tbeam` pin numbers into
-ESP-IDF drivers; `apps/rope` is currently a bring-up diagnostic (sensors, a LoRa round trip
-with the unmodified MicroPython winch via a legacy v6 frame, GNSS baud
-discovery + NAV-PVT + PPS labelling).
+ESP-IDF drivers; `winchy-net-esp` does WiFi/HTTPS/SNTP; `winchy-storage` keeps
+the AssistNow blob on a raw partition.
+
+`apps/rope` runs one task per sensor rate, all writing one shared
+`RopeState` (decisions live in `winchy-rope-logic`):
+
+| Task | Rate | Prio | Does |
+|------|------|------|------|
+| `imu` | 50 Hz | 10 | gyro bias, gravity Kalman, rope angle + rate, glider speed |
+| `radio` | 2 Hz | 9 | ADR, telemetry, listens for link reports / winch position |
+| `force` | 10 SPS | 8 | offset calibration + tare, periodic recalibration while idle |
+| `gnss` | 10 Hz | 7 | baud discovery, NAV-PVT, GNSS time, 1PPS clock discipline, winch geometry |
+| `baro` | 1 Hz | 5 | QNH (seeded from stored field elevation, then GNSS), vertical Kalman |
+| `power` | 0.2 Hz | 4 | battery/charging, low-battery warning, status log line |
+| `net` | 1/min | 3 | WiFi join/roam/zombie check, SNTP fallback, AssistNow refresh |
+
+The main thread serves the USB console. Until the winch is ported, telemetry
+goes out in the MicroPython v6 format (`RadioConfig::wire`); received frames
+are accepted in both formats.
 
 Layering: logic crates never touch hardware. Drivers only see
 `embedded-hal` traits; only a board crate knows pins and PMU rails; the

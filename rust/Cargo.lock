@@ -303,6 +303,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "winchy-rope-logic"
+version = "0.1.0"
+dependencies = [
+ "libm",
+ "winchy-fusion",
+ "winchy-geo",
+ "winchy-gnss",
+ "winchy-link",
+ "winchy-protocol",
+]
+
+[[package]]
 name = "winchy-sx126x"
 version = "0.1.0"
 dependencies = [

@@ -190,6 +190,12 @@ impl Wifi {
         matches!(sock.recv_from(&mut buf), Ok((n, _)) if winchy_net::dns::is_reply(&buf[..n], id))
     }
 
+    /// Drops the association (the next [`Self::connect_any`] rejoins).
+    pub fn disconnect(&mut self) {
+        let _ = self.wifi.disconnect();
+        self.joined = None;
+    }
+
     /// While on a lower-priority network, switches to a better one that came
     /// in range. Returns the new SSID, `None` if it stayed.
     pub fn roam(&mut self, networks: &[Network]) -> Option<String> {

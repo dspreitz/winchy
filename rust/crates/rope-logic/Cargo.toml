@@ -1,0 +1,19 @@
+[package]
+name = "winchy-rope-logic"
+description = "Rope unit application logic: shared state, telemetry, battery, QNH, radio cycle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+libm.workspace = true
+winchy-fusion = { path = "../fusion" }
+winchy-geo.workspace = true
+winchy-gnss = { path = "../gnss" }
+winchy-link = { path = "../link" }
+winchy-protocol = { path = "../protocol" }
+
+[lints]
+workspace = true

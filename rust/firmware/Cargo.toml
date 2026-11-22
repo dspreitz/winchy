@@ -32,6 +32,7 @@ winchy-storage = { path = "crates/storage" }
 winchy-net = { path = "../crates/net" }
 winchy-net-esp = { path = "crates/net-esp" }
 winchy-provision = { path = "../crates/provision" }
+winchy-rope-logic = { path = "../crates/rope-logic" }
 
 [workspace.lints.rust]
 missing_docs = "warn"
@@ -44,6 +45,9 @@ expect_used = "warn"
 panic = "warn"
 todo = "warn"
 dbg_macro = "warn"
+# Sensor units are converted to f32 for filters and logs; the values are far
+# below 2^23, so the precision loss is nil.
+cast_precision_loss = "allow"
 
 [profile.release]
 opt-level = "s"
