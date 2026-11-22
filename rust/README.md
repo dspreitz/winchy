@@ -16,9 +16,17 @@ Rewrite of the MicroPython firmware in Rust (branch `rust`). Two workspaces:
 | `winchy-gnss` | UBX framing/NAV-PVT/CFG-VALSET, NMEA, survey-in, GNSS time trust, baud detect | geo |
 | `winchy-fusion` | Gravity + vertical Kalman, rope angle, ISA altitude, glider speed, gyro bias | — |
 | `winchy-link` | Adaptive TX power (ADR) | — |
+| `winchy-axp2101` | AXP2101 PMU driver: rails, charger, gauge, IRQ mask | embedded-hal |
+| `winchy-bmp280` | BMP280/BME280 barometer, bit-exact integer compensation | embedded-hal |
+| `winchy-qmi8658` | QMI8658 IMU over SPI, burst read | embedded-hal |
+| `winchy-ads1232` | ADS1232 force ADC, bit-banged | embedded-hal |
+| `winchy-tbeam` | T-Beam S3 Supreme pin map + power profile (the only place with pin numbers) | axp2101 |
 | `winchy-testkit` | Seeded PRNG for simulation tests (dev only) | — |
 
-Layering: logic crates never touch hardware. Drivers (next step) only see
+Firmware workspace: `winchy-board` turns the `winchy-tbeam` pin numbers into
+ESP-IDF drivers; `apps/rope` is currently a sensor bring-up diagnostic.
+
+Layering: logic crates never touch hardware. Drivers only see
 `embedded-hal` traits; only a board crate knows pins and PMU rails; the
 firmware apps just wire things together.
 

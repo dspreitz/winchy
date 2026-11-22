@@ -1,0 +1,17 @@
+[package]
+name = "winchy-bmp280"
+description = "Bosch BMP280 barometer driver (integer compensation, forced mode) over embedded-hal I2C"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+embedded-hal.workspace = true
+
+[dev-dependencies]
+embedded-hal-mock.workspace = true
+
+[lints]
+workspace = true

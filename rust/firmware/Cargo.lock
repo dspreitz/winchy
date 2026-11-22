@@ -1522,6 +1522,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "winchy-ads1232"
+version = "0.1.0"
+dependencies = [
+ "embedded-hal 1.0.0",
+]
+
+[[package]]
+name = "winchy-axp2101"
+version = "0.1.0"
+dependencies = [
+ "embedded-hal 1.0.0",
+]
+
+[[package]]
+name = "winchy-bmp280"
+version = "0.1.0"
+dependencies = [
+ "embedded-hal 1.0.0",
+]
+
+[[package]]
+name = "winchy-board"
+version = "0.1.0"
+dependencies = [
+ "esp-idf-svc",
+ "log",
+ "winchy-ads1232",
+ "winchy-axp2101",
+ "winchy-tbeam",
+]
+
+[[package]]
 name = "winchy-fusion"
 version = "0.1.0"
 dependencies = [
@@ -1529,30 +1561,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "winchy-geo"
+name = "winchy-qmi8658"
 version = "0.1.0"
 dependencies = [
- "libm",
+ "embedded-hal 1.0.0",
 ]
-
-[[package]]
-name = "winchy-gnss"
-version = "0.1.0"
-dependencies = [
- "libm",
- "winchy-geo",
-]
-
-[[package]]
-name = "winchy-link"
-version = "0.1.0"
-dependencies = [
- "libm",
-]
-
-[[package]]
-name = "winchy-protocol"
-version = "0.1.0"
 
 [[package]]
 name = "winchy-rope"
@@ -1561,10 +1574,19 @@ dependencies = [
  "embuild",
  "esp-idf-svc",
  "log",
+ "winchy-ads1232",
+ "winchy-bmp280",
+ "winchy-board",
  "winchy-fusion",
- "winchy-gnss",
- "winchy-link",
- "winchy-protocol",
+ "winchy-qmi8658",
+]
+
+[[package]]
+name = "winchy-tbeam"
+version = "0.1.0"
+dependencies = [
+ "embedded-hal 1.0.0",
+ "winchy-axp2101",
 ]
 
 [[package]]

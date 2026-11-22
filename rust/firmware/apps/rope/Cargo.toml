@@ -13,10 +13,11 @@ harness = false
 [dependencies]
 esp-idf-svc.workspace = true
 log.workspace = true
+winchy-ads1232.workspace = true
+winchy-board.workspace = true
+winchy-bmp280.workspace = true
 winchy-fusion.workspace = true
-winchy-gnss.workspace = true
-winchy-link.workspace = true
-winchy-protocol.workspace = true
+winchy-qmi8658.workspace = true
 
 [build-dependencies]
 embuild.workspace = true

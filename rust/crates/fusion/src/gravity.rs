@@ -137,13 +137,13 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::float_cmp, reason = "exact passthrough of a constant")]
+    #[allow(clippy::float_cmp, reason = "exact passthrough of a constant")]
     fn unseeded_points_along_rope() {
         assert_eq!(GravityKalman::default().gravity(), [0.0, 1.0, 0.0]);
     }
 
     #[test]
-    #[expect(clippy::float_cmp, reason = "axis-aligned input normalises exactly")]
+    #[allow(clippy::float_cmp, reason = "axis-aligned input normalises exactly")]
     fn first_update_seeds_normalised() {
         let mut f = GravityKalman::default();
         f.update([0.0, 0.0, 2.0]);
@@ -151,7 +151,7 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::float_cmp, reason = "state must stay bit-identical")]
+    #[allow(clippy::float_cmp, reason = "state must stay bit-identical")]
     fn zero_accel_is_ignored() {
         let mut f = GravityKalman::default();
         f.update([0.0, 0.0, 0.0]);

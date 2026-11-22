@@ -1,0 +1,17 @@
+[package]
+name = "winchy-axp2101"
+description = "AXP2101 PMU driver (rails, charger, gauge, IRQ mask) over embedded-hal I2C"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+embedded-hal.workspace = true
+
+[dev-dependencies]
+embedded-hal-mock.workspace = true
+
+[lints]
+workspace = true

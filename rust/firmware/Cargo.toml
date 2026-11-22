@@ -3,7 +3,7 @@
 # logic crates in ../crates are shared by path.
 [workspace]
 resolver = "3"
-members = ["apps/*"]
+members = ["apps/*", "crates/*"]
 
 [workspace.package]
 version = "0.1.0"
@@ -20,6 +20,12 @@ winchy-geo = { path = "../crates/geo" }
 winchy-gnss = { path = "../crates/gnss" }
 winchy-link = { path = "../crates/link" }
 winchy-protocol = { path = "../crates/protocol" }
+winchy-axp2101 = { path = "../crates/axp2101" }
+winchy-bmp280 = { path = "../crates/bmp280" }
+winchy-qmi8658 = { path = "../crates/qmi8658" }
+winchy-ads1232 = { path = "../crates/ads1232" }
+winchy-tbeam = { path = "../crates/tbeam" }
+winchy-board = { path = "crates/board" }
 
 [workspace.lints.rust]
 missing_docs = "warn"

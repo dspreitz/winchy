@@ -208,7 +208,7 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::float_cmp, reason = "motion must leave the bias bit-identical")]
+    #[allow(clippy::float_cmp, reason = "motion must leave the bias bit-identical")]
     fn tracker_holds_bias_during_motion() {
         let mut t = tracker(TRUE_BIAS);
         for g in handling(500, &mut Rng::new(5)) {

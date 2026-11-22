@@ -1,0 +1,15 @@
+[package]
+name = "winchy-tbeam"
+description = "LilyGo T-Beam S3 Supreme board definition: pin map and AXP2101 power profile"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+embedded-hal.workspace = true
+winchy-axp2101 = { path = "../axp2101" }
+
+[lints]
+workspace = true

@@ -11,11 +11,12 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/dspreitz/winchy"
 publish = false
 
 [workspace.dependencies]
 libm = "0.2"
+embedded-hal = "1.0"
+embedded-hal-mock = { version = "0.11", default-features = false, features = ["eh1"] }
 winchy-geo = { path = "crates/geo" }
 winchy-testkit = { path = "crates/testkit" }
 
