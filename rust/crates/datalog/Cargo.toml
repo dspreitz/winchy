@@ -1,0 +1,11 @@
+[package]
+name = "winchy-datalog"
+description = "Flash data log: timestamped measurement records in CRC-protected ring blocks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

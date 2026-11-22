@@ -16,6 +16,7 @@ embedded-hal = "1.0"
 log.workspace = true
 winchy-ads1232.workspace = true
 winchy-axp2101.workspace = true
+winchy-datalog.workspace = true
 winchy-board.workspace = true
 winchy-bmp280.workspace = true
 winchy-fusion.workspace = true

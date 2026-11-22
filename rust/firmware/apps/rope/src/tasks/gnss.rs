@@ -25,6 +25,8 @@ use winchy_storage::MgaCache;
 use crate::assist;
 use crate::shared::{State, lock, now_ms, now_us, set_unix_us, unix_now_us};
 use crate::tasks::baro::NVS_LAST_ALT;
+use crate::tasks::logger::Logger;
+use winchy_datalog::record::{Record, event};
 
 /// GNSS UART, shared with the AssistNow upload.
 pub type GnssUart = Arc<Mutex<UartDriver<'static>>>;
@@ -132,16 +134,42 @@ fn start_pps(pps: &mut PinDriver<'static, Input>) {
     }
 }
 
+/// Data-log record of a solution, with the receiver's own epoch time.
+fn gnss_record(nav: &NavPvt) -> Record {
+    let sat_i16 =
+        |v: i32| i16::try_from(v.clamp(i32::from(i16::MIN), i32::from(i16::MAX))).unwrap_or(0);
+    Record::Gnss {
+        fix: match nav.fix {
+            FixType::None => 0,
+            FixType::Fix2D => 2,
+            FixType::Fix3D => 3,
+        },
+        sats: nav.num_sv,
+        lat_e7: nav.lat_e7,
+        lon_e7: nav.lon_e7,
+        hmsl_mm: nav.hmsl_mm,
+        hacc_cm: u16::try_from(nav.hacc_mm / 10).unwrap_or(u16::MAX),
+        gspeed_cms: sat_i16(nav.gspeed_mms / 10),
+        climb_cms: sat_i16(-nav.vel_d_mms / 10),
+        utc_ms: nav
+            .utc
+            .and_then(|u| u.to_unix())
+            .map_or(0, |s| s * 1_000 + i64::from(nav.nano_ns) / 1_000_000),
+    }
+}
+
 /// GNSS time handling across NAV-PVT solutions and PPS edges.
 struct Clock {
     fix: TimeFix,
     pps: PpsDiscipline,
     seen_edges: u32,
+    /// The clock has been aligned to a PPS edge since the last coarse set.
+    pps_locked: bool,
     reject_logged_ms: Option<u64>,
 }
 
 impl Clock {
-    fn on_nav(&mut self, nav: &NavPvt, now: u64, state: &State) {
+    fn on_nav(&mut self, nav: &NavPvt, now: u64, state: &State, logger: &Logger) {
         let Some(utc_s) = nav.utc.and_then(|u| u.to_unix()) else {
             return;
         };
@@ -151,6 +179,8 @@ impl Clock {
             TimeAction::Set => {
                 set_unix_us(utc_s * 1_000_000 + i64::from(nav.nano_ns) / 1_000);
                 lock(state).clock = ClockSource::Gnss;
+                logger.event(event::CLOCK, event::CLOCK_GNSS);
+                self.pps_locked = false;
                 log::info!("clock: set from GNSS ({:?}, was {source:?})", nav.utc);
             }
             TimeAction::Reject
@@ -167,7 +197,7 @@ impl Clock {
         }
     }
 
-    fn on_poll(&mut self, pps: &mut PinDriver<'static, Input>) {
+    fn on_poll(&mut self, pps: &mut PinDriver<'static, Input>, logger: &Logger) {
         let edges = PPS_EDGES.load(Ordering::Acquire);
         if edges == self.seen_edges {
             return;
@@ -190,6 +220,11 @@ impl Clock {
                 log::info!("clock: PPS step {d:+} us");
             }
         }
+        if !self.pps_locked {
+            self.pps_locked = true;
+            logger.event(event::CLOCK, event::CLOCK_PPS);
+            log::info!("clock: locked to 1PPS");
+        }
     }
 }
 
@@ -199,6 +234,7 @@ pub fn run(
     mut pps: PinDriver<'static, Input>,
     state: &State,
     store: &Mutex<NvsStore>,
+    logger: &Logger,
 ) {
     bring_up(&lock(uart));
     match MgaCache::open() {
@@ -214,6 +250,7 @@ pub fn run(
         fix: TimeFix::default(),
         pps: PpsDiscipline::new(),
         seen_edges: PPS_EDGES.load(Ordering::Acquire),
+        pps_locked: false,
         reject_logged_ms: None,
     };
     let mut saver = LastFixSaver::default();
@@ -224,7 +261,7 @@ pub fn run(
     loop {
         // Non-blocking read so the AssistNow upload can take the UART.
         let n = lock(uart).read(&mut buf, 0).unwrap_or(0);
-        clock.on_poll(&mut pps);
+        clock.on_poll(&mut pps, logger);
         if n == 0 {
             if now_ms() - last_nav > SILENCE_MS {
                 log::warn!(
@@ -246,8 +283,9 @@ pub fn run(
                 continue;
             };
             let now = now_ms();
+            logger.log_now(gnss_record(&nav));
             last_nav = now;
-            clock.on_nav(&nav, now, state);
+            clock.on_nav(&nav, now, state, logger);
             let fix = nav.fix != FixType::None;
             if fix != had_fix {
                 had_fix = fix;

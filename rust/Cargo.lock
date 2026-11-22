@@ -252,6 +252,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "winchy-datalog"
+version = "0.1.0"
+
+[[package]]
 name = "winchy-fusion"
 version = "0.1.0"
 dependencies = [
@@ -280,6 +284,13 @@ name = "winchy-link"
 version = "0.1.0"
 dependencies = [
  "libm",
+]
+
+[[package]]
+name = "winchy-logdump"
+version = "0.1.0"
+dependencies = [
+ "winchy-datalog",
 ]
 
 [[package]]

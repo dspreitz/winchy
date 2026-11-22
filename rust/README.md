@@ -23,6 +23,7 @@ Rewrite of the MicroPython firmware in Rust (branch `rust`). Two workspaces:
 | `winchy-sx126x` | SX1262 LoRa radio: init/calibration, TX, continuous RX, IRQ, packet status | embedded-hal |
 | `winchy-tbeam` | T-Beam S3 Supreme pin map + power profile (the only place with pin numbers) | axp2101 |
 | `winchy-rope-logic` | Rope app decisions: shared state, telemetry, battery warning, QNH, ADR feedback, radio cycle, PPS clock maths | protocol, link, geo, gnss, fusion |
+| `winchy-datalog` | Flash data-log format: timestamped records, CRC'd 4 KiB blocks with UTC offset, ring resume | — |
 | `winchy-provision` | Settings/secret key registry + USB console commands (secrets never echoed) | — |
 | `winchy-testkit` | Seeded PRNG for simulation tests (dev only) | — |
 
@@ -39,10 +40,29 @@ the AssistNow blob on a raw partition.
 | `imu` | 50 Hz | 10 | gyro bias, gravity Kalman, rope angle + rate, glider speed |
 | `radio` | 2 Hz | 9 | ADR, telemetry, listens for link reports / winch position |
 | `force` | 10 SPS | 8 | offset calibration + tare, periodic recalibration while idle |
+| `logger` | — | 6 | packs every measurement into the flash data log (`storage` partition) |
 | `gnss` | 10 Hz | 7 | baud discovery, NAV-PVT, GNSS time, 1PPS clock discipline, winch geometry |
 | `baro` | 1 Hz | 5 | QNH (seeded from stored field elevation, then GNSS), vertical Kalman |
 | `power` | 0.2 Hz | 4 | battery/charging, low-battery warning, status log line |
 | `net` | 1/min | 3 | WiFi join/roam/zombie check, SNTP fallback, AssistNow refresh |
+
+### Data log
+
+Every measurement (IMU, force, baro, GNSS, power, link report, events) is
+stored with the monotonic time of the measurement (µs since boot); each 4 KiB
+block header holds the UTC offset of the PPS-disciplined system clock, so every
+sample has an exact UTC time. The 4.7 MB `storage` partition is a ring
+(~1 h at ~1.3 kB/s); the oldest blocks are overwritten. Read it out with
+
+```sh
+espflash read-flash --port /dev/cu.usbmodemXXXX 0x350000 0x4B0000 dump.bin
+cd rust && cargo run -p winchy-logdump -- dump.bin out/   # imu.csv, force.csv, gnss.csv, ...
+```
+
+`winchy-logdump` gives samples from before the clock was set the UTC time of
+their boot (preferring the offset after the 1PPS lock). Known gap: a flash
+sector erase (~every 3 s) stalls all tasks for up to ~80 ms, so the IMU loses
+2-3 samples each time (timestamps stay exact).
 
 The main thread serves the USB console. Until the winch is ported, telemetry
 goes out in the MicroPython v6 format (`RadioConfig::wire`); received frames

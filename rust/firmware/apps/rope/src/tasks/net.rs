@@ -18,6 +18,8 @@ use winchy_storage::MgaCache;
 use crate::assist;
 use crate::shared::{State, lock};
 use crate::tasks::gnss::GnssUart;
+use crate::tasks::logger::Logger;
+use winchy_datalog::record::event;
 
 /// Health check period, s.
 const CHECK_S: u32 = 60;
@@ -50,7 +52,14 @@ fn configured_networks(store: &Mutex<NvsStore>) -> Vec<Network> {
 }
 
 /// Everything that needs a fresh connection: clock fallback and AssistNow.
-fn on_joined(wifi: &Wifi, ssid: &str, state: &State, store: &Mutex<NvsStore>, uart: &GnssUart) {
+fn on_joined(
+    wifi: &Wifi,
+    ssid: &str,
+    state: &State,
+    store: &Mutex<NvsStore>,
+    uart: &GnssUart,
+    logger: &Logger,
+) {
     log::info!("net: joined '{ssid}', ip/gw {:?}", wifi.ip_and_gateway());
     let gnss_clock = lock(state).clock == ClockSource::Gnss;
     let now = if gnss_clock {
@@ -61,6 +70,7 @@ fn on_joined(wifi: &Wifi, ssid: &str, state: &State, store: &Mutex<NvsStore>, ua
                 let mut s = lock(state);
                 if s.clock == ClockSource::Unset {
                     s.clock = ClockSource::Ntp;
+                    logger.event(event::CLOCK, event::CLOCK_NTP);
                 }
                 log::info!("net: SNTP time {t}");
                 Some(t)
@@ -93,6 +103,7 @@ pub fn run(
     state: &State,
     store: &Mutex<NvsStore>,
     uart: &GnssUart,
+    logger: &Logger,
 ) {
     let networks = configured_networks(store);
     if networks.is_empty() {
@@ -111,11 +122,11 @@ pub fn run(
     loop {
         if !wifi.is_up() {
             match wifi.connect_any(&networks) {
-                Some(ssid) => on_joined(&wifi, &ssid, state, store, uart),
+                Some(ssid) => on_joined(&wifi, &ssid, state, store, uart, logger),
                 None => log::info!("net: no configured network in range"),
             }
         } else if let Some(ssid) = wifi.roam(&networks) {
-            on_joined(&wifi, &ssid, state, store, uart);
+            on_joined(&wifi, &ssid, state, store, uart, logger);
         } else if wifi.probe_gateway(Duration::from_secs(2)) {
             fails = 0;
         } else {

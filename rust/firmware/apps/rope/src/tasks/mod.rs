@@ -5,6 +5,7 @@ pub mod baro;
 pub mod force;
 pub mod gnss;
 pub mod imu;
+pub mod logger;
 pub mod net;
 pub mod power;
 pub mod radio;

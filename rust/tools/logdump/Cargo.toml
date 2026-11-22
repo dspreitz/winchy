@@ -1,0 +1,14 @@
+[package]
+name = "winchy-logdump"
+description = "Converts a dump of the rope's data-log partition into per-sensor CSV files"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+winchy-datalog = { path = "../../crates/datalog" }
+
+[lints]
+workspace = true

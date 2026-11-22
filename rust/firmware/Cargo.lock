@@ -1554,6 +1554,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "winchy-datalog"
+version = "0.1.0"
+
+[[package]]
 name = "winchy-fusion"
 version = "0.1.0"
 dependencies = [
@@ -1622,6 +1626,7 @@ dependencies = [
  "winchy-axp2101",
  "winchy-bmp280",
  "winchy-board",
+ "winchy-datalog",
  "winchy-fusion",
  "winchy-gnss",
  "winchy-net-esp",

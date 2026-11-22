@@ -11,7 +11,10 @@ use winchy_fusion::vertical::VerticalKalman;
 use winchy_rope_logic::qnh::{GnssAltitude, Qnh, QnhConfig, QnhUpdate};
 use winchy_settings::NvsStore;
 
-use crate::shared::{State, lock, now_ms};
+use winchy_datalog::record::Record;
+
+use crate::shared::{State, lock, now_ms, now_us};
+use crate::tasks::logger::Logger;
 
 /// Sample period, ms.
 const PERIOD_MS: u32 = 1_000;
@@ -29,7 +32,7 @@ fn stored_altitude(store: &Mutex<NvsStore>) -> Option<f32> {
 }
 
 /// Task body.
-pub fn run(i2c: I2cDriver<'static>, state: &State, store: &Mutex<NvsStore>) {
+pub fn run(i2c: I2cDriver<'static>, state: &State, store: &Mutex<NvsStore>, logger: &Logger) {
     let mut bmp = match Bmp280::new(
         i2c,
         winchy_bmp280::ADDRESS,
@@ -58,6 +61,14 @@ pub fn run(i2c: I2cDriver<'static>, state: &State, store: &Mutex<NvsStore>) {
             Ok(m) if m.is_plausible() => m,
             Ok(_) | Err(_) => continue,
         };
+        logger.log(
+            now_us(),
+            Record::Baro {
+                pressure_cpa: u32::try_from(u64::from(m.pressure_q24_8) * 100 / 256)
+                    .unwrap_or(u32::MAX),
+                temperature_cdeg: i16::try_from(m.temperature_cdeg).unwrap_or(i16::MAX),
+            },
+        );
         let p = m.pressure_hpa();
         if !seeded {
             seeded = true;

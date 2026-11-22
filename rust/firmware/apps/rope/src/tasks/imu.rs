@@ -14,7 +14,10 @@ use winchy_rope_logic::motion::{
     ANGLE_RATE_ALPHA, ANGLE_RATE_MAX_DPS, AngleRate, segment_speed_ms,
 };
 
+use winchy_datalog::record::Record;
+
 use crate::shared::{State, lock, now_ms, now_us};
+use crate::tasks::logger::Logger;
 
 /// Sample period.
 const PERIOD: Duration = Duration::from_millis(20);
@@ -50,7 +53,7 @@ fn boot_bias(imu: &mut Imu) -> Vec3 {
 }
 
 /// Task body.
-pub fn run(spi: SpiDeviceDriver<'static, SpiDriver<'static>>, state: &State) {
+pub fn run(spi: SpiDeviceDriver<'static, SpiDriver<'static>>, state: &State, logger: &Logger) {
     let mut imu = match Qmi8658::new(spi, &mut FreeRtos) {
         Ok(i) => i,
         Err(e) => {
@@ -70,6 +73,13 @@ pub fn run(spi: SpiDeviceDriver<'static, SpiDriver<'static>>, state: &State) {
         match imu.read_raw() {
             Ok(sample) => {
                 let t = now_us();
+                logger.log(
+                    t,
+                    Record::Imu {
+                        accel: sample.accel,
+                        gyro: sample.gyro,
+                    },
+                );
                 let dt = ((t - last_us) as f32 / 1e6).clamp(0.001, 0.2);
                 last_us = t;
                 let (accel, raw_gyro) = (sample.accel_g(), sample.gyro_dps());

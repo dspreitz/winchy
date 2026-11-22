@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::peripherals::Peripherals;
 use winchy_board::RopeBoard;
+use winchy_datalog::record::event;
 use winchy_rope_logic::state::RopeState;
 use winchy_sx126x::LoraConfig;
 
@@ -64,26 +65,41 @@ fn main() {
     let state = Arc::new(Mutex::new(RopeState::new(LoraConfig::WINCHY.tx_power_dbm)));
     let uart = Arc::new(Mutex::new(gnss.uart));
 
-    let s = state.clone();
-    spawn(c"imu", 8 * 1024, 10, move || tasks::imu::run(imu_spi, &s));
-    let s = state.clone();
-    spawn(c"radio", 8 * 1024, 9, move || tasks::radio::run(lora, &s));
-    let s = state.clone();
-    spawn(c"force", 4 * 1024, 8, move || tasks::force::run(ads, &s));
-    let (s, st, u) = (state.clone(), store.clone(), uart.clone());
+    let (logger, sink) = tasks::logger::channel();
+    logger.event(event::BOOT, i32::try_from(reset).unwrap_or(-1));
+
+    let (s, l) = (state.clone(), logger.clone());
+    spawn(c"imu", 8 * 1024, 10, move || {
+        tasks::imu::run(imu_spi, &s, &l);
+    });
+    let (s, l) = (state.clone(), logger.clone());
+    spawn(c"radio", 8 * 1024, 9, move || {
+        tasks::radio::run(lora, &s, &l);
+    });
+    let (s, l) = (state.clone(), logger.clone());
+    spawn(c"force", 4 * 1024, 8, move || {
+        tasks::force::run(ads, &s, &l);
+    });
+    let (s, st, u, l) = (state.clone(), store.clone(), uart.clone(), logger.clone());
     let pps = gnss.pps;
     spawn(c"gnss", 10 * 1024, 7, move || {
-        tasks::gnss::run(&u, pps, &s, &st);
-    });
-    let (s, st) = (state.clone(), store.clone());
-    spawn(c"baro", 6 * 1024, 5, move || {
-        tasks::baro::run(sensor_i2c, &s, &st);
+        tasks::gnss::run(&u, pps, &s, &st, &l);
     });
     let s = state.clone();
-    spawn(c"power", 6 * 1024, 4, move || tasks::power::run(pmu, &s));
+    spawn(c"logger", 12 * 1024, 6, move || {
+        tasks::logger::run(&sink, &s);
+    });
+    let (s, st, l) = (state.clone(), store.clone(), logger.clone());
+    spawn(c"baro", 6 * 1024, 5, move || {
+        tasks::baro::run(sensor_i2c, &s, &st, &l);
+    });
+    let (s, l) = (state.clone(), logger.clone());
+    spawn(c"power", 6 * 1024, 4, move || {
+        tasks::power::run(pmu, &s, &l);
+    });
     let (s, st, modem) = (state, store.clone(), p.modem);
     spawn(c"net", 20 * 1024, 3, move || {
-        tasks::net::run(modem, sysloop, nvs_part, &s, &st, &uart);
+        tasks::net::run(modem, sysloop, nvs_part, &s, &st, &uart, &logger);
     });
 
     let mut console = winchy_settings::Console::new();

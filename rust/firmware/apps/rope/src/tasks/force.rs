@@ -5,7 +5,10 @@ use esp_idf_svc::hal::delay::{Ets, FreeRtos};
 use winchy_ads1232::{Ads1232, Gain};
 use winchy_rope_logic::force::{RecalPolicy, TARE_SAMPLES, tare};
 
-use crate::shared::{State, lock, now_ms};
+use winchy_datalog::record::{Record, event};
+
+use crate::shared::{State, lock, now_ms, now_us};
+use crate::tasks::logger::Logger;
 
 /// No conversion within this means a DRDY timeout, ms.
 const TIMEOUT_MS: u32 = 1_000;
@@ -29,12 +32,14 @@ fn wait_ready(adc: &mut Adc, timeout_ms: u32) -> bool {
     false
 }
 
-fn read(adc: &mut Adc) -> Option<i32> {
+/// One conversion and the monotonic time it was read, µs.
+fn read(adc: &mut Adc) -> Option<(i32, i64)> {
     if !wait_ready(adc, TIMEOUT_MS) {
         return None;
     }
     // Keep the 25 SCLK pulses unbroken (SCLK high > 100 µs = standby).
-    esp_idf_svc::hal::interrupt::free(|| adc.read_raw()).ok()
+    let v = esp_idf_svc::hal::interrupt::free(|| adc.read_raw()).ok()?;
+    Some((v, now_us()))
 }
 
 fn calibrate(adc: &mut Adc) -> bool {
@@ -46,7 +51,7 @@ fn calibrate(adc: &mut Adc) -> bool {
 }
 
 /// Task body.
-pub fn run(pins: winchy_board::AdsPins, state: &State) {
+pub fn run(pins: winchy_board::AdsPins, state: &State, logger: &Logger) {
     let mut adc = match Ads1232::new(pins, Ets, Gain::X128) {
         Ok(a) => a,
         Err(e) => {
@@ -63,7 +68,7 @@ pub fn run(pins: winchy_board::AdsPins, state: &State) {
     let mut n = 0;
     while n < TARE_SAMPLES {
         match read(&mut adc) {
-            Some(v) => {
+            Some((v, _)) => {
                 samples[n] = v;
                 n += 1;
             }
@@ -73,6 +78,7 @@ pub fn run(pins: winchy_board::AdsPins, state: &State) {
     let offset = tare(&samples[..n]).unwrap_or(0);
     log::info!("force: offset-calibrated, tared at {offset} ({n} samples)");
     lock(state).force.offset = offset;
+    logger.event(event::TARE, offset);
 
     let policy = RecalPolicy::default();
     let mut last_recal = now_ms();
@@ -82,7 +88,8 @@ pub fn run(pins: winchy_board::AdsPins, state: &State) {
         let (tared, idle) = {
             let mut s = lock(state);
             match raw {
-                Some(v) => {
+                Some((v, t)) => {
+                    logger.log(t, Record::Force { raw: v });
                     s.force.raw = v;
                     s.force.updated_ms = Some(now);
                 }

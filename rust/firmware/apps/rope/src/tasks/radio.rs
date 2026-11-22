@@ -6,7 +6,10 @@ use winchy_protocol::Message;
 use winchy_rope_logic::radio::{RadioConfig, RadioLink};
 use winchy_sx126x::{ChipConfig, IrqFlags, LoraConfig, Sx126x};
 
-use crate::shared::{State, lock, now_ms};
+use winchy_datalog::record::Record;
+
+use crate::shared::{State, lock, now_ms, now_us};
+use crate::tasks::logger::Logger;
 
 /// TX of a 24-byte frame takes ~40 ms at SF7/BW250; give up after this, ms.
 const TX_TIMEOUT_MS: u64 = 300;
@@ -45,6 +48,7 @@ fn listen(
     dio1: &PinDriver<'static, Input>,
     link: &mut RadioLink,
     state: &State,
+    logger: &Logger,
     until_ms: u64,
 ) {
     if let Err(e) = radio.receive_continuous() {
@@ -63,7 +67,22 @@ fn listen(
             continue;
         };
         let frame = &buf[..info.len];
-        let msg = link.on_rx(frame, now_ms(), &mut lock(state));
+        let t = now_us();
+        let (msg, tx_power_dbm) = {
+            let mut s = lock(state);
+            (link.on_rx(frame, now_ms(), &mut s), s.link.tx_power_dbm)
+        };
+        if let Some(Message::LinkReport(r)) = msg {
+            logger.log(
+                t,
+                Record::Link {
+                    rssi_dbm: r.rssi_dbm,
+                    snr_qdb: r.snr_qdb,
+                    loss_pct: r.loss_pct,
+                    tx_power_dbm,
+                },
+            );
+        }
         match msg {
             Some(Message::LinkReport(r)) => log::debug!(
                 "radio: link report rssi {} dBm snr {} qdB loss {} % (rx {} dBm)",
@@ -86,7 +105,7 @@ fn listen(
 }
 
 /// Task body.
-pub fn run(pins: winchy_board::LoraPins, state: &State) {
+pub fn run(pins: winchy_board::LoraPins, state: &State, logger: &Logger) {
     let mut radio = Sx126x::new(pins.spi, pins.busy, pins.reset, Ets);
     if let Err(e) = radio.init(&ChipConfig::LILYGO, &LoraConfig::WINCHY) {
         log::error!("radio: SX1262 init {e:?}");
@@ -130,6 +149,7 @@ pub fn run(pins: winchy_board::LoraPins, state: &State) {
             &dio1,
             &mut link,
             state,
+            logger,
             start + u64::from(plan.listen_ms),
         );
     }

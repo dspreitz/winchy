@@ -6,7 +6,10 @@ use esp_idf_svc::hal::i2c::I2cDriver;
 use winchy_axp2101::Axp2101;
 use winchy_rope_logic::battery::BatteryMonitor;
 
+use winchy_datalog::record::Record;
+
 use crate::shared::{State, lock, now_ms};
+use crate::tasks::logger::Logger;
 
 /// Period, ms.
 const PERIOD_MS: u32 = 5_000;
@@ -47,7 +50,7 @@ fn log_status(state: &State) {
 }
 
 /// Task body.
-pub fn run(mut pmu: Axp2101<I2cDriver<'static>>, state: &State) {
+pub fn run(mut pmu: Axp2101<I2cDriver<'static>>, state: &State, logger: &Logger) {
     let mut monitor = BatteryMonitor::default();
     let mut n = 0u32;
     loop {
@@ -55,6 +58,12 @@ pub fn run(mut pmu: Axp2101<I2cDriver<'static>>, state: &State) {
         let battery_pct = pmu.battery_percent().ok().flatten();
         let system_mv = pmu.system_mv().unwrap_or(0);
         let charging = pmu.is_charging().unwrap_or(false);
+        logger.log_now(Record::Power {
+            battery_mv: battery_mv.unwrap_or(0),
+            battery_pct: battery_pct.unwrap_or(u8::MAX),
+            system_mv,
+            charging,
+        });
         {
             let mut s = lock(state);
             let low = monitor.update(battery_mv, s.is_idle());
