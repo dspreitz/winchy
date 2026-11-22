@@ -19,7 +19,7 @@ fn main() {
         log::error!("peripherals already taken");
         return;
     };
-    let mut board = match RopeBoard::init(p.i2c0, p.i2c1, p.spi2, p.spi3) {
+    let mut board = match RopeBoard::init(p.i2c0, p.i2c1, p.spi2, p.spi3, p.uart1) {
         Ok(b) => b,
         Err(e) => {
             log::error!("board init failed: {e:?}");
@@ -33,12 +33,14 @@ fn main() {
         imu_spi,
         ads,
         lora,
+        gnss,
         ..
     } = board;
     report_baro(sensor_i2c);
     report_imu(imu_spi);
     report_force(ads);
     radio_round_trip(lora);
+    gnss_bring_up(gnss);
     log::info!("bring-up done");
 }
 
@@ -241,4 +243,172 @@ where
         FreeRtos::delay_ms(1);
     }
     false
+}
+
+fn gnss_listen(uart: &esp_idf_svc::hal::uart::UartDriver<'static>, baud: u32, ms: u32) -> bool {
+    use esp_idf_svc::hal::delay::TickType;
+    if uart
+        .change_baudrate(esp_idf_svc::hal::units::Hertz(baud))
+        .is_err()
+    {
+        return false;
+    }
+    let _ = uart.clear_rx();
+    let mut window = [0u8; 600];
+    let mut len = 0;
+    let start = std::time::Instant::now();
+    while start.elapsed().as_millis() < u128::from(ms) {
+        let mut chunk = [0u8; 128];
+        let n = uart
+            .read(&mut chunk, TickType::new_millis(20).ticks())
+            .unwrap_or(0);
+        for &b in &chunk[..n] {
+            if len == window.len() {
+                window.copy_within(1.., 0);
+                len -= 1;
+            }
+            window[len] = b;
+            len += 1;
+        }
+        if winchy_gnss::detect::contains_gnss_frame(&window[..len]) {
+            return true;
+        }
+    }
+    false
+}
+
+fn gnss_send(
+    uart: &esp_idf_svc::hal::uart::UartDriver<'static>,
+    items: &[(u32, winchy_gnss::ubx::CfgValue)],
+) {
+    use winchy_gnss::ubx::{layer, write_valset};
+    let mut frame = [0u8; 160];
+    match write_valset(layer::RAM | layer::BBR, items, &mut frame) {
+        Ok(n) => {
+            let _ = uart.write(&frame[..n]);
+        }
+        Err(e) => log::error!("GNSS VALSET encode: {e:?}"),
+    }
+}
+
+/// Long enough for the GPS UTC parameters (broadcast every 12.5 min).
+const GNSS_TEST_S: u64 = 900;
+
+/// Runs the baud discovery state machine against the real UART.
+fn gnss_find_baud(uart: &esp_idf_svc::hal::uart::UartDriver<'static>) -> u32 {
+    use winchy_gnss::baud::{BaudProbe, ProbeAction};
+    use winchy_gnss::ubx::{CfgValue, key};
+
+    let mut probe = BaudProbe::new(9_600, 115_200, 12);
+    let mut outcome = false;
+    loop {
+        match probe.step(outcome) {
+            ProbeAction::Listen { baud, timeout_ms } => {
+                outcome = gnss_listen(uart, baud, timeout_ms);
+                log::info!(
+                    "GNSS: listen {baud} baud -> {}",
+                    if outcome { "alive" } else { "silent" }
+                );
+            }
+            ProbeAction::Raise { to } => {
+                gnss_send(uart, &[(key::UART1_BAUDRATE, CfgValue::U32(to))]);
+                FreeRtos::delay_ms(150);
+                outcome = false;
+            }
+            ProbeAction::Sleep { ms } => {
+                FreeRtos::delay_ms(ms);
+                outcome = false;
+            }
+            ProbeAction::Found { baud } => return baud,
+            ProbeAction::GaveUp { baud } => {
+                log::warn!("GNSS: baud probe gave up, assuming {baud}");
+                return baud;
+            }
+        }
+    }
+}
+
+fn gnss_bring_up(g: winchy_board::GnssPins) {
+    use esp_idf_svc::hal::delay::TickType;
+    use winchy_gnss::time::{ClockSource, PpsDiscipline, TimeAction, TimeFix};
+    use winchy_gnss::ubx::{Framer, NavPvt, msg, receiver_config};
+
+    let uart = g.uart;
+    let baud = gnss_find_baud(&uart);
+    let _ = uart.change_baudrate(esp_idf_svc::hal::units::Hertz(baud));
+    gnss_send(&uart, &receiver_config(10));
+    log::info!("GNSS: running at {baud} baud, NAV-PVT 10 Hz requested");
+
+    let mut framer = Framer::new();
+    let mut time_fix = TimeFix::default();
+    let mut pps = PpsDiscipline::new();
+    let mut clock = ClockSource::Unset;
+    let mut clock_s = 0_i64;
+    let (mut navs, mut edges, mut pps_prev) = (0u32, 0u32, g.pps.is_high());
+    let (mut labelled, mut had_utc, mut had_tacc) = (0u32, false, false);
+    let start = std::time::Instant::now();
+    let mut buf = [0u8; 256];
+    while start.elapsed().as_secs() < GNSS_TEST_S && labelled < 3 {
+        let n = uart
+            .read(&mut buf, TickType::new_millis(5).ticks())
+            .unwrap_or(0);
+        let now_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let level = g.pps.is_high();
+        if level && !pps_prev {
+            edges += 1;
+            if let Some(s) = pps.on_edge(now_ms) {
+                labelled += 1;
+                log::info!("GNSS: PPS edge #{edges} marks UTC second {s} (t+{now_ms} ms)");
+            } else if edges <= 3 {
+                log::info!("GNSS: PPS edge #{edges} (not armed) at t+{now_ms} ms");
+            }
+        }
+        pps_prev = level;
+        for &b in &buf[..n] {
+            let Some(p) = framer.push(b) else { continue };
+            if (p.class, p.id) != msg::NAV_PVT {
+                continue;
+            }
+            let Some(nav) = NavPvt::parse(p.payload) else {
+                continue;
+            };
+            navs += 1;
+            if nav.utc.is_some() && !had_utc {
+                had_utc = true;
+                log::info!("GNSS: UTC fully resolved after {now_ms} ms: {:?}", nav.utc);
+            }
+            if nav.tacc_ns < 1_000_000_000 && !had_tacc {
+                had_tacc = true;
+                log::info!("GNSS: tAcc {} ns after {now_ms} ms", nav.tacc_ns);
+            }
+            if let Some(utc_s) = nav.utc.and_then(|u| u.to_unix()) {
+                match time_fix.decide(clock, utc_s, clock_s, nav.tacc_ns) {
+                    TimeAction::Set => {
+                        clock = ClockSource::Gnss;
+                        clock_s = utc_s;
+                        log::info!("GNSS: clock set from GNSS: {:?}", nav.utc);
+                    }
+                    TimeAction::Arm => clock_s = utc_s,
+                    TimeAction::Reject | TimeAction::Wait => {}
+                }
+                if clock == ClockSource::Gnss {
+                    pps.arm(utc_s, nav.nano_ns, now_ms);
+                }
+            }
+            if navs % 600 == 1 {
+                log::info!(
+                    "GNSS: NAV-PVT #{navs} fix {:?} sats {} lat {:.6} lon {:.6} hMSL {:.1} m hAcc {:.1} m utc {:?} tAcc {} ns pps edges {edges}",
+                    nav.fix,
+                    nav.num_sv,
+                    nav.lat_deg(),
+                    nav.lon_deg(),
+                    f64::from(nav.hmsl_mm) / 1000.0,
+                    f64::from(nav.hacc_mm) / 1000.0,
+                    nav.utc,
+                    nav.tacc_ns
+                );
+            }
+        }
+    }
+    log::info!("GNSS: {navs} NAV-PVT, {edges} PPS edges, {labelled} labelled");
 }

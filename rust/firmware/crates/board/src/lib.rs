@@ -9,6 +9,7 @@ use esp_idf_svc::hal::gpio::{AnyIOPin, Input, Output, PinDriver, Pull};
 use esp_idf_svc::hal::i2c::{I2C0, I2C1, I2cConfig, I2cDriver};
 use esp_idf_svc::hal::spi::config::{Config as SpiConfig, DriverConfig, MODE_0, MODE_3};
 use esp_idf_svc::hal::spi::{SPI2, SPI3, SpiDeviceDriver, SpiDriver};
+use esp_idf_svc::hal::uart::{UART1, UartDriver, config::Config as UartConfig};
 use esp_idf_svc::hal::units::Hertz;
 use esp_idf_svc::sys::EspError;
 use winchy_axp2101::Axp2101;
@@ -53,7 +54,20 @@ pub struct RopeBoard {
     pub ads: AdsPins,
     /// SX1262 radio bus and control pins.
     pub lora: LoraPins,
+    /// GNSS receiver.
+    pub gnss: GnssPins,
 }
+
+/// GNSS receiver UART and 1PPS input.
+pub struct GnssPins {
+    /// UART1 at the receiver's cold-boot baud (re-tune with `change_baudrate`).
+    pub uart: UartDriver<'static>,
+    /// 1PPS time-pulse input.
+    pub pps: PinDriver<'static, Input>,
+}
+
+/// UART RX buffer: >1 s of NAV-PVT at 10 Hz.
+const GNSS_RX_BUFFER: usize = 2048;
 
 /// SX1262 SPI device and control pins.
 pub struct LoraPins {
@@ -88,6 +102,7 @@ impl RopeBoard {
         i2c1: I2C1<'static>,
         spi2: SPI2<'static>,
         spi3: SPI3<'static>,
+        uart1: UART1<'static>,
     ) -> Result<Self, BoardError> {
         let pmu_bus = I2cDriver::new(
             i2c1,
@@ -150,12 +165,27 @@ impl RopeBoard {
             dio1: PinDriver::input(io(pins::lora::DIO1), Pull::Floating)?,
         };
 
+        let gnss = GnssPins {
+            uart: UartDriver::new(
+                uart1,
+                io(pins::gnss::TX),
+                io(pins::gnss::RX),
+                Option::<AnyIOPin>::None,
+                Option::<AnyIOPin>::None,
+                &UartConfig::new()
+                    .baudrate(Hertz(pins::gnss::BAUD_DEFAULT))
+                    .rx_fifo_size(GNSS_RX_BUFFER),
+            )?,
+            pps: PinDriver::input(io(pins::gnss::PPS), Pull::Floating)?,
+        };
+
         Ok(Self {
             pmu,
             sensor_i2c,
             imu_spi,
             ads,
             lora,
+            gnss,
         })
     }
 }

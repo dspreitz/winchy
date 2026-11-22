@@ -199,6 +199,8 @@ pub struct NavPvt {
     pub utc: Option<UtcDateTime>,
     /// Time accuracy estimate, ns.
     pub tacc_ns: u32,
+    /// Fraction of the UTC second, ns (-1e9..=1e9; may be negative).
+    pub nano_ns: i32,
 }
 
 impl NavPvt {
@@ -247,6 +249,7 @@ impl NavPvt {
             pdop_e2: u16_at(76),
             utc,
             tacc_ns: u32_at(12),
+            nano_ns: i32_at(16),
         })
     }
 

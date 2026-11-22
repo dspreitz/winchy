@@ -165,6 +165,50 @@ impl Default for TimeFix {
     }
 }
 
+/// A fix may arm the next PPS edge only from the first half of its second:
+/// a late solution could arrive after the edge it would label.
+pub const ARM_WINDOW_NS: i64 = 500_000_000;
+/// An armed value older than this is stale (fixes stopped) and never applied.
+pub const ARM_MAX_AGE_MS: u64 = 1_000;
+
+/// Labels PPS edges with the UTC second they mark.
+///
+/// Each early-in-the-second fix arms "next whole second"; the PPS edge then
+/// takes it (once). Monotonic milliseconds guard against stale arming.
+#[derive(Debug, Clone, Default)]
+pub struct PpsDiscipline {
+    armed: Option<(i64, u64)>,
+}
+
+impl PpsDiscipline {
+    /// Creates a disarmed discipline.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { armed: None }
+    }
+
+    /// Arms from a fix: `utc_s` + `nano_ns` (NAV-PVT, nano may be negative),
+    /// received at monotonic `now_ms`. Returns the armed second, or `None` if
+    /// the solution lies too late in its second (previous arming is kept).
+    pub fn arm(&mut self, utc_s: i64, nano_ns: i32, now_ms: u64) -> Option<i64> {
+        let nano = i64::from(nano_ns);
+        let second = utc_s + nano.div_euclid(1_000_000_000);
+        if nano.rem_euclid(1_000_000_000) >= ARM_WINDOW_NS {
+            return None;
+        }
+        let next = second + 1;
+        self.armed = Some((next, now_ms));
+        Some(next)
+    }
+
+    /// A PPS edge at monotonic `now_ms`: the UTC second it marks, if armed
+    /// recently enough. Disarms either way.
+    pub fn on_edge(&mut self, now_ms: u64) -> Option<i64> {
+        let (second, at) = self.armed.take()?;
+        (now_ms >= at && now_ms - at <= ARM_MAX_AGE_MS).then_some(second)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,6 +222,49 @@ mod tests {
             minute,
             second,
         }
+    }
+
+    #[test]
+    fn pps_arms_next_second_early_in_the_second() {
+        let mut p = PpsDiscipline::new();
+        assert_eq!(p.arm(1000, 0, 0), Some(1001));
+        assert_eq!(p.arm(1000, 100_000_000, 0), Some(1001));
+        assert_eq!(p.arm(1000, 499_999_999, 0), Some(1001));
+    }
+
+    #[test]
+    fn pps_ignores_late_solutions_and_keeps_previous_arming() {
+        let mut p = PpsDiscipline::new();
+        assert_eq!(p.arm(1000, 100_000_000, 10), Some(1001));
+        assert_eq!(p.arm(1000, 900_000_000, 810), None);
+        assert_eq!(p.on_edge(910), Some(1001));
+    }
+
+    #[test]
+    fn pps_handles_negative_nano() {
+        let mut p = PpsDiscipline::new();
+        // 1000 s - 1 us = 999.999999 s: late in second 999.
+        assert_eq!(p.arm(1000, -1_000, 0), None);
+        // 1000 s - 0.6 s = 999.4 s: early in second 999 -> next edge is 1000.
+        assert_eq!(p.arm(1000, -600_000_000, 0), Some(1000));
+    }
+
+    #[test]
+    fn pps_edge_applies_once() {
+        let mut p = PpsDiscipline::new();
+        assert_eq!(p.on_edge(0), None);
+        p.arm(1000, 0, 0);
+        assert_eq!(p.on_edge(900), Some(1001));
+        assert_eq!(p.on_edge(1900), None);
+    }
+
+    #[test]
+    fn pps_never_applies_stale_arming() {
+        let mut p = PpsDiscipline::new();
+        p.arm(1000, 0, 0);
+        assert_eq!(p.on_edge(1_200), None);
+        p.arm(1000, 0, 5_000);
+        assert_eq!(p.on_edge(4_000), None, "edge before arming is not ours");
     }
 
     #[test]

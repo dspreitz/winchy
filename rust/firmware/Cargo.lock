@@ -1561,6 +1561,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "winchy-geo"
+version = "0.1.0"
+dependencies = [
+ "libm",
+]
+
+[[package]]
+name = "winchy-gnss"
+version = "0.1.0"
+dependencies = [
+ "libm",
+ "winchy-geo",
+]
+
+[[package]]
 name = "winchy-qmi8658"
 version = "0.1.0"
 dependencies = [
@@ -1579,6 +1594,7 @@ dependencies = [
  "winchy-bmp280",
  "winchy-board",
  "winchy-fusion",
+ "winchy-gnss",
  "winchy-qmi8658",
  "winchy-sx126x",
 ]

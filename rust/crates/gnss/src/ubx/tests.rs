@@ -8,6 +8,7 @@ pub(crate) fn make_navpvt(fix_type: u8, gnss_ok: bool, resolved: bool) -> [u8; 9
     pl[6..11].copy_from_slice(&[6, 27, 16, 45, 10]);
     pl[11] = 0x01 | 0x02 | if resolved { 0x04 } else { 0 };
     pl[12..16].copy_from_slice(&25u32.to_le_bytes());
+    pl[16..20].copy_from_slice(&(-123_456i32).to_le_bytes()); // nano
     pl[20] = fix_type;
     pl[21] = u8::from(gnss_ok);
     pl[23] = 12;
@@ -118,6 +119,7 @@ fn navpvt_3d_fix_fields() {
     assert!((p.climb_ms() - 0.3).abs() < 1e-6);
     assert_eq!(p.pdop_e2, 123);
     assert_eq!(p.tacc_ns, 25);
+    assert_eq!(p.nano_ns, -123_456);
     assert_eq!(
         p.utc,
         Some(UtcDateTime {

@@ -13,7 +13,7 @@ Rewrite of the MicroPython firmware in Rust (branch `rust`). Two workspaces:
 |-------|--------------|------------|
 | `winchy-protocol` | Versioned LoRa frames (encode/decode, fixed-point) | — |
 | `winchy-geo` | Winch↔rope geometry on the local tangent plane | — |
-| `winchy-gnss` | UBX framing/NAV-PVT/CFG-VALSET, NMEA, survey-in, GNSS time trust, baud detect | geo |
+| `winchy-gnss` | UBX framing/NAV-PVT/CFG-VALSET, NMEA, survey-in, GNSS time trust, PPS edge labelling, baud discovery state machine | geo |
 | `winchy-fusion` | Gravity + vertical Kalman, rope angle, ISA altitude, glider speed, gyro bias | — |
 | `winchy-link` | Adaptive TX power (ADR) | — |
 | `winchy-axp2101` | AXP2101 PMU driver: rails, charger, gauge, IRQ mask | embedded-hal |
@@ -25,8 +25,9 @@ Rewrite of the MicroPython firmware in Rust (branch `rust`). Two workspaces:
 | `winchy-testkit` | Seeded PRNG for simulation tests (dev only) | — |
 
 Firmware workspace: `winchy-board` turns the `winchy-tbeam` pin numbers into
-ESP-IDF drivers; `apps/rope` is currently a bring-up diagnostic (sensors + a LoRa round trip
-with the unmodified MicroPython winch via a legacy v6 frame).
+ESP-IDF drivers; `apps/rope` is currently a bring-up diagnostic (sensors, a LoRa round trip
+with the unmodified MicroPython winch via a legacy v6 frame, GNSS baud
+discovery + NAV-PVT + PPS labelling).
 
 Layering: logic crates never touch hardware. Drivers only see
 `embedded-hal` traits; only a board crate knows pins and PMU rails; the
