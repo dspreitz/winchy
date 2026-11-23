@@ -18,7 +18,7 @@ Rewrite of the MicroPython firmware in Rust (branch `rust`). Two workspaces:
 | `winchy-link` | Adaptive TX power (ADR) | — |
 | `winchy-axp2101` | AXP2101 PMU driver: rails, charger, gauge, IRQ mask | embedded-hal |
 | `winchy-bmp280` | BMP280/BME280 barometer, bit-exact integer compensation | embedded-hal |
-| `winchy-qmi8658` | QMI8658 IMU over SPI, burst read | embedded-hal |
+| `winchy-qmi8658` | QMI8658 IMU over SPI, burst read (FIFO supported, lossy) | embedded-hal |
 | `winchy-ads1232` | ADS1232 force ADC, bit-banged | embedded-hal |
 | `winchy-sx126x` | SX1262 LoRa radio: init/calibration, TX, continuous RX, IRQ, packet status | embedded-hal |
 | `winchy-tbeam` | T-Beam S3 Supreme pin map + power profile (the only place with pin numbers) | axp2101 |
@@ -60,9 +60,15 @@ cd rust && cargo run -p winchy-logdump -- dump.bin out/   # imu.csv, force.csv, 
 ```
 
 `winchy-logdump` gives samples from before the clock was set the UTC time of
-their boot (preferring the offset after the 1PPS lock). Known gap: a flash
-sector erase (~every 3 s) stalls all tasks for up to ~80 ms, so the IMU loses
-2-3 samples each time (timestamps stay exact).
+their boot (preferring the offset after the 1PPS lock).
+
+A flash sector erase stalls all tasks for up to ~80 ms (the IMU loses 2-3
+samples; timestamps stay exact). The logger therefore keeps a reserve of 64
+erased sectors (~3 min) and refills it only while the unit lies still and no
+tow runs (`rope-logic::erase_gate`), so towing writes without erasing.
+Rejected alternatives, measured on the rope: the QMI8658A FIFO drops ~0.2
+samples per read, unreported (see `winchy-qmi8658` docs); ESP-IDF flash
+auto-suspend made the stalls longer (erases up to ~1 s, 5x more IMU gaps).
 
 The main thread serves the USB console. Until the winch is ported, telemetry
 goes out in the MicroPython v6 format (`RadioConfig::wire`); received frames

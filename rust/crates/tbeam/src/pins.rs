@@ -49,7 +49,7 @@ pub mod imu {
     /// Data-ready interrupt.
     pub const INT: u8 = 33;
     /// SPI clock, Hz.
-    pub const FREQ_HZ: u32 = 1_000_000;
+    pub const FREQ_HZ: u32 = 8_000_000;
 }
 
 /// SX1262 LoRa radio.

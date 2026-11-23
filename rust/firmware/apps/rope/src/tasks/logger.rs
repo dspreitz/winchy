@@ -3,19 +3,25 @@
 //! blocks (`winchy-datalog`) and writes them round-robin to the `storage`
 //! partition. The block header carries the UTC offset of the PPS-disciplined
 //! system clock, so each sample gets an exact UTC time.
+//!
+//! A sector erase stops every task for up to ~80 ms. So the writer keeps a
+//! reserve of erased slots and refills it only while the unit lies still and
+//! no tow runs ([`EraseGate`]); during a tow blocks go into the reserve
+//! without any erase, and only an exhausted reserve erases inline.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use winchy_datalog::block::{BLOCK_SIZE, BlockHeader, BlockWriter, HEADER_SIZE};
 use winchy_datalog::record::{Record, event};
-use winchy_datalog::ring::resume;
+use winchy_datalog::ring::{Ring, leading_erased, resume};
 use winchy_gnss::time::ClockSource;
+use winchy_rope_logic::erase_gate::EraseGate;
 use winchy_storage::RawPartition;
 
-use crate::shared::{State, lock, now_us, unix_now_us};
+use crate::shared::{State, lock, now_ms, now_us, unix_now_us};
 
 /// Queue depth (~3 s of all sensors; covers a sector erase).
 const QUEUE: usize = 256;
@@ -69,52 +75,91 @@ pub fn channel() -> (Logger, Sink) {
     )
 }
 
+/// Erased slots kept ahead of the write position (~3 min of log).
+const RESERVE: usize = 64;
+/// At most one erase-ahead per this interval (each stalls all tasks).
+const REFILL_INTERVAL: Duration = Duration::from_millis(500);
+
 /// Ring writer over the raw partition.
-struct Ring {
+struct Flash {
     part: RawPartition,
-    slots: usize,
-    index: usize,
-    seq: u32,
+    plan: Ring,
+    /// Reserve state last reported (full / exhausted), to log transitions only.
+    reported_full: bool,
+    reported_empty: bool,
 }
 
-impl Ring {
+impl Flash {
     fn open() -> Option<Self> {
         let part = RawPartition::find(c"storage")
             .map_err(|e| log::error!("datalog: storage partition {e:?}"))
             .ok()?;
         let slots = part.size() / BLOCK_SIZE;
         let mut header = [0u8; HEADER_SIZE];
-        let r = resume((0..slots).map(|i| {
-            part.read(i * BLOCK_SIZE, &mut header).ok()?;
-            BlockHeader::peek_seq(&header)
-        }));
+        let mut read_header =
+            |i: usize| part.read(i * BLOCK_SIZE, &mut header).ok().map(|()| header);
+        let at = resume((0..slots).map(|i| BlockHeader::peek_seq(&read_header(i)?)));
+        let ready = leading_erased(
+            (0..RESERVE).map(|k| {
+                read_header((at.index + k) % slots).is_some_and(|h| h.iter().all(|b| *b == 0xFF))
+            }),
+            RESERVE,
+        );
+        let plan = Ring::new(slots, at, ready, RESERVE);
         log::info!(
-            "datalog: {slots} blocks of {BLOCK_SIZE} B, continuing at block {} (seq {})",
-            r.index,
-            r.seq
+            "datalog: {slots} blocks of {BLOCK_SIZE} B, continuing at block {} (seq {}), {} erased ahead",
+            at.index,
+            at.seq,
+            plan.ready()
         );
         Some(Self {
             part,
-            slots,
-            index: r.index,
-            seq: r.seq,
+            plan,
+            reported_full: false,
+            reported_empty: false,
         })
     }
 
     fn write(&mut self, writer: &mut BlockWriter) {
-        let Some(block) = writer.seal(self.seq) else {
+        if writer.is_empty() {
+            return;
+        }
+        let w = self.plan.next_write();
+        let Some(block) = writer.seal(w.seq) else {
             return;
         };
-        let at = self.index * BLOCK_SIZE;
-        if let Err(e) = self
-            .part
-            .erase(at, BLOCK_SIZE)
-            .and_then(|()| self.part.write(at, block))
-        {
-            log::warn!("datalog: block {} write {e:?}", self.index);
+        let at = w.index * BLOCK_SIZE;
+        let erased = if w.erase {
+            if !self.reported_empty {
+                log::info!("datalog: erase reserve exhausted, erasing inline");
+                self.reported_empty = true;
+            }
+            self.part.erase(at, BLOCK_SIZE)
+        } else {
+            Ok(())
+        };
+        if let Err(e) = erased.and_then(|()| self.part.write(at, block)) {
+            log::warn!("datalog: block {} write {e:?}", w.index);
         }
-        self.index = (self.index + 1) % self.slots;
-        self.seq = self.seq.wrapping_add(1);
+    }
+
+    /// Erases one slot of the reserve, if it is not full.
+    fn refill(&mut self) {
+        let Some(i) = self.plan.erase_ahead() else {
+            return;
+        };
+        match self.part.erase(i * BLOCK_SIZE, BLOCK_SIZE) {
+            Ok(()) => {
+                self.plan.erased_ahead();
+                self.reported_empty = false;
+                let full = self.plan.erase_ahead().is_none();
+                if full && !self.reported_full {
+                    log::info!("datalog: erase reserve full ({} blocks)", self.plan.ready());
+                }
+                self.reported_full = full;
+            }
+            Err(e) => log::warn!("datalog: erase ahead {i} {e:?}"),
+        }
     }
 }
 
@@ -125,11 +170,13 @@ fn utc_offset(state: &State) -> Option<i64> {
 
 /// Task body.
 pub fn run(sink: &Sink, state: &State) {
-    let Some(mut ring) = Ring::open() else {
+    let Some(mut ring) = Flash::open() else {
         return;
     };
     let mut writer = BlockWriter::new();
-    let push = |ring: &mut Ring, writer: &mut BlockWriter, mono: i64, rec: &Record| {
+    let mut gate = EraseGate::new();
+    let mut last_refill = Instant::now();
+    let push = |ring: &mut Flash, writer: &mut BlockWriter, mono: i64, rec: &Record| {
         let mono = u64::try_from(mono).unwrap_or(0);
         let offset = utc_offset(state);
         if !writer.push(mono, offset, rec) {
@@ -138,7 +185,7 @@ pub fn run(sink: &Sink, state: &State) {
         }
     };
     loop {
-        match sink.rx.recv_timeout(Duration::from_secs(1)) {
+        match sink.rx.recv_timeout(REFILL_INTERVAL) {
             Ok((mono, rec)) => push(&mut ring, &mut writer, mono, &rec),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
@@ -150,6 +197,14 @@ pub fn run(sink: &Sink, state: &State) {
                 value: i32::try_from(dropped).unwrap_or(i32::MAX),
             };
             push(&mut ring, &mut writer, now_us(), &rec);
+        }
+        let (gyro, idle) = {
+            let s = lock(state);
+            (s.attitude.gyro_dps, s.is_idle())
+        };
+        if gate.update(now_ms(), gyro, idle) && last_refill.elapsed() >= REFILL_INTERVAL {
+            last_refill = Instant::now();
+            ring.refill();
         }
     }
 }

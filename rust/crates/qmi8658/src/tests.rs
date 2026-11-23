@@ -107,3 +107,114 @@ fn temperature() {
     assert!((imu.temperature_c().unwrap() - 25.5).abs() < 1e-6);
     imu.release().done();
 }
+
+/// `CTRL9` command with handshake: write, poll done (after `busy` polls),
+/// acknowledge, poll cleared.
+fn command(cmd: u8, busy: usize) -> Vec<T<u8>> {
+    let mut t = write(0x0A, cmd).to_vec();
+    for _ in 0..busy {
+        t.extend(read(0x2D, &[0x00]));
+    }
+    t.extend(read(0x2D, &[0x80]));
+    t.extend(write(0x0A, 0x00));
+    t.extend(read(0x2D, &[0x00]));
+    t
+}
+
+#[test]
+fn enable_fifo_configures_stream_mode_with_sensors_off() {
+    let mut t = init(&[0x05]);
+    t.extend(write(0x09, 0x80)); // handshake via STATUSINT
+    t.extend(write(0x08, 0x00)); // sensors off
+    t.extend(write(0x14, 0x0E)); // 128 frames, stream
+    t.extend(command(0x04, 2)); // reset FIFO
+    t.extend(write(0x08, 0x03)); // sensors on, SyncSample off
+    let mut imu = Qmi8658::new(Mock::new(&t), &mut NoopDelay::new()).unwrap();
+    imu.enable_fifo().unwrap();
+    imu.release().done();
+}
+
+#[test]
+fn hung_command_times_out() {
+    let mut t = init(&[0x05]);
+    t.extend(write(0x09, 0x80));
+    t.extend(write(0x08, 0x00));
+    t.extend(write(0x14, 0x0E));
+    t.extend(write(0x0A, 0x04));
+    for _ in 0..CMD_POLLS {
+        t.extend(read(0x2D, &[0x00]));
+    }
+    let mut spi = Mock::new(&t);
+    let mut imu = Qmi8658::new(spi.clone(), &mut NoopDelay::new()).unwrap();
+    assert_eq!(imu.enable_fifo(), Err(Error::Timeout));
+    spi.done();
+}
+
+/// Frame `i` with recognisable values.
+fn frame(i: i16) -> ([u8; 12], RawSample) {
+    let s = RawSample {
+        accel: [i, -i, 100 + i],
+        gyro: [1000 + i, -1000 - i, i * 3],
+    };
+    let mut b = [0u8; 12];
+    for (k, v) in s.accel.iter().chain(s.gyro.iter()).enumerate() {
+        b[2 * k..2 * k + 2].copy_from_slice(&v.to_le_bytes());
+    }
+    (b, s)
+}
+
+#[test]
+fn read_fifo_reads_complete_frames_in_one_burst() {
+    let mut t = init(&[0x05]);
+    t.extend(command(0x05, 0));
+    // 6 frames + 1 partial word = 37 words.
+    t.extend(read(0x15, &[37, 0x10]));
+    let frames: Vec<_> = (0..6).map(frame).collect();
+    let bytes: Vec<u8> = frames.iter().flat_map(|f| f.0).collect();
+    t.extend(read(0x17, &bytes)); // one burst, CS held
+    t.extend(write(0x14, 0x0E)); // leave read mode
+    let mut imu = Qmi8658::new(Mock::new(&t), &mut NoopDelay::new()).unwrap();
+    let mut out = [RawSample::default(); FIFO_FRAMES];
+    let batch = imu.read_fifo(&mut out, || 42).unwrap();
+    assert_eq!(
+        batch,
+        FifoBatch {
+            frames: 6,
+            overflow: false,
+            stamp: 42
+        }
+    );
+    for (got, want) in out.iter().zip(&frames) {
+        assert_eq!(*got, want.1);
+    }
+    imu.release().done();
+}
+
+#[test]
+fn read_fifo_uses_count_msbs_and_flags_loss() {
+    let mut t = init(&[0x05]);
+    t.extend(command(0x05, 1));
+    // Full FIFO: 768 words = 0x300, status FULL.
+    t.extend(read(0x15, &[0x00, 0x83]));
+    let bytes = vec![0u8; FIFO_FRAMES * 12];
+    t.extend(read(0x17, &bytes));
+    t.extend(write(0x14, 0x0E));
+    let mut imu = Qmi8658::new(Mock::new(&t), &mut NoopDelay::new()).unwrap();
+    let mut out = [RawSample::default(); FIFO_FRAMES];
+    let batch = imu.read_fifo(&mut out, || ()).unwrap();
+    assert_eq!(batch.frames, FIFO_FRAMES);
+    assert!(batch.overflow);
+    imu.release().done();
+}
+
+#[test]
+fn empty_fifo_reads_no_data() {
+    let mut t = init(&[0x05]);
+    t.extend(command(0x05, 0));
+    t.extend(read(0x15, &[0, 0x00]));
+    t.extend(write(0x14, 0x0E));
+    let mut imu = Qmi8658::new(Mock::new(&t), &mut NoopDelay::new()).unwrap();
+    let mut out = [RawSample::default(); FIFO_FRAMES];
+    assert_eq!(imu.read_fifo(&mut out, || ()).unwrap().frames, 0);
+    imu.release().done();
+}

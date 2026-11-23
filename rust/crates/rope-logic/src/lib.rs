@@ -8,6 +8,7 @@
 
 pub mod battery;
 pub mod clock;
+pub mod erase_gate;
 pub mod force;
 pub mod geometry;
 pub mod last_fix;
