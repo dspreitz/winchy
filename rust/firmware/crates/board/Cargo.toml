@@ -1,6 +1,6 @@
 [package]
 name = "winchy-board"
-description = "ESP-IDF peripheral bring-up for the T-Beam S3 Supreme (pins from winchy-tbeam)"
+description = "ESP-IDF peripheral bring-up for the rope (T-Beam S3 Supreme) and winch (T3S3) boards"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,6 +11,7 @@ esp-idf-svc.workspace = true
 log.workspace = true
 winchy-ads1232.workspace = true
 winchy-axp2101.workspace = true
+winchy-t3s3.workspace = true
 winchy-tbeam.workspace = true
 
 [lints]

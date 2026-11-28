@@ -1,0 +1,31 @@
+[package]
+name = "winchy-winch"
+description = "Winchy winch unit firmware (LilyGo T3S3 V1.2)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "winchy-winch"
+harness = false
+
+[dependencies]
+esp-idf-svc.workspace = true
+log.workspace = true
+ssd1306 = "0.10"
+winchy-board.workspace = true
+winchy-geo.workspace = true
+winchy-gnss.workspace = true
+winchy-protocol.workspace = true
+winchy-rt.workspace = true
+winchy-settings.workspace = true
+winchy-sx126x.workspace = true
+winchy-winch-logic.workspace = true
+winchy-winch-ui.workspace = true
+
+[build-dependencies]
+embuild.workspace = true
+
+[lints]
+workspace = true

@@ -147,8 +147,11 @@ fn rejects_wrong_version_type_and_length() {
     );
     assert_eq!(
         decode(&[6, 1, 0, 0]),
-        Err(DecodeError::UnknownType(1)),
-        "rope-only type"
+        Err(DecodeError::BadLength {
+            expected: TELEMETRY_LEN,
+            actual: 4
+        }),
+        "telemetry is 17 bytes"
     );
     assert_eq!(decode(&[6, 99, 0, 0]), Err(DecodeError::UnknownType(99)));
     assert_eq!(
@@ -158,4 +161,80 @@ fn rejects_wrong_version_type_and_length() {
             actual: 5
         })
     );
+}
+
+#[test]
+fn decodes_rope_telemetry_received_from_the_air() {
+    // Captured by the winch from the rope (2026-11-28): seq 160, idle,
+    // force -861 counts, 5.5 deg, 361 m, flags 0x05, battery unknown.
+    let f = decode(&[
+        0x06, 0x01, 0xa0, 0x00, 0x00, 0xa3, 0xfc, 0xff, 0xff, 0x0b, 0x69, 0x01, 0x00, 0x05, 0xff,
+        0x00, 0x00,
+    ])
+    .unwrap();
+    assert_eq!(f.seq, 160);
+    assert_eq!(
+        f.message,
+        Message::Telemetry(Telemetry {
+            phase: crate::TowPhase::Idle,
+            flags: crate::TelemetryFlags(0x05),
+            force: -861,
+            rope_angle_cdeg: 550,
+            altitude_dm: 3_610,
+            climb_cms: 0,
+            glider_speed_cms: 0,
+            battery_mv: 0,
+            battery_pct: 255,
+            tx_power_dbm: 0,
+        })
+    );
+}
+
+#[test]
+fn telemetry_round_trips_at_v6_resolution() {
+    let t = Telemetry {
+        phase: crate::TowPhase::Climb,
+        flags: crate::TelemetryFlags(0x13),
+        force: 12_345,
+        rope_angle_cdeg: 4_450,
+        altitude_dm: 12_000,
+        climb_cms: 0,
+        glider_speed_cms: 2_500,
+        battery_mv: 3_400,
+        battery_pct: 40,
+        tx_power_dbm: 0,
+    };
+    let mut buf = [0u8; 32];
+    let n = encode_telemetry(7, &t, &mut buf).unwrap();
+    assert_eq!(
+        decode(&buf[..n]).unwrap(),
+        Frame {
+            seq: 7,
+            message: Message::Telemetry(t)
+        }
+    );
+}
+
+#[test]
+fn bad_v6_phase_is_rejected() {
+    let mut buf = [0u8; 32];
+    let n = encode_telemetry(
+        1,
+        &Telemetry {
+            phase: crate::TowPhase::Idle,
+            flags: crate::TelemetryFlags(0),
+            force: 0,
+            rope_angle_cdeg: 0,
+            altitude_dm: 0,
+            climb_cms: 0,
+            glider_speed_cms: 0,
+            battery_mv: 0,
+            battery_pct: 0,
+            tx_power_dbm: 0,
+        },
+        &mut buf,
+    )
+    .unwrap();
+    buf[4] = 99;
+    assert_eq!(decode(&buf[..n]), Err(DecodeError::BadValue));
 }

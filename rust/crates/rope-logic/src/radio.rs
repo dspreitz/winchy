@@ -2,7 +2,7 @@
 //! winch sends back.
 
 use winchy_link::adr::{AdrConfig, next_tx_power};
-use winchy_protocol::{EncodeError, Frame, Message, v6};
+use winchy_protocol::{EncodeError, Frame, Message, decode_any, v6};
 
 use crate::geometry::adr_distance_m;
 use crate::link::{LinkTracker, REPORT_TIMEOUT_MS};
@@ -12,7 +12,7 @@ use crate::telemetry::{self, build, request_report};
 /// On-air format of outgoing telemetry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Wire {
-    /// MicroPython protocol v6 (while the winch still runs MicroPython).
+    /// MicroPython protocol v6 (only for a winch reflashed to MicroPython).
     LegacyV6,
     /// Current protocol ([`winchy_protocol::VERSION`]).
     Current,
@@ -38,12 +38,6 @@ pub fn encode_telemetry(
     }
 }
 
-/// Decodes a received frame in either format.
-#[must_use]
-pub fn decode_any(buf: &[u8]) -> Option<Frame> {
-    Frame::decode(buf).or_else(|_| v6::decode(buf)).ok()
-}
-
 /// Radio cycle configuration.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RadioConfig {
@@ -62,7 +56,7 @@ pub struct RadioConfig {
 impl Default for RadioConfig {
     fn default() -> Self {
         Self {
-            wire: Wire::LegacyV6,
+            wire: Wire::Current,
             period_ms: telemetry::PERIOD_MS,
             report_window_ms: telemetry::REPORT_WINDOW_MS,
             report_every: telemetry::REPORT_EVERY,

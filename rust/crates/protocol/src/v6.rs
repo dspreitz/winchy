@@ -1,10 +1,12 @@
-//! Legacy MicroPython protocol v6, kept only while the winch still runs the
-//! MicroPython firmware. The rope sends v6 TELEMETRY and understands the
-//! winch's v6 replies; everything maps onto the current [`Message`] types.
-//! Delete this module once the winch speaks [`crate::VERSION`].
+//! Legacy MicroPython protocol v6, kept for the transition from the
+//! MicroPython units: either side can encode/decode its v6 frames, mapped
+//! onto the current [`Message`] types. Delete this module once no unit runs
+//! MicroPython any more.
 
 use crate::frame::{DecodeError, EncodeError, Frame};
-use crate::message::{LinkReport, Message, Telemetry, WinchPos, WinchStatus};
+use crate::message::{
+    LinkReport, Message, Telemetry, TelemetryFlags, TowPhase, WinchPos, WinchStatus,
+};
 
 /// v6 version byte.
 pub const VERSION: u8 = 6;
@@ -37,8 +39,8 @@ pub fn encode_telemetry(seq: u16, t: &Telemetry, out: &mut [u8]) -> Result<usize
     Ok(TELEMETRY_LEN)
 }
 
-/// Decodes the v6 frames the winch sends (link report, winch position,
-/// upload command/ack).
+/// Decodes a v6 frame: the rope's telemetry or the winch's replies (link
+/// report, winch position, upload command/ack).
 ///
 /// # Errors
 /// [`DecodeError`].
@@ -50,6 +52,7 @@ pub fn decode(buf: &[u8]) -> Result<Frame, DecodeError> {
         return Err(DecodeError::UnknownVersion(buf[0]));
     }
     let expected = match buf[1] {
+        TELEMETRY => TELEMETRY_LEN,
         LINK_REPORT => 8,
         WINCH_POS => 16,
         UPLOAD_CMD | UPLOAD_ACK => 5,
@@ -64,6 +67,18 @@ pub fn decode(buf: &[u8]) -> Result<Frame, DecodeError> {
     let seq = u16::from_le_bytes([buf[2], buf[3]]);
     let i32_at = |o: usize| i32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
     let message = match buf[1] {
+        TELEMETRY => Message::Telemetry(Telemetry {
+            phase: TowPhase::try_from(buf[4]).map_err(|_| DecodeError::BadValue)?,
+            flags: TelemetryFlags(buf[13]),
+            force: i32_at(5),
+            rope_angle_cdeg: i16::from(buf[9]) * 50,
+            altitude_dm: i32::from(u16::from_le_bytes([buf[10], buf[11]])) * 10,
+            climb_cms: 0,
+            glider_speed_cms: u16::from_le_bytes([buf[15], buf[16]]).saturating_mul(10),
+            battery_mv: u16::from(buf[12]) * 100,
+            battery_pct: buf[14],
+            tx_power_dbm: 0,
+        }),
         LINK_REPORT => Message::LinkReport(LinkReport {
             rssi_dbm: i16::from_le_bytes([buf[4], buf[5]]),
             // The winch sends the raw SX1262 SNR byte, already 0.25 dB.

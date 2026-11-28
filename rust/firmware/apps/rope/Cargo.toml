@@ -29,6 +29,7 @@ winchy-net-esp.workspace = true
 winchy-provision.workspace = true
 winchy-protocol.workspace = true
 winchy-rope-logic.workspace = true
+winchy-rt.workspace = true
 
 [build-dependencies]
 embuild.workspace = true

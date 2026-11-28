@@ -1,0 +1,11 @@
+[package]
+name = "winchy-t3s3"
+description = "LilyGo T3S3 V1.2 board definition (winch unit): pin map"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

@@ -22,3 +22,12 @@ pub use message::{
     LinkReport, Mass, Message, MessageType, Summary, Telemetry, TelemetryFlags, TowPhase, WinchPos,
     WinchStatus,
 };
+
+/// Decodes a received frame in either format (current or MicroPython v6).
+#[must_use]
+pub fn decode_any(buf: &[u8]) -> Option<Frame> {
+    Frame::decode(buf).or_else(|_| v6::decode(buf)).ok()
+}
+
+#[cfg(test)]
+mod tests;

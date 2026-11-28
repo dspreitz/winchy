@@ -1,0 +1,18 @@
+[package]
+name = "winchy-winch-logic"
+description = "Winch unit application logic: link statistics, replies, winch position, screens"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+heapless = "0.8"
+libm.workspace = true
+winchy-geo.workspace = true
+winchy-gnss = { path = "../gnss" }
+winchy-protocol = { path = "../protocol" }
+
+[lints]
+workspace = true

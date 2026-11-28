@@ -4,21 +4,21 @@
 //! The 1PPS ISR only timestamps the edge; labelling it with a UTC second and
 //! stepping the system clock happens here, in task context.
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use esp_idf_svc::hal::delay::{FreeRtos, TickType};
-use esp_idf_svc::hal::gpio::{Input, InterruptType, PinDriver};
+use esp_idf_svc::hal::gpio::{Input, PinDriver};
 use esp_idf_svc::hal::uart::UartDriver;
 use esp_idf_svc::hal::units::Hertz;
 use winchy_gnss::baud::{BaudProbe, ProbeAction};
+use winchy_gnss::clock::{STEP_TOLERANCE_US, step_us, utc_now_us};
 use winchy_gnss::time::{ClockSource, PpsDiscipline, TimeAction, TimeFix};
 use winchy_gnss::ubx::{
     CfgValue, FixType, Framer, NavPvt, key, layer, msg, receiver_config, write_valset,
 };
-use winchy_rope_logic::clock::{STEP_TOLERANCE_US, step_us, utc_now_us};
 use winchy_rope_logic::geometry::winch_geometry;
 use winchy_rope_logic::last_fix::LastFixSaver;
+use winchy_rt::pps::PpsInput;
 use winchy_settings::NvsStore;
 use winchy_storage::MgaCache;
 
@@ -37,17 +37,6 @@ const NAV_RATE_HZ: u16 = 10;
 const SILENCE_MS: u64 = 8_000;
 /// Idle poll interval of the UART, ms.
 const POLL_MS: u32 = 10;
-
-/// 1PPS edges seen (ISR).
-static PPS_EDGES: AtomicU32 = AtomicU32::new(0);
-/// Low 32 bits of the monotonic µs timestamp of the last edge (ISR).
-static PPS_EDGE_US: AtomicU32 = AtomicU32::new(0);
-
-/// Low 32 bits of a µs timestamp (wraps every ~71 min; only differences of
-/// a few ms are taken, so the wrap is harmless).
-fn low32(us: i64) -> u32 {
-    u32::try_from(us.rem_euclid(1 << 32)).unwrap_or(0)
-}
 
 fn listen(uart: &UartDriver<'static>, baud: u32, ms: u32) -> bool {
     if uart.change_baudrate(Hertz(baud)).is_err() {
@@ -115,25 +104,6 @@ fn bring_up(uart: &UartDriver<'static>) {
     log::info!("gnss: {baud} baud, NAV-PVT {NAV_RATE_HZ} Hz");
 }
 
-fn start_pps(pps: &mut PinDriver<'static, Input>) {
-    let armed = pps
-        .set_interrupt_type(InterruptType::PosEdge)
-        .and_then(|()| {
-            // SAFETY: the callback only touches atomics and esp_timer_get_time,
-            // both ISR-safe; it lives as long as the pin driver (forever).
-            unsafe {
-                pps.subscribe(|| {
-                    PPS_EDGE_US.store(low32(now_us()), Ordering::Release);
-                    PPS_EDGES.fetch_add(1, Ordering::AcqRel);
-                })
-            }
-        });
-    match armed.and_then(|()| pps.enable_interrupt()) {
-        Ok(()) => log::info!("gnss: 1PPS interrupt armed"),
-        Err(e) => log::error!("gnss: 1PPS interrupt {e:?}"),
-    }
-}
-
 /// Data-log record of a solution, with the receiver's own epoch time.
 fn gnss_record(nav: &NavPvt) -> Record {
     let sat_i16 =
@@ -162,7 +132,6 @@ fn gnss_record(nav: &NavPvt) -> Record {
 struct Clock {
     fix: TimeFix,
     pps: PpsDiscipline,
-    seen_edges: u32,
     /// The clock has been aligned to a PPS edge since the last coarse set.
     pps_locked: bool,
     reject_logged_ms: Option<u64>,
@@ -197,16 +166,10 @@ impl Clock {
         }
     }
 
-    fn on_poll(&mut self, pps: &mut PinDriver<'static, Input>, logger: &Logger) {
-        let edges = PPS_EDGES.load(Ordering::Acquire);
-        if edges == self.seen_edges {
+    fn on_poll(&mut self, pps: &mut PpsInput, logger: &Logger) {
+        let Some(edge_us) = pps.poll() else {
             return;
-        }
-        self.seen_edges = edges;
-        let _ = pps.enable_interrupt(); // the HAL disables it after each edge
-        let now = now_us();
-        let elapsed = low32(now).wrapping_sub(PPS_EDGE_US.load(Ordering::Acquire));
-        let edge_us = now - i64::from(elapsed);
+        };
         let Some(second) = self
             .pps
             .on_edge(u64::try_from(edge_us / 1_000).unwrap_or(0))
@@ -231,7 +194,7 @@ impl Clock {
 /// Task body.
 pub fn run(
     uart: &GnssUart,
-    mut pps: PinDriver<'static, Input>,
+    pps: PinDriver<'static, Input>,
     state: &State,
     store: &Mutex<NvsStore>,
     logger: &Logger,
@@ -244,12 +207,11 @@ pub fn run(
     // Solutions queued while feeding are seconds old; they must not set the
     // clock or arm the PPS label.
     let _ = lock(uart).clear_rx();
-    start_pps(&mut pps);
+    let mut pps = PpsInput::start(pps);
 
     let mut clock = Clock {
         fix: TimeFix::default(),
         pps: PpsDiscipline::new(),
-        seen_edges: PPS_EDGES.load(Ordering::Acquire),
         pps_locked: false,
         reject_logged_ms: None,
     };

@@ -11,9 +11,9 @@ Rewrite of the MicroPython firmware in Rust (branch `rust`). Two workspaces:
 
 | Crate | What it does | Depends on |
 |-------|--------------|------------|
-| `winchy-protocol` | Versioned LoRa frames (encode/decode, fixed-point); `v6` = transitional codec for the MicroPython winch | — |
+| `winchy-protocol` | Versioned LoRa frames (encode/decode, fixed-point), `decode_any`; `v6` = codec for MicroPython units (both directions) | — |
 | `winchy-geo` | Winch↔rope geometry on the local tangent plane | — |
-| `winchy-gnss` | UBX framing/NAV-PVT/CFG-VALSET, NMEA, survey-in, GNSS time trust, PPS edge labelling, baud discovery state machine | geo |
+| `winchy-gnss` | UBX framing/NAV-PVT/CFG-VALSET, u-blox 7 CFG messages, NMEA, survey-in, GNSS time trust, PPS edge labelling + clock maths, baud discovery state machine | geo |
 | `winchy-fusion` | Gravity + vertical Kalman, rope angle, ISA altitude, glider speed, gyro bias | — |
 | `winchy-link` | Adaptive TX power (ADR) | — |
 | `winchy-axp2101` | AXP2101 PMU driver: rails, charger, gauge, IRQ mask | embedded-hal |
@@ -21,16 +21,20 @@ Rewrite of the MicroPython firmware in Rust (branch `rust`). Two workspaces:
 | `winchy-qmi8658` | QMI8658 IMU over SPI, burst read (FIFO supported, lossy) | embedded-hal |
 | `winchy-ads1232` | ADS1232 force ADC, bit-banged | embedded-hal |
 | `winchy-sx126x` | SX1262 LoRa radio: init/calibration, TX, continuous RX, IRQ, packet status | embedded-hal |
-| `winchy-tbeam` | T-Beam S3 Supreme pin map + power profile (the only place with pin numbers) | axp2101 |
-| `winchy-rope-logic` | Rope app decisions: shared state, telemetry, battery warning, QNH, ADR feedback, radio cycle, PPS clock maths | protocol, link, geo, gnss, fusion |
+| `winchy-tbeam` | T-Beam S3 Supreme (rope) pin map + power profile | axp2101 |
+| `winchy-t3s3` | T3S3 V1.2 (winch) pin map | — |
+| `winchy-rope-logic` | Rope app decisions: shared state, telemetry, battery warning, QNH, ADR feedback, radio cycle, erase gate | protocol, link, geo, gnss, fusion |
+| `winchy-winch-logic` | Winch app decisions: link statistics/report, reply planning, winch position, OLED screen model | protocol, gnss, geo |
+| `winchy-winch-ui` | Draws the winch screens on a 128x64 monochrome display | embedded-graphics |
 | `winchy-datalog` | Flash data-log format: timestamped records, CRC'd 4 KiB blocks with UTC offset, ring resume | — |
 | `winchy-provision` | Settings/secret key registry + USB console commands (secrets never echoed) | — |
 | `winchy-testkit` | Seeded PRNG for simulation tests (dev only) | — |
 
 Firmware workspace: `winchy-settings` stores provisioned values in NVS and
-runs the USB console; `winchy-board` turns the `winchy-tbeam` pin numbers into
-ESP-IDF drivers; `winchy-net-esp` does WiFi/HTTPS/SNTP; `winchy-storage` keeps
-the AssistNow blob on a raw partition.
+runs the USB console; `winchy-board` turns the board crates' pin numbers into
+ESP-IDF drivers (`RopeBoard`, `WinchBoard`); `winchy-rt` holds clocks, task
+spawning and the 1PPS edge capture; `winchy-net-esp` does WiFi/HTTPS/SNTP;
+`winchy-storage` keeps the AssistNow blob on a raw partition.
 
 `apps/rope` runs one task per sensor rate, all writing one shared
 `RopeState` (decisions live in `winchy-rope-logic`):
@@ -70,9 +74,29 @@ Rejected alternatives, measured on the rope: the QMI8658A FIFO drops ~0.2
 samples per read, unreported (see `winchy-qmi8658` docs); ESP-IDF flash
 auto-suspend made the stalls longer (erases up to ~1 s, 5x more IMU gaps).
 
-The main thread serves the USB console. Until the winch is ported, telemetry
-goes out in the MicroPython v6 format (`RadioConfig::wire`); received frames
-are accepted in both formats.
+The main thread serves the USB console. Telemetry goes out in the current
+protocol (`RadioConfig::wire`; `Wire::LegacyV6` only for a winch reflashed to
+MicroPython); received frames are accepted in both formats.
+
+### Winch (`apps/winch`, LilyGo T3S3, 4 MB flash)
+
+| Task | Rate | Prio | Does |
+|------|------|------|------|
+| `radio` | on RX | 9 | continuous receive; answers each telemetry frame (20 ms guard) with a link report when asked, else the winch position every 15 s; replies at 22 dBm |
+| `gnss` | 1 Hz | 7 | u-blox 7 NMEA: Stationary + SBAS setup, survey-in from GGA, clock from RMC, 1PPS discipline |
+| `display` | 2 Hz | 5 | SSD1306: telemetry screen while the rope talks, GPS/survey screen after 3 s silence |
+
+The winch has its own partition table and flash size:
+
+```sh
+cd rust/firmware
+cargo build --release -p winchy-winch
+espflash flash --port /dev/cu.usbmodemXXXX --flash-size 4mb \
+    --partition-table partitions-winch.csv target/xtensa-esp32s3-espidf/release/winchy-winch
+```
+
+Still on the MicroPython winch only (later stages): WiFi dashboard, RX log +
+GitHub upload, IP announce, cross-upload, GPS aiding.
 
 Layering: logic crates never touch hardware. Drivers only see
 `embedded-hal` traits; only a board crate knows pins and PMU rails; the

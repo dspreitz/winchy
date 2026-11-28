@@ -25,8 +25,12 @@ winchy-bmp280 = { path = "../crates/bmp280" }
 winchy-qmi8658 = { path = "../crates/qmi8658" }
 winchy-ads1232 = { path = "../crates/ads1232" }
 winchy-tbeam = { path = "../crates/tbeam" }
+winchy-t3s3 = { path = "../crates/t3s3" }
+winchy-winch-logic = { path = "../crates/winch-logic" }
+winchy-winch-ui = { path = "../crates/winch-ui" }
 winchy-sx126x = { path = "../crates/sx126x" }
 winchy-board = { path = "crates/board" }
+winchy-rt = { path = "crates/rt" }
 winchy-settings = { path = "crates/settings" }
 winchy-storage = { path = "crates/storage" }
 winchy-net = { path = "../crates/net" }

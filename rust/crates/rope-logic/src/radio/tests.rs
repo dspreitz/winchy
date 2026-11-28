@@ -20,8 +20,17 @@ fn fixed_power() -> RadioConfig {
 }
 
 #[test]
+fn default_wire_is_the_current_protocol() {
+    // The winch runs Rust and understands the current protocol (2026-11-28).
+    assert_eq!(RadioConfig::default().wire, Wire::Current);
+}
+
+#[test]
 fn legacy_cycle_numbers_frames_and_requests_every_second_report() {
-    let mut link = RadioLink::new(fixed_power());
+    let mut link = RadioLink::new(RadioConfig {
+        wire: Wire::LegacyV6,
+        ..fixed_power()
+    });
     let state = RopeState::new(14);
     let mut out = [0u8; 32];
 
@@ -128,23 +137,6 @@ fn garbage_is_ignored() {
     assert_eq!(link.on_rx(&[1, 2, 3, 4, 5], 0, &mut state), None);
     assert_eq!(link.on_rx(&[], 0, &mut state), None);
     assert_eq!(state.link.rx_count, 0);
-}
-
-#[test]
-fn decode_any_accepts_both_versions() {
-    assert!(decode_any(&v6_link_report(-90, 0, 0)).is_some());
-    let mut buf = [0u8; 32];
-    let n = Frame {
-        seq: 1,
-        message: Message::UploadAck { nonce: 4 },
-    }
-    .encode(&mut buf)
-    .unwrap();
-    assert_eq!(
-        decode_any(&buf[..n]).unwrap().message,
-        Message::UploadAck { nonce: 4 }
-    );
-    assert_eq!(decode_any(&[9, 9, 9, 9]), None);
 }
 
 #[test]

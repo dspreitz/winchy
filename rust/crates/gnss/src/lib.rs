@@ -6,8 +6,10 @@
 
 pub mod assistnow;
 pub mod baud;
+pub mod clock;
 pub mod detect;
 pub mod nmea;
 pub mod survey;
 pub mod time;
+pub mod ublox7;
 pub mod ubx;

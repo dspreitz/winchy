@@ -1,0 +1,18 @@
+[package]
+name = "winchy-winch-ui"
+description = "Draws the winch OLED screens (128x64, monochrome) with embedded-graphics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+embedded-graphics = "0.8"
+winchy-winch-logic = { path = "../winch-logic" }
+
+[dev-dependencies]
+heapless = "0.8"
+
+[lints]
+workspace = true
