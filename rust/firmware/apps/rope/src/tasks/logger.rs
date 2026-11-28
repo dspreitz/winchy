@@ -84,7 +84,8 @@ const REFILL_INTERVAL: Duration = Duration::from_millis(500);
 struct Flash {
     part: RawPartition,
     plan: Ring,
-    /// Reserve state last reported (full / exhausted), to log transitions only.
+    /// "Full" is reported once per fill-up (after boot or after the reserve
+    /// ran dry), "exhausted" once per run dry.
     reported_full: bool,
     reported_empty: bool,
 }
@@ -133,6 +134,7 @@ impl Flash {
             if !self.reported_empty {
                 log::info!("datalog: erase reserve exhausted, erasing inline");
                 self.reported_empty = true;
+                self.reported_full = false;
             }
             self.part.erase(at, BLOCK_SIZE)
         } else {
@@ -155,8 +157,8 @@ impl Flash {
                 let full = self.plan.erase_ahead().is_none();
                 if full && !self.reported_full {
                     log::info!("datalog: erase reserve full ({} blocks)", self.plan.ready());
+                    self.reported_full = true;
                 }
-                self.reported_full = full;
             }
             Err(e) => log::warn!("datalog: erase ahead {i} {e:?}"),
         }
