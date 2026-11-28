@@ -24,7 +24,7 @@ Rewrite of the MicroPython firmware in Rust (branch `rust`). Two workspaces:
 | `winchy-tbeam` | T-Beam S3 Supreme (rope) pin map + power profile | axp2101 |
 | `winchy-t3s3` | T3S3 V1.2 (winch) pin map | — |
 | `winchy-rope-logic` | Rope app decisions: shared state, telemetry, battery warning, QNH, ADR feedback, radio cycle, erase gate | protocol, link, geo, gnss, fusion |
-| `winchy-winch-logic` | Winch app decisions: link statistics/report, reply planning, winch position, OLED screen model | protocol, gnss, geo |
+| `winchy-winch-logic` | Winch app decisions: link statistics/report, reply planning, winch position, OLED screen model, dashboard page + JSON | protocol, gnss, geo |
 | `winchy-winch-ui` | Draws the winch screens on a 128x64 monochrome display | embedded-graphics |
 | `winchy-datalog` | Flash data-log format: timestamped records, CRC'd 4 KiB blocks with UTC offset, ring resume | — |
 | `winchy-provision` | Settings/secret key registry + USB console commands (secrets never echoed) | — |
@@ -85,6 +85,14 @@ MicroPython); received frames are accepted in both formats.
 | `radio` | on RX | 9 | continuous receive; answers each telemetry frame (20 ms guard) with a link report when asked, else the winch position every 15 s; replies at 22 dBm |
 | `gnss` | 1 Hz | 7 | u-blox 7 NMEA: Stationary + SBAS setup, survey-in from GGA, clock from RMC, 1PPS discipline |
 | `display` | 2 Hz | 5 | SSD1306: telemetry screen while the rope talks, GPS/survey screen after 3 s silence |
+| `ws-push` | 2 Hz | 4 | pushes the dashboard snapshot to every connected WebSocket client |
+| `net` | 1/30 s | 3 | WiFi join/roam/zombie check as DHCP host `winchy`, starts the dashboard, SNTP until GNSS time, internet check (OLED "I") |
+
+Dashboard: `http://<winch-ip>/` (or `http://winchy.fritz.box/` where the
+router resolves DHCP names) — the MicroPython page, fed by a WebSocket at
+`/ws`; `/data` returns the same JSON snapshot. ESP-IDF 5.5 does not call the
+URI handler for the WebSocket handshake, so the page says "hello" on open and
+the winch registers a client on its first frame.
 
 The winch has its own partition table and flash size:
 
@@ -95,8 +103,8 @@ espflash flash --port /dev/cu.usbmodemXXXX --flash-size 4mb \
     --partition-table partitions-winch.csv target/xtensa-esp32s3-espidf/release/winchy-winch
 ```
 
-Still on the MicroPython winch only (later stages): WiFi dashboard, RX log +
-GitHub upload, IP announce, cross-upload, GPS aiding.
+Still on the MicroPython winch only (later stages): RX log + GitHub upload
+(and the dashboard's upload button), IP announce, cross-upload, GPS aiding.
 
 Layering: logic crates never touch hardware. Drivers only see
 `embedded-hal` traits; only a board crate knows pins and PMU rails; the

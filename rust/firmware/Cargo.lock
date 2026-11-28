@@ -1755,6 +1755,7 @@ dependencies = [
  "esp-idf-svc",
  "log",
  "winchy-net",
+ "winchy-provision",
 ]
 
 [[package]]
@@ -1861,11 +1862,13 @@ version = "0.1.0"
 dependencies = [
  "embuild",
  "esp-idf-svc",
+ "heapless 0.8.0",
  "log",
  "ssd1306",
  "winchy-board",
  "winchy-geo",
  "winchy-gnss",
+ "winchy-net-esp",
  "winchy-protocol",
  "winchy-rt",
  "winchy-settings",

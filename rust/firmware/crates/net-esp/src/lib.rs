@@ -9,11 +9,16 @@ use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::http::Method;
 use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection};
+use esp_idf_svc::ipv4;
+use esp_idf_svc::netif::{EspNetif, NetifConfiguration, NetifStack};
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::sntp::{EspSntp, SyncStatus};
 use esp_idf_svc::sys::EspError;
-use esp_idf_svc::wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi};
+use esp_idf_svc::wifi::{
+    AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi, WifiDriver,
+};
 use winchy_net::wifi::{MIN_ROAM_RSSI, ScanHit, order_candidates, preferred, roam_worth_scanning};
+use winchy_provision::{Key, MAX_VALUE_LEN, Store, WIFI_SLOTS};
 
 /// A configured WiFi network (priority = position in the list).
 #[derive(Debug, Clone)]
@@ -53,7 +58,8 @@ pub struct Wifi {
 }
 
 impl Wifi {
-    /// Creates and starts the station interface.
+    /// Creates and starts the station interface; `hostname` is announced via
+    /// DHCP (so routers resolve it), `None` keeps the ESP-IDF default.
     ///
     /// # Errors
     /// ESP-IDF errors.
@@ -61,9 +67,22 @@ impl Wifi {
         modem: Modem<'static>,
         sysloop: EspSystemEventLoop,
         nvs: EspDefaultNvsPartition,
+        hostname: Option<&str>,
     ) -> Result<Self, NetError> {
-        let mut wifi =
-            BlockingWifi::wrap(EspWifi::new(modem, sysloop.clone(), Some(nvs))?, sysloop)?;
+        let driver = WifiDriver::new(modem, sysloop.clone(), Some(nvs))?;
+        let sta = match hostname {
+            Some(h) => EspNetif::new_with_conf(&NetifConfiguration {
+                ip_configuration: Some(ipv4::Configuration::Client(
+                    ipv4::ClientConfiguration::DHCP(ipv4::DHCPClientSettings {
+                        hostname: h.try_into().ok(),
+                    }),
+                )),
+                ..NetifConfiguration::wifi_default_client()
+            })?,
+            None => EspNetif::new(NetifStack::Sta)?,
+        };
+        let esp = EspWifi::wrap_all(driver, sta, EspNetif::new(NetifStack::Ap)?)?;
+        let mut wifi = BlockingWifi::wrap(esp, sysloop)?;
         wifi.set_configuration(&Configuration::Client(ClientConfiguration::default()))?;
         wifi.start()?;
         Ok(Self { wifi, joined: None })
@@ -215,6 +234,62 @@ impl Wifi {
         self.joined = None;
         self.connect_any(networks)
     }
+
+    /// One upkeep step: join while down, roam up the priority list while up,
+    /// otherwise prove two-way traffic and rejoin a link that is associated
+    /// but dead (`fails` counts consecutive failed probes). Returns the SSID
+    /// whenever a new association was made.
+    pub fn maintain(&mut self, networks: &[Network], fails: &mut u32) -> Option<String> {
+        if !self.is_up() {
+            let joined = self.connect_any(networks);
+            if joined.is_none() {
+                log::info!("wifi: no configured network in range");
+            }
+            return joined;
+        }
+        if let Some(ssid) = self.roam(networks) {
+            return Some(ssid);
+        }
+        if self.probe_gateway(Duration::from_secs(2)) {
+            *fails = 0;
+        } else {
+            *fails += 1;
+            log::warn!("wifi: gateway probe failed ({fails})");
+            if *fails >= ZOMBIE_FAILS {
+                log::warn!("wifi: link is a zombie, rejoining");
+                *fails = 0;
+                self.disconnect();
+                return self.connect_any(networks);
+            }
+        }
+        None
+    }
+}
+
+/// Consecutive failed gateway probes before a link counts as a zombie.
+pub const ZOMBIE_FAILS: u32 = 2;
+
+/// Networks provisioned in `store` (console `set wifiN_ssid/pass`), in
+/// priority order (slot 1 first).
+pub fn configured_networks<S: Store>(store: &mut S) -> Vec<Network> {
+    (1..=WIFI_SLOTS)
+        .filter_map(|slot| {
+            let mut sb = [0u8; MAX_VALUE_LEN];
+            let ssid = store
+                .get(Key::WifiSsid(slot), &mut sb)
+                .ok()
+                .flatten()?
+                .to_owned();
+            let mut pb = [0u8; MAX_VALUE_LEN];
+            let password = store
+                .get(Key::WifiPass(slot), &mut pb)
+                .ok()
+                .flatten()
+                .unwrap_or("")
+                .to_owned();
+            Some(Network { ssid, password })
+        })
+        .collect()
 }
 
 /// An HTTP response.

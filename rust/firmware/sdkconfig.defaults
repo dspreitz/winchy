@@ -8,3 +8,6 @@ CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 CONFIG_ESP_TASK_WDT_PANIC=y
 # 1 ms scheduler tick: the 50 Hz IMU loop sleeps to deadlines, not 10 ms ticks.
 CONFIG_FREERTOS_HZ=1000
+
+# WebSocket support in esp_http_server (winch dashboard push).
+CONFIG_HTTPD_WS_SUPPORT=y

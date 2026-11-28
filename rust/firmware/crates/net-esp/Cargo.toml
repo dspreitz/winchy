@@ -10,6 +10,7 @@ publish.workspace = true
 esp-idf-svc.workspace = true
 log.workspace = true
 winchy-net.workspace = true
+winchy-provision.workspace = true
 
 [lints]
 workspace = true

@@ -94,7 +94,7 @@ fn text<const N: usize>(args: core::fmt::Arguments<'_>) -> String<N> {
 }
 
 /// `a / b` rounded half away from zero (`b > 0`).
-fn round_div(a: i32, b: i32) -> i32 {
+pub(crate) fn round_div(a: i32, b: i32) -> i32 {
     if a >= 0 {
         (a + b / 2) / b
     } else {

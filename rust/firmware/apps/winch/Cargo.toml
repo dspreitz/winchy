@@ -12,10 +12,12 @@ harness = false
 
 [dependencies]
 esp-idf-svc.workspace = true
+heapless = "0.8"
 log.workspace = true
 ssd1306 = "0.10"
 winchy-board.workspace = true
 winchy-geo.workspace = true
+winchy-net-esp.workspace = true
 winchy-gnss.workspace = true
 winchy-protocol.workspace = true
 winchy-rt.workspace = true

@@ -6,6 +6,7 @@
 //! the firmware only moves bytes and pixels.
 #![cfg_attr(not(test), no_std)]
 
+pub mod dashboard;
 pub mod link_stats;
 pub mod responder;
 pub mod screen;

@@ -6,6 +6,7 @@
 
 mod shared;
 mod tasks;
+mod web;
 
 use std::sync::{Arc, Mutex};
 
@@ -30,12 +31,15 @@ fn main() {
         log::error!("peripherals already taken");
         return;
     };
-    let Ok(nvs_part) = esp_idf_svc::nvs::EspDefaultNvsPartition::take() else {
-        log::error!("NVS partition unavailable");
+    let (Ok(sysloop), Ok(nvs_part)) = (
+        esp_idf_svc::eventloop::EspSystemEventLoop::take(),
+        esp_idf_svc::nvs::EspDefaultNvsPartition::take(),
+    ) else {
+        log::error!("event loop / NVS partition unavailable");
         return;
     };
-    let store = match winchy_settings::NvsStore::open(nvs_part) {
-        Ok(s) => Mutex::new(s),
+    let store = match winchy_settings::NvsStore::open(nvs_part.clone()) {
+        Ok(s) => Arc::new(Mutex::new(s)),
         Err(e) => {
             log::error!("NVS: {e:?}");
             return;
@@ -54,8 +58,13 @@ fn main() {
     spawn(c"radio", 8 * 1024, 9, move || tasks::radio::run(lora, &s));
     let s = state.clone();
     spawn(c"gnss", 8 * 1024, 7, move || tasks::gnss::run(gnss, &s));
+    let s = state.clone();
     spawn(c"display", 8 * 1024, 5, move || {
-        tasks::display::run(oled, &state);
+        tasks::display::run(oled, &s);
+    });
+    let (st, modem) = (store.clone(), p.modem);
+    spawn(c"net", 16 * 1024, 3, move || {
+        tasks::net::run(modem, sysloop, nvs_part, &state, &st);
     });
 
     let mut console = winchy_settings::Console::new();

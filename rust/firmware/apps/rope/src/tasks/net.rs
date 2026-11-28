@@ -10,8 +10,7 @@ use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use winchy_gnss::time::ClockSource;
-use winchy_net_esp::{Network, Wifi};
-use winchy_provision::{Key, MAX_VALUE_LEN, Store, WIFI_SLOTS};
+use winchy_net_esp::{Wifi, configured_networks};
 use winchy_settings::NvsStore;
 use winchy_storage::MgaCache;
 
@@ -23,33 +22,8 @@ use winchy_datalog::record::event;
 
 /// Health check period, s.
 const CHECK_S: u32 = 60;
-/// Consecutive failed gateway probes before the link counts as a zombie.
-const ZOMBIE_FAILS: u32 = 2;
 /// AssistNow freshness check every this many health checks (~6 h).
 const ASSIST_EVERY: u32 = 360;
-
-/// Configured networks from NVS, in priority order (slot 1 first).
-fn configured_networks(store: &Mutex<NvsStore>) -> Vec<Network> {
-    let mut nvs = lock(store);
-    (1..=WIFI_SLOTS)
-        .filter_map(|slot| {
-            let mut sb = [0u8; MAX_VALUE_LEN];
-            let ssid = nvs
-                .get(Key::WifiSsid(slot), &mut sb)
-                .ok()
-                .flatten()?
-                .to_owned();
-            let mut pb = [0u8; MAX_VALUE_LEN];
-            let password = nvs
-                .get(Key::WifiPass(slot), &mut pb)
-                .ok()
-                .flatten()
-                .unwrap_or("")
-                .to_owned();
-            Some(Network { ssid, password })
-        })
-        .collect()
-}
 
 /// Everything that needs a fresh connection: clock fallback and AssistNow.
 fn on_joined(
@@ -105,12 +79,12 @@ pub fn run(
     uart: &GnssUart,
     logger: &Logger,
 ) {
-    let networks = configured_networks(store);
+    let networks = configured_networks(&mut *lock(store));
     if networks.is_empty() {
         log::warn!("net: no WiFi configured (console: set wifi1_ssid ... / set wifi1_pass ...)");
         return;
     }
-    let mut wifi = match Wifi::new(modem, sysloop, nvs) {
+    let mut wifi = match Wifi::new(modem, sysloop, nvs, None) {
         Ok(w) => w,
         Err(e) => {
             log::error!("net: WiFi init {e:?}");
@@ -120,24 +94,8 @@ pub fn run(
     let mut fails = 0u32;
     let mut checks = 0u32;
     loop {
-        if !wifi.is_up() {
-            match wifi.connect_any(&networks) {
-                Some(ssid) => on_joined(&wifi, &ssid, state, store, uart, logger),
-                None => log::info!("net: no configured network in range"),
-            }
-        } else if let Some(ssid) = wifi.roam(&networks) {
+        if let Some(ssid) = wifi.maintain(&networks, &mut fails) {
             on_joined(&wifi, &ssid, state, store, uart, logger);
-        } else if wifi.probe_gateway(Duration::from_secs(2)) {
-            fails = 0;
-        } else {
-            fails += 1;
-            log::warn!("net: gateway probe failed ({fails})");
-            if fails >= ZOMBIE_FAILS {
-                log::warn!("net: link is a zombie, rejoining");
-                fails = 0;
-                wifi.disconnect();
-                continue;
-            }
         }
         checks += 1;
         if checks.is_multiple_of(ASSIST_EVERY) && wifi.is_up() {
